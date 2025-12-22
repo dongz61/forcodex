@@ -1,0 +1,262 @@
+// Copyright 2024-2025 PowerServe Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "executor/executor.hpp"
+
+#include "core/logger.hpp"
+
+#include <cstdint>
+
+
+namespace powerserve {
+
+void Executor::allocate_buffers() {
+    
+    // ziqian：增加通过后端决定分配buffer类型
+    const bool use_opencl = m_platform.using_opencl(m_graph.m_model_id);
+    
+    for (auto &node : m_graph.tensors) {
+        auto tensor = node->tensor();
+        if (!tensor) continue;
+
+        if (tensor->m_data) continue;
+
+        switch (tensor->m_dtype) {
+        case DataType::FP32:
+            if (use_opencl) create_opencl_buffer<float>(node);
+            else            create_cpu_buffer<float>(node);
+            break;
+        case DataType::FP16:
+            if (use_opencl) create_opencl_buffer<uint16_t>(node);
+            else            create_cpu_buffer<uint16_t>(node);
+            break;
+        case DataType::INT32:
+            if (use_opencl) create_opencl_buffer<int32_t>(node);
+            else            create_cpu_buffer<int32_t>(node);
+            break;
+        default:
+            POWERSERVE_ABORT("allocate_buffers: unsupported dtype");
+        }
+    }
+    // ziqian：end
+}
+
+
+void Executor::plan() {
+    // ziqian：增加通过后端决定使用什么plan方法
+    auto *backend = m_platform.get_backend(m_graph.m_model_id);
+    POWERSERVE_ASSERT(backend != nullptr);
+    backend->plan(m_graph.ops);
+    // ziqian：end
+}
+
+#ifdef POWERSERVE_DUMP_TENSORS
+// Debug code: dump a tensor's data
+void tensor_dump(Tensor* x, std::vector<size_t> max_show_elems, std::string name) {
+    POWERSERVE_ASSERT(x->m_dtype == DataType::FP32);
+    auto shape = x->m_shape;
+    auto stride = x->get<CPUBuffer>().m_stride;
+    printf("--------------------Dumping GGML tensor-------------------\n");
+    printf("Tensor name: %s\n", name.c_str());
+    printf("Tensor rank: 4\n");
+    printf("Tensor shape: [%ld, %ld, %ld, %ld]\n", shape[3], shape[2], shape[1], shape[0]);
+    printf("Tensor dtype: FP32\n");
+    for (size_t i3 = 0; i3 < shape[3] && i3 < max_show_elems[3]; i3++) {
+        for (size_t i2 = 0; i2 < shape[2] && i2 < max_show_elems[2]; i2++) {
+            for (size_t i1 = 0; i1 < shape[1] && i1 < max_show_elems[1]; i1++) {
+                printf("Dumping elements in dimension [%ld, %ld, %ld]:", i3, i2, i1);
+                for (size_t i0 = 0; i0 < shape[0] && i0 < max_show_elems[0]; i0++) {
+                    float *ptr = (float *)((char *)x->get<CPUBuffer>().m_data + i3 * stride[3] + i2 * stride[2] + i1 * stride[1] + i0 * stride[0]);
+                    printf(" %.6f", (double)*ptr);
+                }
+                printf("\n");
+            }
+        }
+    }
+}
+#endif //POWERSERVE_DUMP_TENSORS
+
+void Executor::run() {
+    // ziqian：增加通过后端决定执行哪个算子
+    auto &model_id = m_graph.m_model_id;
+    auto *backend = m_platform.get_backend(model_id);
+    POWERSERVE_ASSERT(backend != nullptr);
+    const bool use_opencl = m_platform.using_opencl(model_id);
+    plan();
+
+    for (auto op : m_graph.ops) {
+        switch (op->op) {
+        case OpType::GET_EMBEDDING: {
+            auto weight   = op->prev[0]->tensor();
+            auto out      = op->output();
+            auto [tokens] = op->get_params<GetEmbeddingParams>();
+            backend->get_embedding(out, weight, tokens);
+#ifdef POWERSERVE_DUMP_TENSORS
+            std::vector<size_t> dump_embedding_dims={8, 6, 1, 1};
+            tensor_dump(out, dump_embedding_dims, "Embedding");
+#endif //POWERSERVE_DUMP_TENSORS
+        } break;
+
+        case OpType::ADD: {
+            auto a   = op->prev[0]->tensor();
+            auto b   = op->prev[1]->tensor();
+            auto out = op->output();
+            backend->add(out, a, b);
+        } break;
+
+        case OpType::MAT_MUL: {
+            auto a   = op->prev[0]->tensor();
+            auto b   = op->prev[1]->tensor();
+            auto out = op->output();
+            backend->matmul(out, a, b);
+        } break;
+
+        case OpType::RMS_NORM: {
+            auto x      = op->prev[0]->tensor();
+            auto weight = op->prev[1]->tensor();
+            auto out    = op->output();
+            auto [eps]  = op->get_params<RMSNormParams>();
+            backend->rmsnorm(out, x, weight, eps);
+        } break;
+
+        case OpType::SILU_HADAMARD: {
+            auto gate = op->prev[0]->tensor();
+            auto up   = op->prev[1]->tensor();
+            auto out  = op->output();
+            backend->silu_hadamard(out, gate, up);
+        } break;
+
+        case OpType::ROPE: {
+            auto src             = op->prev[0]->tensor();
+            auto out             = op->next[0]->tensor();
+            auto [pos, rope_cfg] = op->get_params<RopeParams>();
+            backend->rope(out, src, pos, rope_cfg);
+        } break;
+
+        case OpType::SOFTMAX: {
+            auto x   = op->prev[0]->tensor();
+            auto out = op->output();
+            backend->softmax(out, x);
+        } break;
+
+        case OpType::COPY: {
+            auto dst = op->prev[0]->tensor();
+            auto src = op->prev[1]->tensor();
+            backend->copy(dst, src);
+        } break;
+
+#if defined(POWERSERVE_WITH_QNN)
+        case OpType::QNN_FORWARD: {
+            auto x     = op->prev[0]->tensor();
+            auto out   = op->output();
+            auto pos   = op->get_params<QNNForwardParams>().pos;
+            auto &mask = op->get_params<QNNForwardParams>().mask;
+            m_platform.qnn_backend->forward(m_graph.m_model_id, out, x, pos, mask);
+#ifdef POWERSERVE_DUMP_TENSORS
+            std::vector<size_t> dump_qnn_dims={8, 6, 1, 1};
+            tensor_dump(out, dump_qnn_dims, "QNN");
+#endif //POWERSERVE_DUMP_TENSORS
+        } break;
+        case OpType::QNN_FORWARD_VL: {
+            auto x                  = op->prev[0]->tensor();
+            auto out                = op->output();
+            auto pos                = op->get_params<QNNForwardVLParams>().pos;
+            auto &mask              = op->get_params<QNNForwardVLParams>().mask;
+            auto &pixel_values_list = op->get_params<QNNForwardVLParams>().pixel_values_list;
+            auto &img_infos         = op->get_params<QNNForwardVLParams>().img_infos;
+            m_platform.qnn_backend->forward(m_graph.m_model_id, out, x, pixel_values_list, img_infos, pos, mask);
+            pixel_values_list.clear();
+            img_infos.clear();
+        } break;
+#endif
+
+        case OpType::PRINT: {
+            auto x    = op->prev[0]->tensor();
+            auto size = op->get_params<PrintParams>().size;
+            backend->print(x, size);
+
+        } break;
+
+        case OpType::ADD_CACHE: {
+            auto k                 = op->prev[0]->tensor();
+            auto v                 = op->prev[1]->tensor();
+            auto [L, pos, head_id] = op->get_params<AddCacheParams>();
+            backend->add_cache(k, v, L, pos, head_id);
+        } break;
+        case OpType::PERMUTE: {
+            auto x      = op->prev[0]->tensor();
+            auto out    = op->output();
+            auto [axes] = op->get_params<PermuteParams>();
+            backend->permute(out, x, axes);
+        } break;
+
+        case OpType::CONT: {
+            auto x   = op->prev[0]->tensor();
+            auto out = op->output();
+            backend->cont(out, x);
+        } break;
+
+        case OpType::VIEW: {
+            if (use_opencl) {
+                // NOTE: OpenCL view semantics should be handled during allocate_buffers()
+                // via OpenCLBuffer::create_buffer_view (sub-buffer). CPU path mutates pointer/stride directly.
+                POWERSERVE_ABORT("VIEW op on OpenCL backend is not supported in executor run(); "
+                                 "handle views in allocate_buffers() via OpenCLBuffer sub-buffers");
+            }
+            auto out                       = op->output();
+            auto [stride, offset]          = op->get_params<ViewParams>();
+            out->get<CPUBuffer>().m_stride = stride;
+            out->get<CPUBuffer>().m_data   = (char *)out->get<CPUBuffer>().m_data + offset;
+        } break;
+
+        case OpType::SOFTMAX_EXT: {
+            auto out               = op->output();
+            auto x                 = op->prev[0]->tensor();
+            auto mask              = op->prev[1]->tensor();
+            auto [scale, max_bias] = op->get_params<SoftmaxExtParams>();
+
+            backend->softmax_ext(out, x, mask, scale, max_bias);
+        } break;
+
+        case OpType::GET_MASK: {
+            if (use_opencl) {
+                POWERSERVE_ABORT("GET_MASK currently only supported on CPU backend");
+            }
+            auto out         = op->output();
+            auto [mask, pos] = op->get_params<GetMaskParams>();
+            auto n_kv        = out->m_shape[0];
+            auto batch_size  = out->m_shape[1];
+
+            POWERSERVE_ASSERT(out->m_dtype == DataType::FP32);
+            auto mask_buf = (float *)out->get<CPUBuffer>().m_data;
+            for (size_t i = 0; i < batch_size; i++) {
+                size_t cur_pos = pos[i];
+                for (size_t j = 0; j < n_kv; j++) {
+                    mask_buf[j + i * n_kv] = (j <= cur_pos) ? 0.f : -INFINITY;
+                }
+            }
+        } break;
+
+        case OpType::TRANSPOSE: {
+            auto x   = op->prev[0]->tensor();
+            auto out = op->output();
+            backend->transpose(out, x);
+        } break;
+        default:
+            POWERSERVE_ABORT("Unknown OpType: {}", static_cast<int>(op->op));
+        }
+    }
+    // ziqian：end
+} 
+}// namespace powerserve
