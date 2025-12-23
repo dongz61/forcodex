@@ -206,20 +206,156 @@ void OpenCLBackend::add_minimal(Tensor * dst, const Tensor * src0, const Tensor 
 }
 
 
-void OpenCLBackend::add(const Tensor * /*dst*/, const Tensor * /*src0*/, const Tensor * /*src1*/) const {
-    POWERSERVE_ABORT("OpenCLBackend::add TODO");
+void OpenCLBackend::add(const Tensor *dst, const Tensor *src0, const Tensor *src1) const {
+    if (!initialized) {
+        POWERSERVE_LOG_ERROR("OpenCL backend not initialized");
+        return;
+    }
+    if (!dst || !src0 || !src1) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::add got null tensor");
+        return;
+    }
+
+    // Strict mode (Phase 1):
+    // - FP32 only
+    // - same-shape only (no broadcast)
+    // - contiguous assumed by convention (views are handled by OpenCLBuffer sub-buffer already)
+    if (dst->m_dtype != DataType::FP32 || src0->m_dtype != DataType::FP32 || src1->m_dtype != DataType::FP32) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::add (Phase1) only supports FP32");
+        return;
+    }
+    if (dst->m_shape != src0->m_shape || dst->m_shape != src1->m_shape) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::add (Phase1) requires same shape (no broadcast)");
+        return;
+    }
+    this->add_minimal(const_cast<Tensor *>(dst), src0, src1);
 }
 
 void OpenCLBackend::get_embedding(
-    const Tensor * /*dst*/,
-    const Tensor * /*weight*/,
-    const std::vector<int> & /*tokens*/
+    const Tensor *dst,
+    const Tensor *weight,
+    const std::vector<int> &tokens
 ) const {
-    POWERSERVE_ABORT("OpenCLBackend::get_embedding TODO");
+    if (!initialized) {
+        POWERSERVE_LOG_ERROR("OpenCL backend not initialized");
+        return;
+    }
+    if (!dst || !weight) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding got null tensor");
+        return;
+    }
+
+    // Phase 1 strict:
+    // - dst must be FP32 and OpenCLBuffer-backed (executor allocates it as OpenCLBuffer)
+    // - weight must be FP32 and CPUBuffer-backed (model weight lives on CPU in your flow)
+    // - do CPU gather then H2D copy
+    if (dst->m_dtype != DataType::FP32) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding (Phase1) dst must be FP32");
+        return;
+    }
+    if (weight->m_dtype != DataType::FP32) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding (Phase1) weight must be FP32 (no dequant yet)");
+        return;
+    }
+
+    const size_t batch_size = tokens.size();
+    const size_t dim        = dst->m_shape[0];
+
+    if (dst->m_shape[2] != 1 || dst->m_shape[3] != 1) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding (Phase1) dst must be 2D-like (dim,batch,1,1)");
+        return;
+    }
+    if (dst->m_shape[1] != batch_size) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding (Phase1) batch mismatch: dst.shape[1] != tokens.size()");
+        return;
+    }
+
+    // Weight is expected to be an embedding table laid out like GGML path:
+    // each token row is contiguous with stride[1] bytes (see CPU reference):contentReference[oaicite:3]{index=3}
+    powerserve::CPUBuffer *w_cpu = nullptr;
+    try {
+        w_cpu = &const_cast<Tensor *>(weight)->get<powerserve::CPUBuffer>();
+    } catch (const std::bad_cast &e) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding (Phase1) expects weight backed by CPUBuffer");
+        return;
+    }
+    if (!w_cpu->m_data) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding (Phase1) weight CPUBuffer data is null");
+        return;
+    }
+
+    // 1) CPU gather into a temporary host tensor
+    Tensor host_tmp(DataType::FP32, dst->m_shape);
+    host_tmp.m_data = powerserve::CPUBuffer::create_buffer<float>(dst->m_shape);
+
+    auto *dst_host = static_cast<float *>(host_tmp.get<powerserve::CPUBuffer>().m_data);
+    auto *embd_tb  = static_cast<char *>(w_cpu->m_data);
+    const auto w_stride = w_cpu->m_stride; // bytes
+
+    for (size_t i = 0; i < batch_size; i++) {
+        const int token = tokens[i];
+        if (token < 0) {
+            POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding (Phase1) got negative token id");
+            return;
+        }
+
+        // row pointer = base + stride[1] * token
+        char *src = embd_tb + w_stride[1] * static_cast<size_t>(token);
+
+        // (optional) basic bounds check like GGMLBackend does:contentReference[oaicite:4]{index=4}
+        // Here we only check that src doesn't go backwards and that stride[1] is sane.
+        // Full bound check would require knowing total table bytes; we keep it minimal & fail-fast-ish.
+        if (w_stride[1] == 0) {
+            POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding (Phase1) weight stride[1] is 0");
+            return;
+        }
+
+        std::memcpy(dst_host + i * dim, src, dim * sizeof(float));
+    }
+
+    // 2) H2D copy into dst OpenCLBuffer using existing copy() (CPU -> OpenCL path):contentReference[oaicite:5]{index=5}
+    this->copy(dst, &host_tmp);
 }
 
-void OpenCLBackend::matmul(const Tensor * /*dst*/, const Tensor * /*src0*/, const Tensor * /*src1*/) const {
-    POWERSERVE_ABORT("OpenCLBackend::matmul TODO");
+void OpenCLBackend::matmul(const Tensor *dst, const Tensor *src0, const Tensor *src1) const {
+    if (!initialized) {
+        POWERSERVE_LOG_ERROR("OpenCL backend not initialized");
+        return;
+    }
+    if (!dst || !src0 || !src1) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::matmul got null tensor");
+        return;
+    }
+
+    // Strict mode (Phase 1), per matmul_minimal contract already documented in-file:
+    // A:{K,M,1,1}, B:{N,K,1,1}, C:{N,M,1,1}, FP32 only, 2D only.
+    if (dst->m_dtype != DataType::FP32 || src0->m_dtype != DataType::FP32 || src1->m_dtype != DataType::FP32) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::matmul (Phase1) only supports FP32");
+        return;
+    }
+
+    if (src0->m_shape[2] != 1 || src0->m_shape[3] != 1 ||
+        src1->m_shape[2] != 1 || src1->m_shape[3] != 1 ||
+        dst->m_shape[2]  != 1 || dst->m_shape[3]  != 1) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::matmul (Phase1) only supports 2D (shape[2]=shape[3]=1)");
+        return;
+    }
+
+    const size_t K = src0->m_shape[0];
+    const size_t M = src0->m_shape[1];
+    const size_t N = src1->m_shape[0];
+
+    if (src1->m_shape[1] != K) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::matmul (Phase1) requires B.shape[1]==A.shape[0] (K)");
+        return;
+    }
+    if (dst->m_shape[0] != N || dst->m_shape[1] != M) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::matmul (Phase1) requires C shape (N,M,1,1)");
+        return;
+    }
+
+    // Route to minimal kernel
+    this->matmul_minimal(const_cast<Tensor *>(dst), src0, src1);
 }
 
 void OpenCLBackend::matmul_minimal(Tensor * dst,
