@@ -51,7 +51,6 @@ bool OpenCLKernelManager::compile_embedded_kernels() {
     // 1. 编译 copy 内核
 #ifdef OPENCL_CPY_CL_AVAILABLE
     {
-        POWERSERVE_LOG_DEBUG("Compiling copy kernels...");
         const std::string& cpy_source = ::powerserve::opencl::embedded::cpy_cl_source;
         
         if (!cpy_source.empty()) {
@@ -68,7 +67,6 @@ bool OpenCLKernelManager::compile_embedded_kernels() {
     // 2. 编译 add 内核
 #ifdef OPENCL_ADD_CL_AVAILABLE
     {
-        POWERSERVE_LOG_DEBUG("Compiling add kernels...");
         const std::string& add_source = ::powerserve::opencl::embedded::add_cl_source;
         
         if (!add_source.empty()) {
@@ -88,7 +86,6 @@ bool OpenCLKernelManager::compile_embedded_kernels() {
     // 3. 编译 silu 内核
 #ifdef OPENCL_SILU_CL_AVAILABLE
     {
-        POWERSERVE_LOG_DEBUG("Compiling silu kernels...");
         const std::string& silu_source = ::powerserve::opencl::embedded::silu_cl_source;
         
         if (!silu_source.empty()) {
@@ -108,7 +105,6 @@ bool OpenCLKernelManager::compile_embedded_kernels() {
     // 4. 编译 gelu 内核
 #ifdef OPENCL_GELU_CL_AVAILABLE
     {
-        POWERSERVE_LOG_DEBUG("Compiling gelu kernels...");
         const std::string& gelu_source = ::powerserve::opencl::embedded::gelu_cl_source;
         
         if (!gelu_source.empty()) {
@@ -128,7 +124,6 @@ bool OpenCLKernelManager::compile_embedded_kernels() {
     // 5. 编译 matmul 内核
 #ifdef OPENCL_MATMUL_CL_AVAILABLE
     {
-        POWERSERVE_LOG_DEBUG("Compiling matmul kernels...");
         const std::string& matmul_source = ::powerserve::opencl::embedded::mul_mat_f16_f32_cl_source;
         
         if (!matmul_source.empty()) {
@@ -148,7 +143,6 @@ bool OpenCLKernelManager::compile_embedded_kernels() {
     // 6. 编译 rms_norm 内核
 #ifdef OPENCL_RMS_NORM_CL_AVAILABLE
     {
-        POWERSERVE_LOG_DEBUG("Compiling rms_norm kernels...");
         const std::string& rms_norm_source = ::powerserve::opencl::embedded::rms_norm_cl_source;
         
         if (!rms_norm_source.empty()) {
@@ -168,7 +162,6 @@ bool OpenCLKernelManager::compile_embedded_kernels() {
     // 7. 编译 softmax 内核
 #ifdef OPENCL_SOFTMAX_CL_AVAILABLE
     {
-        POWERSERVE_LOG_DEBUG("Compiling softmax kernels...");
         const std::string& softmax_source = ::powerserve::opencl::embedded::softmax_f32_cl_source;
         
         if (!softmax_source.empty()) {
@@ -188,7 +181,6 @@ bool OpenCLKernelManager::compile_embedded_kernels() {
     // 8. 编译 rope 内核
 #ifdef OPENCL_ROPE_CL_AVAILABLE
     {
-        POWERSERVE_LOG_DEBUG("Compiling rope kernels...");
         const std::string& rope_source = ::powerserve::opencl::embedded::rope_cl_source;
         
         if (!rope_source.empty()) {
@@ -205,7 +197,6 @@ bool OpenCLKernelManager::compile_embedded_kernels() {
     // 9. 编译 diag_mask_inf 内核
 #ifdef OPENCL_DIAG_MASK_INF_CL_AVAILABLE
     {
-        POWERSERVE_LOG_DEBUG("Compiling diag_mask_inf kernels...");
         const std::string& diag_mask_inf_source = ::powerserve::opencl::embedded::diag_mask_inf_cl_source;
         
         if (!diag_mask_inf_source.empty()) {
@@ -264,10 +255,7 @@ bool OpenCLKernelManager::compile_program(const std::string& program_name,
     
     POWERSERVE_LOG_DEBUG("compile_program_impl returned successfully");
     
-    // 自动提取所有kernel名 - 添加详细调试
-    POWERSERVE_LOG_DEBUG("Extracting kernel names from source...");
     std::vector<std::string> kernel_names = split_kernel_names(source_code);
-    POWERSERVE_LOG_DEBUG("Found {} kernels in source", kernel_names.size());
     
     // 如果没找到，输出源码片段帮助调试
     if (kernel_names.empty()) {
@@ -288,9 +276,8 @@ bool OpenCLKernelManager::compile_program(const std::string& program_name,
         if (kernel_pos != std::string::npos) {
             size_t sample_start = (kernel_pos > 50) ? kernel_pos - 50 : 0;
             size_t sample_end = std::min(source_code.length(), kernel_pos + 100);
-            POWERSERVE_LOG_DEBUG("Found 'kernel' at position {}, sample:", kernel_pos);
-            POWERSERVE_LOG_DEBUG("  ...{}...", 
-                source_code.substr(sample_start, sample_end - sample_start));
+            // POWERSERVE_LOG_DEBUG("Found 'kernel' at position {}, sample:", kernel_pos);
+            // POWERSERVE_LOG_DEBUG("  ...{}...", source_code.substr(sample_start, sample_end - sample_start));
         }
         
         // 也查找带下划线的版本
@@ -298,22 +285,20 @@ bool OpenCLKernelManager::compile_program(const std::string& program_name,
         if (underscore_kernel_pos != std::string::npos) {
             size_t sample_start = (underscore_kernel_pos > 50) ? underscore_kernel_pos - 50 : 0;
             size_t sample_end = std::min(source_code.length(), underscore_kernel_pos + 100);
-            POWERSERVE_LOG_DEBUG("Found '__kernel' at position {}, sample:", underscore_kernel_pos);
-            POWERSERVE_LOG_DEBUG("  ...{}...", 
-                source_code.substr(sample_start, sample_end - sample_start));
+            // POWERSERVE_LOG_DEBUG("Found '__kernel' at position {}, sample:", underscore_kernel_pos);
+            // POWERSERVE_LOG_DEBUG("  ...{}...", source_code.substr(sample_start, sample_end - sample_start));
         }
     } else {
         // 输出找到的内核名
-        for (const auto& kernel_name : kernel_names) {
-            POWERSERVE_LOG_DEBUG("  Kernel: {}", kernel_name);
-        }
+        // for (const auto& kernel_name : kernel_names) {
+        //     POWERSERVE_LOG_DEBUG("  Kernel: {}", kernel_name);
+        // }
     }
     
     // 为每个kernel创建cl_kernel对象
     std::unordered_map<std::string, cl_kernel> kernels;
     for (const auto& kernel_name : kernel_names) {
         cl_int err;
-        POWERSERVE_LOG_DEBUG("Creating kernel: {}", kernel_name);
         cl_kernel kernel = clCreateKernel(program, kernel_name.c_str(), &err);
         if (err != CL_SUCCESS) {
             POWERSERVE_LOG_ERROR("Failed to create kernel '{}': {}", 
@@ -331,7 +316,7 @@ bool OpenCLKernelManager::compile_program(const std::string& program_name,
         cache_item.last_used = std::chrono::steady_clock::now().time_since_epoch().count();
         kernel_cache_[kernel_name] = cache_item;
         
-        POWERSERVE_LOG_DEBUG("Created kernel: {}", kernel_name);
+        // POWERSERVE_LOG_DEBUG("Created kernel: {}", kernel_name);
     }
     
     // 创建缓存项
@@ -342,7 +327,6 @@ bool OpenCLKernelManager::compile_program(const std::string& program_name,
     
     programs_[program_name] = std::move(item);
     
-    POWERSERVE_LOG_DEBUG("compile_program END: {}", program_name);
     POWERSERVE_LOG_INFO("Program '{}' compiled successfully with {} kernels", 
                        program_name, programs_[program_name].kernels.size());
     return true;
@@ -621,7 +605,7 @@ std::vector<std::string> OpenCLKernelManager::split_kernel_names(const std::stri
                     if (pos > name_start) {
                         std::string kernel_name = source.substr(name_start, pos - name_start);
                         kernels.push_back(kernel_name);
-                        POWERSERVE_LOG_DEBUG("Found kernel: {}", kernel_name);
+                        // POWERSERVE_LOG_DEBUG("Found kernel: {}", kernel_name);
                         i = pos - 1; // 继续从当前位置搜索
                     }
                 }

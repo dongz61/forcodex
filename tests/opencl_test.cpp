@@ -1,5 +1,6 @@
 // src/backend/opencl/opencl_smoke_test.cpp
 #include "backend/opencl/opencl_backend.hpp"
+#include "backend/ggml/ggml_wrapper.cpp"
 #include "backend/cpu_buffer.hpp"
 #include "core/logger.hpp"
 #include "core/tensor.hpp"
@@ -74,6 +75,36 @@ static inline void ref_logits_B_KN(
         out_N[(size_t)v] = acc;
     }
 }
+
+static inline void ref_rmsnorm_f32(
+    const std::vector<float> &x,         // [rows*hidden]
+    const std::vector<float> &w,         // [hidden]
+    int hidden,
+    int rows,
+    float eps,
+    std::vector<float> &out              // [rows*hidden]
+) {
+    out.resize((size_t)hidden * (size_t)rows);
+    const float inv_hidden = 1.0f / (float)hidden;
+
+    for (int r = 0; r < rows; ++r) {
+        const float *xr = x.data() + (size_t)r * (size_t)hidden;
+        float *yr = out.data() + (size_t)r * (size_t)hidden;
+
+        double sumsq = 0.0;
+        for (int i = 0; i < hidden; ++i) {
+            const float v = xr[i];
+            sumsq += (double)v * (double)v;
+        }
+        const float mean = (float)(sumsq * inv_hidden);
+        const float scale = 1.0f / std::sqrt(mean + eps);
+
+        for (int i = 0; i < hidden; ++i) {
+            yr[i] = xr[i] * scale * w[(size_t)i];
+        }
+    }
+}
+
 
 // ---------------- the smoke test ----------------
 
@@ -244,10 +275,254 @@ bool run_opencl_backend_smoke_test() {
     return true;
 }
 
+bool run_opencl_backend_rope_vs_ggml_test() {
+    POWERSERVE_LOG_INFO("OpenCL rope-vs-ggml test: start");
+
+    // ---- minimal config just to satisfy backend init ----
+    ModelConfig::LLMConfig cfg{};
+    cfg.dim        = 16;  // hidden dimension (ne0)
+    cfg.vocab_size = 8;
+    cfg.n_layers   = 1;
+    cfg.n_heads    = 1;
+    cfg.n_kv_heads = 1;
+    cfg.kv_dim     = 16;
+    cfg.head_size  = 16;
+    cfg.seq_len    = 16;
+
+    // Setup RoPE config
+    cfg.rope_config.n_dims       = 16;        // rotate all dims for this test
+    cfg.rope_config.n_ctx_orig   = 2048;
+    cfg.rope_config.freq_base    = 10000.0f;
+    cfg.rope_config.freq_scale   = 1.0f;
+    cfg.rope_config.ext_factor   = 0.0f;      // keep it simple first
+    cfg.rope_config.attn_factor  = 1.0f;
+    cfg.rope_config.beta_fast    = 32.0f;
+    cfg.rope_config.beta_slow    = 0.0f;
+
+    // 先测 norm (rope_type=0)，再测 neox (rope_type=2)
+    // 这里假设 GGML_ROPE_TYPE_NEOX == 2
+    const int rope_types_to_test[2] = {0, 2};
+
+    HyperParams hp{};
+    hp.n_threads = 1;
+
+    // ---- init backends ----
+    OpenCLBackend ocl(cfg, hp);
+    if (!ocl.initialize()) {
+        POWERSERVE_LOG_ERROR("OpenCL rope-vs-ggml test: OpenCL backend.initialize failed");
+        return false;
+    }
+
+    powerserve::ggml::GGMLBackend ggml(cfg, hp);
+    if (!ggml.initialize()) {
+        POWERSERVE_LOG_ERROR("OpenCL rope-vs-ggml test: GGML backend.initialize failed");
+        return false;
+    }
+
+    // ---- build test tensor: shape {dim, batch, 1, 1} ----
+    const int D = (int)cfg.dim;
+    const int B = 3;
+
+    Shape shape{};
+    shape[0] = D;
+    shape[1] = B;
+    shape[2] = 1;
+    shape[3] = 1;
+
+    // src on CPU
+    std::vector<float> src_storage;
+    Tensor src_cpu = make_cpu_tensor_f32(shape, src_storage);
+    for (int b = 0; b < B; ++b) {
+        for (int i = 0; i < D; ++i) {
+            src_storage[(size_t)b * (size_t)D + (size_t)i] =
+                0.01f * (float)b + 0.001f * (float)i - 0.02f;
+        }
+    }
+
+    // positions
+    std::vector<int> pos = {0, 5, 17};
+
+    // outputs for ggml/opencl
+    std::vector<float> out_ggml_storage;
+    Tensor out_ggml_cpu = make_cpu_tensor_f32(shape, out_ggml_storage);
+
+    std::vector<float> out_ocl_storage;
+    Tensor out_ocl_cpu  = make_cpu_tensor_f32(shape, out_ocl_storage);
+
+    // OpenCL tensors
+    Tensor src_dev = make_opencl_tensor_f32(ocl, shape);
+    Tensor out_dev = make_opencl_tensor_f32(ocl, shape);
+
+    // Upload src to device
+    ocl.copy(&src_dev, &src_cpu);
+
+    // ---- run two rope_type variants ----
+    for (int t = 0; t < 2; ++t) {
+        cfg.rope_config.rope_type = rope_types_to_test[t];
+
+        // (1) GGML reference: ggml backend rope writes into CPU tensor
+        // NOTE: ggml backend expects dst/src on CPU buffers
+        Tensor ggml_in  = src_cpu;         // CPU input
+        Tensor ggml_out = out_ggml_cpu;    // CPU output
+        ggml.rope(&ggml_out, &ggml_in, pos, cfg.rope_config);
+
+        // (2) OpenCL backend rope: uses CPU fallback but takes dev input/out
+        ocl.rope(&out_dev, &src_dev, pos, cfg.rope_config);
+
+        // download OpenCL output
+        ocl.copy(&out_ocl_cpu, &out_dev);
+
+        // compare
+        const float atol = 1e-4f;
+        const float rtol = 1e-4f;
+        size_t bad_i = 0;
+        float bad_diff = 0.f;
+
+        bool ok = allclose(out_ocl_storage, out_ggml_storage, atol, rtol, &bad_i, &bad_diff);
+        if (!ok) {
+            POWERSERVE_LOG_ERROR("OpenCL rope-vs-ggml test: FAILED (rope_type mismatch)");
+            printf("rope_type=%d bad_i=%zu ocl=%f ggml=%f diff=%f\n",
+                   cfg.rope_config.rope_type,
+                   bad_i,
+                   (double)out_ocl_storage[bad_i],
+                   (double)out_ggml_storage[bad_i],
+                   (double)bad_diff);
+
+            // print head for quick diagnosis
+            printf("OCL out head:  ");
+            for (size_t i = 0; i < std::min<size_t>(8, out_ocl_storage.size()); ++i) {
+                printf("%f ", (double)out_ocl_storage[i]);
+            }
+            printf("\nGGML out head: ");
+            for (size_t i = 0; i < std::min<size_t>(8, out_ggml_storage.size()); ++i) {
+                printf("%f ", (double)out_ggml_storage[i]);
+            }
+            printf("\n");
+            return false;
+        }
+
+        POWERSERVE_LOG_INFO("OpenCL rope-vs-ggml test: PASS (rope_type=%d)", cfg.rope_config.rope_type);
+    }
+
+    POWERSERVE_LOG_INFO("OpenCL rope-vs-ggml test: PASS");
+    return true;
+}
+
+
+bool run_opencl_backend_rmsnorm_test() {
+    POWERSERVE_LOG_INFO("OpenCL rmsnorm test: start");
+
+    // Minimal config
+    ModelConfig::LLMConfig cfg{};
+    cfg.dim        = 16;   // hidden
+    cfg.vocab_size = 8;
+    cfg.n_layers   = 1;
+    cfg.n_heads    = 1;
+    cfg.n_kv_heads = 1;
+    cfg.kv_dim     = 16;
+    cfg.head_size  = 16;
+    cfg.seq_len    = 16;
+
+    HyperParams hp{};
+    hp.n_threads = 1;
+
+    OpenCLBackend backend(cfg, hp);
+    if (!backend.initialize()) {
+        POWERSERVE_LOG_ERROR("OpenCL rmsnorm test: backend.initialize failed");
+        return false;
+    }
+
+    const int H = (int)cfg.dim;
+    const int M = 3;      // rows (batch-like)
+    const float eps = 1e-5f;
+
+    // x_dev: shape {H, M, 1, 1}
+    Shape x_shape{};
+    x_shape[0] = H;
+    x_shape[1] = M;
+    x_shape[2] = 1;
+    x_shape[3] = 1;
+
+    // host x
+    std::vector<float> x_host_storage;
+    Tensor x_cpu = make_cpu_tensor_f32(x_shape, x_host_storage);
+    for (int r = 0; r < M; ++r) {
+        for (int i = 0; i < H; ++i) {
+            // deterministic but nontrivial
+            x_host_storage[(size_t)r * (size_t)H + (size_t)i] =
+                0.01f * (float)r + 0.001f * (float)i - 0.002f;
+        }
+    }
+
+    Tensor x_dev = make_opencl_tensor_f32(backend, x_shape);
+    backend.copy(&x_dev, &x_cpu); // H2D
+
+    // weight_cpu: shape {H,1,1,1}
+    Shape w_shape{};
+    w_shape[0] = H;
+    w_shape[1] = 1;
+    w_shape[2] = 1;
+    w_shape[3] = 1;
+
+    std::vector<float> w_storage;
+    Tensor w_cpu = make_cpu_tensor_f32(w_shape, w_storage);
+    for (int i = 0; i < H; ++i) {
+        // gamma: vary a bit
+        w_storage[(size_t)i] = 1.0f + 0.01f * (float)i;
+    }
+
+    // out_dev: shape {H,M,1,1}
+    Tensor out_dev = make_opencl_tensor_f32(backend, x_shape);
+
+    // ---- call backend rmsnorm (CPU fallback) ----
+    backend.rmsnorm(&out_dev, &x_dev, &w_cpu, eps);
+
+    // ---- D2H out ----
+    std::vector<float> out_host_storage;
+    Tensor out_cpu = make_cpu_tensor_f32(x_shape, out_host_storage);
+    backend.copy(&out_cpu, &out_dev); // D2H
+
+    // ---- CPU reference ----
+    std::vector<float> ref_out;
+    ref_rmsnorm_f32(x_host_storage, w_storage, H, M, eps, ref_out);
+
+    // ---- compare ----
+    const float atol = 1e-4f;
+    const float rtol = 1e-4f;
+    size_t bad_i = 0;
+    float bad_diff = 0.f;
+    bool ok = allclose(out_host_storage, ref_out, atol, rtol, &bad_i, &bad_diff);
+
+    if (!ok) {
+        POWERSERVE_LOG_ERROR("OpenCL rmsnorm test: FAILED (mismatch)");
+        printf("bad_i=%zu gpu=%f cpu=%f diff=%f\n",
+               bad_i,
+               (double)out_host_storage[bad_i],
+               (double)ref_out[bad_i],
+               (double)bad_diff);
+
+        printf("GPU out head: ");
+        for (size_t i = 0; i < std::min<size_t>(8, out_host_storage.size()); ++i) {
+            printf("%f ", (double)out_host_storage[i]);
+        }
+        printf("\nCPU out head: ");
+        for (size_t i = 0; i < std::min<size_t>(8, ref_out.size()); ++i) {
+            printf("%f ", (double)ref_out[i]);
+        }
+        printf("\n");
+        return false;
+    }
+
+    POWERSERVE_LOG_INFO("OpenCL rmsnorm test: PASS");
+    return true;
+}
+
+
 } // namespace powerserve::opencl
 
 int main() {
-    bool ok = powerserve::opencl::run_opencl_backend_smoke_test();
-    return ok ? 0 : 1;
+    bool ok1 = powerserve::opencl::run_opencl_backend_smoke_test();
+    bool ok2 = powerserve::opencl::run_opencl_backend_rope_vs_ggml_test();
+    return (ok1 && ok2) ? 0 : 1;
 }
 
