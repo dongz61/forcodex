@@ -50,7 +50,7 @@ cl_mem OpenCLMemoryPool::allocate(size_t size, cl_mem_flags flags) {
 cl_mem OpenCLMemoryPool::allocate_pooled(size_t size, cl_mem_flags flags) {
     size = align_size(size);
     
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     
     // 首先在内存池中寻找合适的块
     cl_mem buffer = find_suitable_pool_entry(size);
@@ -60,9 +60,9 @@ cl_mem OpenCLMemoryPool::allocate_pooled(size_t size, cl_mem_flags flags) {
     }
     
     // 释放锁，分配新内存
-    mutex_.unlock();
+    lock.unlock();
     buffer = allocate_impl(size, flags, false);
-    mutex_.lock();
+    lock.lock();
     
     if (!buffer) {
         POWERSERVE_LOG_ERROR("Failed to allocate pooled buffer of size {}", size);
