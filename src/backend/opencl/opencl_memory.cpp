@@ -172,15 +172,59 @@ void OpenCLMemoryPool::clear_pool() {
     POWERSERVE_LOG_DEBUG("Memory pool cleared");
 }
 
+// for copy
+static inline bool get_mem_size(OpenCLContext* ctx, cl_mem mem, size_t* out_size) {
+    if (!mem || !out_size) return false;
+    cl_int err = clGetMemObjectInfo(mem, CL_MEM_SIZE, sizeof(size_t), out_size, nullptr);
+    if (!ctx->check_error(err, "clGetMemObjectInfo(CL_MEM_SIZE)")) return false;
+    return true;
+}
+// for copy end
+
 bool OpenCLMemoryPool::copy_host_to_device(cl_mem dst, const void* src, size_t size, size_t offset) {
+
     if (!dst || !src) {
         POWERSERVE_LOG_ERROR("Invalid arguments for copy_host_to_device");
         return false;
     }
+    if (size == 0) {
+        POWERSERVE_LOG_WARN("copy_host_to_device: size == 0, skip");
+        return true;
+    }
+
+    // query dst mem size
+    size_t dst_size = 0;
+    if (!get_mem_size(context_.get(), dst, &dst_size)) {
+        POWERSERVE_LOG_ERROR("copy_host_to_device: failed to query dst mem size");
+        return false;
+    }
+
+    // OOB check
+    if (offset + size > dst_size) {
+        POWERSERVE_LOG_ERROR("H2D OOB: offset+size={} > dst_size={}",
+                             offset + size, dst_size);
+        return false;
+    }
+
+    POWERSERVE_LOG_DEBUG("H2D copy: dst={}, src={}, bytes={}, offset={}, dst_size={}",
+                         (void*)dst, src, size, offset, dst_size);
     
-    cl_int err = clEnqueueWriteBuffer(context_->get_queue(), dst, CL_TRUE, 
-                                      offset, size, src, 0, nullptr, nullptr);
-    return context_->check_error(err, "clEnqueueWriteBuffer");
+    // volatile uint8_t probe = 0;
+    // const uint8_t* p = reinterpret_cast<const uint8_t*>(src);
+    // probe ^= p[0];
+    // probe ^= p[size - 1];
+    // (void)probe;
+    // POWERSERVE_LOG_ERROR(">>> PROBE_END src={} size={}", src, size);
+
+    cl_int err = clEnqueueWriteBuffer(context_->get_queue(), dst, CL_TRUE,
+                                  offset, size, src, 0, nullptr, nullptr);
+    if (!context_->check_error(err, "clEnqueueWriteBuffer")) return false;
+
+    // ✅ 新增：强制 flush + finish，确保拷贝真正完成并同步 driver
+    err = clFinish(context_->get_queue());
+    if (!context_->check_error(err, "clFinish(after H2D)")) return false;
+
+    return true;
 }
 
 bool OpenCLMemoryPool::copy_device_to_host(void* dst, cl_mem src, size_t size, size_t offset) {
@@ -188,20 +232,56 @@ bool OpenCLMemoryPool::copy_device_to_host(void* dst, cl_mem src, size_t size, s
         POWERSERVE_LOG_ERROR("Invalid arguments for copy_device_to_host");
         return false;
     }
-    
-    cl_int err = clEnqueueReadBuffer(context_->get_queue(), src, CL_TRUE, 
+
+    // size check
+    size_t src_size = 0;
+    if (!get_mem_size(context_.get(), src, &src_size)) {
+        POWERSERVE_LOG_ERROR("copy_device_to_host: failed to query src mem size");
+        return false;
+    }
+
+    if (offset + size > src_size) {
+        POWERSERVE_LOG_ERROR("D2H OOB: offset+size={} > src_size={}",
+                             offset + size, src_size);
+        return false;
+    }
+
+    POWERSERVE_LOG_DEBUG("D2H copy: src={}, dst={}, bytes={}, offset={}, src_size={}",
+                         (void*)src, dst, size, offset, src_size);
+
+    cl_int err = clEnqueueReadBuffer(context_->get_queue(), src, CL_TRUE,
                                      offset, size, dst, 0, nullptr, nullptr);
     return context_->check_error(err, "clEnqueueReadBuffer");
 }
+
 
 bool OpenCLMemoryPool::copy_device_to_device(cl_mem dst, cl_mem src, size_t size) {
     if (!dst || !src) {
         POWERSERVE_LOG_ERROR("Invalid arguments for copy_device_to_device");
         return false;
     }
-    
-    cl_int err = clEnqueueCopyBuffer(context_->get_queue(), src, dst, 0, 0, size, 
-                                     0, nullptr, nullptr);
+
+    size_t src_size = 0, dst_size = 0;
+    if (!get_mem_size(context_.get(), src, &src_size)) {
+        POWERSERVE_LOG_ERROR("copy_device_to_device: failed to query src mem size");
+        return false;
+    }
+    if (!get_mem_size(context_.get(), dst, &dst_size)) {
+        POWERSERVE_LOG_ERROR("copy_device_to_device: failed to query dst mem size");
+        return false;
+    }
+
+    if (size > src_size || size > dst_size) {
+        POWERSERVE_LOG_ERROR("D2D OOB: size={} src_size={} dst_size={}",
+                             size, src_size, dst_size);
+        return false;
+    }
+
+    POWERSERVE_LOG_DEBUG("D2D copy: src={}, dst={}, bytes={}, src_size={}, dst_size={}",
+                         (void*)src, (void*)dst, size, src_size, dst_size);
+
+    cl_int err = clEnqueueCopyBuffer(context_->get_queue(), src, dst,
+                                     0, 0, size, 0, nullptr, nullptr);
     return context_->check_error(err, "clEnqueueCopyBuffer");
 }
 

@@ -10,8 +10,32 @@
 #include <vector>
 #include <cmath>
 #include <algorithm>
+#include <execinfo.h>
 
 namespace powerserve::opencl {
+
+// for debug
+std::shared_ptr<OpenCLBuffer> OpenCLBackend::debug_get_k_cache(size_t L) const {
+    if (!m_kv || L >= m_kv->key.size()) return nullptr;
+    return m_kv->key[L];
+}
+
+std::shared_ptr<OpenCLBuffer> OpenCLBackend::debug_get_v_cache(size_t L) const {
+    if (!m_kv || L >= m_kv->value.size()) return nullptr;
+    return m_kv->value[L];
+}
+
+static inline void dump_backtrace() {
+    void* bt[32];
+    int n = backtrace(bt, 32);
+    char** syms = backtrace_symbols(bt, n);
+    POWERSERVE_LOG_ERROR(">>> copy() backtrace:");
+    for (int i = 0; i < n; ++i) {
+        POWERSERVE_LOG_ERROR("  {}", syms[i]);
+    }
+    free(syms);
+}
+// for debug end
 
 OpenCLBackend::OpenCLBackend(const ModelConfig::LLMConfig &llm,
                              const HyperParams &hparams)
@@ -670,16 +694,26 @@ void OpenCLBackend::rope(
     }
 
     // minimal shape contract: {dim, batch, 1, 1}
-    if (src->m_shape[2] != 1 || src->m_shape[3] != 1) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::rope fallback only supports shape (dim,batch,1,1)");
+    const int dim   = (int)src->m_shape[0];
+    const int ne1   = (int)src->m_shape[1]; // heads
+    const int ne2   = (int)src->m_shape[2]; // tokens/time
+    const int ne3   = (int)src->m_shape[3]; // batch (bring-up：先限制 1)
+
+    if (ne3 != 1) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::rope fallback only supports shape[3]==1 for now, got {}", ne3);
         return;
     }
 
-    const int dim   = (int)src->m_shape[0];
-    const int batch = (int)src->m_shape[1];
+    // 兼容旧测试：如果 shape[2]==1 且 pos.size()==shape[1]，就把 shape[1] 当 token 数
+    const bool legacy_axis1 = (ne2 == 1 && (int)pos.size() == ne1);
 
-    if ((int)pos.size() != batch) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::rope pos.size() must equal batch (shape[1])");
+    // H = head 数，T = token 数
+    const int H = legacy_axis1 ? 1   : ne1;
+    const int T = legacy_axis1 ? ne1 : ne2;
+
+    if (!legacy_axis1 && (int)pos.size() != T) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::rope pos.size() must equal n_tokens (shape[2]) = {}, got {}",
+                            T, (int)pos.size());
         return;
     }
 
@@ -714,40 +748,44 @@ void OpenCLBackend::rope(
     const float theta_scale = std::pow(rope_cfg.freq_base, -2.0f / (float)n_dims);
     const float sin_sign = 1.0f; // forward only
 
-    for (int b = 0; b < batch; ++b) {
-        const float theta_base = (float)pos[b];
-        float *x = x_host + (size_t)b * (size_t)dim;
-        float *y = y_host + (size_t)b * (size_t)dim;
+    for (int t = 0; t < T; ++t) {
+        const float theta_base = (float)pos[t];
 
-        // default copy-through
-        std::memcpy(y, x, sizeof(float) * (size_t)dim);
-
-        // init cache for this pos
+        // 每个 token 初始化一次 cache
         rope_cache_init(theta_base, rope_cfg.freq_scale, /*freq_factors*/nullptr,
                         corr_dims, (int64_t)dim, rope_cfg.ext_factor, rope_cfg.attn_factor,
                         cache.data(), sin_sign, theta_scale);
 
-        if (!is_neox) {
-            // norm: rotate (i0, i0+1)
-            for (int i0 = 0; i0 < n_dims; i0 += 2) {
-                const float cos_theta = cache[(size_t)i0 + 0];
-                const float sin_theta = cache[(size_t)i0 + 1];
-                const float x0 = x[i0 + 0];
-                const float x1 = x[i0 + 1];
-                y[i0 + 0] = x0 * cos_theta - x1 * sin_theta;
-                y[i0 + 1] = x0 * sin_theta + x1 * cos_theta;
-            }
-        } else {
-            // neox: rotate (ic, ic + n_dims/2) but still use cache indexed by i0=2*ic
-            const int half = n_dims / 2;
-            for (int i0 = 0; i0 < n_dims; i0 += 2) {
-                const int ic = i0 / 2;
-                const float cos_theta = cache[(size_t)i0 + 0];
-                const float sin_theta = cache[(size_t)i0 + 1];
-                const float x0 = x[ic];
-                const float x1 = x[ic + half];
-                y[ic]        = x0 * cos_theta - x1 * sin_theta;
-                y[ic + half] = x0 * sin_theta + x1 * cos_theta;
+        for (int h = 0; h < H; ++h) {
+            // contiguous layout: ((t * H + h) * dim)
+            const size_t row = ((size_t)t * (size_t)H + (size_t)h) * (size_t)dim;
+            float *x = x_host + row;
+            float *y = y_host + row;
+
+            std::memcpy(y, x, sizeof(float) * (size_t)dim);
+
+            if (!is_neox) {
+                // norm: rotate (i0, i0+1)
+                for (int i0 = 0; i0 < n_dims; i0 += 2) {
+                    const float cos_theta = cache[(size_t)i0 + 0];
+                    const float sin_theta = cache[(size_t)i0 + 1];
+                    const float x0 = x[i0 + 0];
+                    const float x1 = x[i0 + 1];
+                    y[i0 + 0] = x0 * cos_theta - x1 * sin_theta;
+                    y[i0 + 1] = x0 * sin_theta + x1 * cos_theta;
+                }
+            } else {
+                // neox: rotate (ic, ic + n_dims/2)
+                const int half = n_dims / 2;
+                for (int i0 = 0; i0 < n_dims; i0 += 2) {
+                    const int ic = i0 / 2;
+                    const float cos_theta = cache[(size_t)i0 + 0];
+                    const float sin_theta = cache[(size_t)i0 + 1];
+                    const float x0 = x[ic];
+                    const float x1 = x[ic + half];
+                    y[ic]        = x0 * cos_theta - x1 * sin_theta;
+                    y[ic + half] = x0 * sin_theta + x1 * cos_theta;
+                }
             }
         }
     }
@@ -755,8 +793,8 @@ void OpenCLBackend::rope(
     // ---- H2D host_y -> out ----
     this->copy(out, &host_y);
 
-    POWERSERVE_LOG_DEBUG("OpenCLBackend::rope CPU fallback done (dim={}, batch={}, n_dims={}, rope_type={})",
-                         dim, batch, n_dims, rope_type);
+    POWERSERVE_LOG_ERROR("rope fallback: dim={}, heads={}, tokens={}, batch={}, n_dims={}, rope_type={}",
+                     dim, H, T, ne3, n_dims, rope_type);
 }
 
 
@@ -894,8 +932,11 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
         POWERSERVE_LOG_ERROR("copy: null tensor");
         return;
     }
+    if (!memory_pool) {
+        POWERSERVE_LOG_ERROR("copy: memory_pool is null");
+        return;
+    }
 
-    // 1) bytes 计算（建议你们项目里封装成 Tensor::nbytes()）
     const size_t src_bytes = numel_4d(src) * dtype_size(src->m_dtype);
     const size_t dst_bytes = numel_4d(dst) * dtype_size(dst->m_dtype);
     if (src_bytes == 0 || dst_bytes == 0 || src_bytes != dst_bytes) {
@@ -903,7 +944,6 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
         return;
     }
 
-    // 2) 取 buffer（按你们 Tensor 接口改）
     BaseBuffer& src_base = src->get<BaseBuffer>();
     BaseBuffer& dst_base = dst->get<BaseBuffer>();
 
@@ -912,67 +952,38 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
     auto* src_cl  = dynamic_cast<OpenCLBuffer*>(&src_base);
     auto* dst_cl  = dynamic_cast<OpenCLBuffer*>(&dst_base);
 
-    cl_command_queue q = context->get_queue();
-    if (!q) {
-        POWERSERVE_LOG_ERROR("copy: OpenCL queue is null");
-        return;
-    }
-
-    cl_int err = CL_SUCCESS;
-
-    // --- H2D: CPU -> OpenCL ---
+    // H2D
     if (src_cpu && dst_cl) {
-        void* host = src_cpu->m_data; 
+        
+        void* host = src_cpu->m_data;
         cl_mem dev = dst_cl->get_device_buffer();
         if (!host || !dev) {
             POWERSERVE_LOG_ERROR("H2D: invalid host/dev");
             return;
         }
-
-        err = clEnqueueWriteBuffer(
-            q, dev,
-            CL_TRUE,   // bring-up 阶段用 blocking，最稳
-            0,         // !!! 你们 sub-buffer 模式下永远 0
-            src_bytes,
-            host,
-            0, nullptr, nullptr
-        );
-        if (err != CL_SUCCESS) {
-            POWERSERVE_LOG_ERROR("H2D clEnqueueWriteBuffer failed: {}", context->get_error_string(err));
-            return;
+        if (!memory_pool->copy_host_to_device(dev, host, src_bytes, 0)) {
+            POWERSERVE_LOG_ERROR("H2D: copy_host_to_device failed");
         }
-
         POWERSERVE_LOG_DEBUG("copy H2D bytes={}", src_bytes);
         return;
     }
 
-    // --- D2H: OpenCL -> CPU ---
+    // D2H
     if (src_cl && dst_cpu) {
-        void* host = dst_cpu->m_data; 
+        void* host = dst_cpu->m_data;
         cl_mem dev = src_cl->get_device_buffer();
         if (!host || !dev) {
             POWERSERVE_LOG_ERROR("D2H: invalid host/dev");
             return;
         }
-
-        err = clEnqueueReadBuffer(
-            q, dev,
-            CL_TRUE,
-            0,         // !!! sub-buffer 模式下永远 0
-            src_bytes,
-            host,
-            0, nullptr, nullptr
-        );
-        if (err != CL_SUCCESS) {
-            POWERSERVE_LOG_ERROR("D2H clEnqueueReadBuffer failed: {}", context->get_error_string(err));
-            return;
+        if (!memory_pool->copy_device_to_host(host, dev, src_bytes, 0)) {
+            POWERSERVE_LOG_ERROR("D2H: copy_device_to_host failed");
         }
-
         POWERSERVE_LOG_DEBUG("copy D2H bytes={}", src_bytes);
         return;
     }
 
-    // --- D2D: OpenCL -> OpenCL（含 sub-buffer/view）---
+    // D2D
     if (src_cl && dst_cl) {
         cl_mem src_dev = src_cl->get_device_buffer();
         cl_mem dst_dev = dst_cl->get_device_buffer();
@@ -980,31 +991,14 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
             POWERSERVE_LOG_ERROR("D2D: invalid cl_mem");
             return;
         }
-
-        err = clEnqueueCopyBuffer(
-            q,
-            src_dev,
-            dst_dev,
-            0, 0,       // !!! 两边都 0，因为 cl_mem 已经是正确的 sub-buffer
-            src_bytes,
-            0, nullptr, nullptr
-        );
-        if (err != CL_SUCCESS) {
-            POWERSERVE_LOG_ERROR("D2D clEnqueueCopyBuffer failed: {}", context->get_error_string(err));
-            return;
+        if (!memory_pool->copy_device_to_device(dst_dev, src_dev, src_bytes)) {
+            POWERSERVE_LOG_ERROR("D2D: copy_device_to_device failed");
         }
-
-        // bring-up 阶段可以 finish，保证确定性；后面再优化成 event/异步
-        err = clFinish(q);
-        if (err != CL_SUCCESS) {
-            POWERSERVE_LOG_WARN("clFinish failed: {}", context->get_error_string(err));
-        }
-
         POWERSERVE_LOG_DEBUG("copy D2D bytes={}", src_bytes);
         return;
     }
 
-    // --- CPU -> CPU（可选兜底） ---
+    // CPU2CPU
     if (src_cpu && dst_cpu) {
         std::memcpy(dst_cpu->m_data, src_cpu->m_data, src_bytes);
         POWERSERVE_LOG_DEBUG("copy CPU2CPU bytes={}", src_bytes);
@@ -1013,7 +1007,6 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
 
     POWERSERVE_LOG_ERROR("copy: unsupported src/dst buffer types");
 }
-
 
 void OpenCLBackend::print(const Tensor* x, size_t size) const {
     POWERSERVE_ABORT("OpenCLBackend::print TODO");
@@ -1157,16 +1150,6 @@ void OpenCLBackend::ensure_kv_cache_allocated_v0() {
 
     POWERSERVE_LOG_INFO("KVCache v0 allocated: layers={}, kv_dim={}, max_seq_len={}",
                         n_layers, kv_dim, max_seq_len);
-}
-
-// for debug
-std::shared_ptr<OpenCLBuffer> OpenCLBackend::debug_get_k_cache(size_t L) const {
-    if (!m_kv || L >= m_kv->key.size()) return nullptr;
-    return m_kv->key[L];
-}
-std::shared_ptr<OpenCLBuffer> OpenCLBackend::debug_get_v_cache(size_t L) const {
-    if (!m_kv || L >= m_kv->value.size()) return nullptr;
-    return m_kv->value[L];
 }
 
 } // namespace powerserve::opencl

@@ -315,23 +315,36 @@ bool run_opencl_backend_rope_vs_ggml_test() {
 
     powerserve::ggml::GGMLBackend ggml(cfg, hp);
 
+    // ====== STEP: make GGMLBackend usable standalone (no plan()) ======
+    // GGMLBackend::rope() will call m_thread_pool->run(...) :contentReference[oaicite:5]{index=5}
+    // but m_thread_pool is nullptr right after construction :contentReference[oaicite:6]{index=6},
+    // and wdata/wsize are also empty until setup_work_data() :contentReference[oaicite:7]{index=7}.
+    ggml.setup_threadpool();
+    // For ROPE, plan() uses sizeof(float) * dst_dim * n_threads as the base work size :contentReference[oaicite:8]{index=8}
+    ggml.setup_work_data(sizeof(float) * (size_t)cfg.dim * (size_t)hp.n_threads);
+    // ================================================================
+
     // ---- build test tensor: shape {dim, batch, 1, 1} ----
     const int D = (int)cfg.dim;
-    const int B = 3;
+    const int T = 3;        // tokens = pos.size()
+    const int H = 1;        // heads
+    const int B = 1;        // batch (bring-up，先固定 1)
 
     Shape shape{};
     shape[0] = D;
-    shape[1] = B;
-    shape[2] = 1;
-    shape[3] = 1;
+    shape[1] = H;
+    shape[2] = T;
+    shape[3] = B;
 
-    // src on CPU
+    // src_storage: size = D * H * T * B = D * T
     std::vector<float> src_storage;
     Tensor src_cpu = make_cpu_tensor_f32(shape, src_storage);
-    for (int b = 0; b < B; ++b) {
+
+    // 填数据：按 token 维写，每个 token 一行 D
+    for (int t = 0; t < T; ++t) {
         for (int i = 0; i < D; ++i) {
-            src_storage[(size_t)b * (size_t)D + (size_t)i] =
-                0.01f * (float)b + 0.001f * (float)i - 0.02f;
+            src_storage[(size_t)t * (size_t)D + (size_t)i] =
+                0.01f * (float)t + 0.001f * (float)i - 0.02f;
         }
     }
 
@@ -397,7 +410,7 @@ bool run_opencl_backend_rope_vs_ggml_test() {
             return false;
         }
 
-        POWERSERVE_LOG_INFO("OpenCL rope-vs-ggml test: PASS (rope_type=%d)", cfg.rope_config.rope_type);
+        POWERSERVE_LOG_INFO("OpenCL rope-vs-ggml test: PASS (rope_type={})", cfg.rope_config.rope_type);
     }
 
     POWERSERVE_LOG_INFO("OpenCL rope-vs-ggml test: PASS");
@@ -521,4 +534,3 @@ int main() {
     bool ok2 = powerserve::opencl::run_opencl_backend_rope_vs_ggml_test();
     return (ok1 && ok2) ? 0 : 1;
 }
-
