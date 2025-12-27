@@ -59,9 +59,20 @@ public:
     }
 
     template <typename Buffer>
+    // ziqian: add debug info for bad cast
     auto get() const -> Buffer & {
-        return dynamic_cast<Buffer &>(*m_data);
+        
+        // return dynamic_cast<Buffer &>(*m_data);
+        
+        auto *p = dynamic_cast<Buffer *>(m_data.get());
+        if (!p) {
+            fprintf(stderr, "[Tensor::get] bad cast: want=%s, actual=%s\n",
+                    typeid(Buffer).name(), typeid(*m_data).name());
+            abort(); // 或 throw runtime_error
+        }
+        return *p;
     }
+    // ziqian: end
 
     bool is_quantized() const {
         return m_dtype != DataType::FP32;

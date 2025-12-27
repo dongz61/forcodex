@@ -49,21 +49,34 @@ private:
 
     // ziqian：增加OpenCL buffer创建
     template <typename T>
+    void create_opencl_buffer_for_tensor(Tensor* tensor) {
+        POWERSERVE_ASSERT(tensor != nullptr);
+
+        // If this tensor is a view, allocate as a sub-buffer view.
+        // NOTE: In the graph codepath, view tensor allocation uses TensorNode metadata (parent pointer & shape).
+        // For raw Tensor*, we cannot reliably reconstruct the parent relationship.
+        // So we only support non-view tensors here.
+
+        // base buffer must be created by OpenCLBackend (it owns memory_pool)
+        auto* backend = m_platform.get_backend(m_graph.m_model_id);
+        auto* ocl = dynamic_cast<opencl::OpenCLBackend*>(backend);
+        if (!ocl) {
+            POWERSERVE_ABORT("create_opencl_buffer_for_tensor: backend is not OpenCLBackend");
+        }
+
+        auto ocl_buf = ocl->create_buffer(tensor->m_shape, tensor->m_dtype);
+        tensor->m_data = std::static_pointer_cast<BaseBuffer>(ocl_buf);
+    }
+
+    template <typename T>
     void create_opencl_buffer(std::shared_ptr<TensorNode> tensor) {
         if (tensor->type == NodeType::TENSOR_VIEW) {
             tensor->m_data =
-                opencl::OpenCLBuffer::create_buffer_view<T>(tensor->tensor_view()->parent->get<opencl::OpenCLBuffer>(), tensor->m_shape);
+                opencl::OpenCLBuffer::create_buffer_view<T>(
+                    tensor->tensor_view()->parent->get<opencl::OpenCLBuffer>(),
+                    tensor->m_shape);
         } else {
-             // 关键：base buffer 由 OpenCLBackend 创建（它持有 memory_pool）
-            auto* backend = m_platform.get_backend(m_graph.m_model_id);
-            auto* ocl = dynamic_cast<opencl::OpenCLBackend*>(backend);
-            if (!ocl) {
-                POWERSERVE_ABORT("create_opencl_buffer: backend is not OpenCLBackend");
-            }
-
-            auto ocl_buf = ocl->create_buffer(tensor->m_shape, tensor->m_dtype);
-
-            tensor->m_data = std::static_pointer_cast<BaseBuffer>(ocl_buf);
+            create_opencl_buffer_for_tensor<T>(tensor.get());
         }
     }
     // ziqian：end

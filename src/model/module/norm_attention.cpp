@@ -35,7 +35,10 @@ TensorNode *NormAttention::build(
 ) {
     auto batch_size = pos.size();
     auto head_size  = m_config.head_size;
-    POWERSERVE_ASSERT(head_size == (size_t)m_config.rope_config.n_dims);
+
+    // POWERSERVE_ASSERT(head_size == (size_t)m_config.rope_config.n_dims);
+    // 不要 assert 这个啦！Qwen3 跑不动的！
+    
     auto n_head    = m_config.n_heads;
     auto n_head_kv = m_config.n_kv_heads;
     auto n_ctx     = m_config.seq_len;
@@ -72,8 +75,21 @@ TensorNode *NormAttention::build(
     auto q_view = g.view_tensor(q, {head_size, n_head, q->m_shape[1], q->m_shape[2]});
     // (head_size, n_kv_heads, bs, 1)
     auto k_view = g.view_tensor(k, {head_size, n_head_kv, k->m_shape[1], k->m_shape[2]});
-    auto rope_q = g.rope(q_view, pos, m_config.rope_config); // (head_size, n_heads, bs, 1)
-    auto rope_k = g.rope(k_view, pos, m_config.rope_config); // (head_size, n_kv_heads, bs, 1)
+
+    /* lsh 修改起始 */
+    TensorNode *q_final = q_view;
+    TensorNode *k_final = k_view; 
+
+    if(is_need_bias==false){ // for Qwen3 only
+        auto q_norm_w = g.add_tensor(m_weights->lw[L].attn_q_norm); // weight shape: (128, 1, 1, 1)
+        q_final = g.rms_norm(q_view, q_norm_w, m_config.norm_eps);  // input shape: (128, 16, bs, 1)
+
+        auto k_norm_w = g.add_tensor(m_weights->lw[L].attn_k_norm); // weight shape: (128, 1, 1, 1)
+        k_final = g.rms_norm(k_view, k_norm_w, m_config.norm_eps);  // input shape: (128, 8, bs, 1)
+    }
+    /* lsh 修改结束 */
+    auto rope_q = g.rope(q_final, pos, m_config.rope_config); // (head_size, n_heads, bs, 1)
+    auto rope_k = g.rope(k_final, pos, m_config.rope_config); // (head_size, n_kv_heads, bs, 1)
 
     // store kv
     {

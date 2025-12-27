@@ -21,17 +21,91 @@
 
 namespace powerserve {
 
+// ziqian：增加通过后端决定分配buffer类型
 void Executor::allocate_buffers() {
-    
-    // ziqian：增加通过后端决定分配buffer类型
     const bool use_opencl = m_platform.using_opencl(m_graph.m_model_id);
-    
+
+    powerserve::opencl::OpenCLBackend* cl_backend = nullptr;
+    if (use_opencl) {
+        cl_backend = dynamic_cast<powerserve::opencl::OpenCLBackend*>(
+            m_platform.get_backend(m_graph.m_model_id));
+        POWERSERVE_ASSERT(cl_backend && "OpenCL backend is null or not OpenCLBackend");
+    }
+
     for (auto &node : m_graph.tensors) {
         auto tensor = node->tensor();
         if (!tensor) continue;
 
-        if (tensor->m_data) continue;
+        // ----------------------------
+        // Case 1: tensor 已经有 buffer
+        // ----------------------------
+        if (tensor->m_data) {
+            if (!use_opencl) {
+                continue; // CPU backend 下无需处理
+            }
 
+            // 如果已经是 OpenCLBuffer，直接跳过
+            {
+                auto &base = tensor->get<BaseBuffer>();
+                if (dynamic_cast<powerserve::opencl::OpenCLBuffer*>(&base)) {
+                    continue;
+                }
+            }
+
+            // 如果是 CPUBuffer，则迁移：CPUBuffer -> OpenCLBuffer
+            {
+                auto &base = tensor->get<BaseBuffer>();
+                auto *cpu_buf = dynamic_cast<powerserve::CPUBuffer*>(&base);
+                if (!cpu_buf) {
+                    POWERSERVE_ABORT("allocate_buffers: tensor has non-CPU, non-OpenCL buffer type");
+                }
+                if (tensor->m_dtype != DataType::FP32 &&
+                    tensor->m_dtype != DataType::FP16 &&
+                    tensor->m_dtype != DataType::INT32) {
+                    POWERSERVE_LOG_DEBUG("skip migrate CPU->OpenCL for dtype={} shape=[{}, {}, {}, {}]",
+                                        (int)tensor->m_dtype,
+                                        tensor->m_shape[0], tensor->m_shape[1], tensor->m_shape[2], tensor->m_shape[3]);
+                    continue;
+                }
+
+                // 1) 创建一个同 shape/dtype 的临时 tensor（只用于承载 OpenCLBuffer）
+                //    注意：这里要根据你的 Tensor/Node API 来构造/clone metadata
+                Tensor tmp = *tensor;        // 复制元信息（shape/dtype）
+                tmp.m_data.reset();          // 清掉原 buffer（重要！）
+
+                // 2) 给 tmp 分配 OpenCLBuffer（复用你现有的 create_opencl_buffer）
+                switch (tensor->m_dtype) {
+                case DataType::FP32:
+                    create_opencl_buffer_for_tensor<float>(&tmp);
+                    break;
+                case DataType::FP16:
+                    create_opencl_buffer_for_tensor<uint16_t>(&tmp);
+                    break;
+                case DataType::INT32:
+                    create_opencl_buffer_for_tensor<int32_t>(&tmp);
+                    break;
+                default:
+                    POWERSERVE_ABORT(
+                        "allocate_buffers migrate: unsupported dtype={} shape=[{}, {}, {}, {}]",
+                        (int)tensor->m_dtype,
+                        tensor->m_shape[0], tensor->m_shape[1], tensor->m_shape[2], tensor->m_shape[3]
+                    );
+
+                }
+
+                // 3) 调用你已有的 copy（H2D）
+                cl_backend->copy(&tmp, tensor);
+
+                // 4) 用 tmp 的 OpenCLBuffer 替换掉原 tensor 的 CPUBuffer
+                tensor->m_data = std::move(tmp.m_data);
+
+                continue;
+            }
+        }
+
+        // ----------------------------
+        // Case 2: tensor 没有 buffer（原有逻辑）
+        // ----------------------------
         switch (tensor->m_dtype) {
         case DataType::FP32:
             if (use_opencl) create_opencl_buffer<float>(node);
@@ -49,9 +123,8 @@ void Executor::allocate_buffers() {
             POWERSERVE_ABORT("allocate_buffers: unsupported dtype");
         }
     }
-    // ziqian：end
 }
-
+// ziqian：end
 
 void Executor::plan() {
     // ziqian：增加通过后端决定使用什么plan方法

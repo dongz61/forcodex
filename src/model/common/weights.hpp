@@ -39,6 +39,10 @@ public:
     Tensor attn_k_bias;
     Tensor attn_v_bias;
 
+    // Below are tensors Special for Qwen3
+    Tensor attn_q_norm;   
+    Tensor attn_k_norm;
+
     virtual ~LayerWeights() = default;
 
 protected:
