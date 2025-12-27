@@ -1100,9 +1100,32 @@ void OpenCLBackend::add_cache(const Tensor *k,
     m_kv->position += 1;
 }
 
-void OpenCLBackend::transpose(const Tensor * /*out*/, const Tensor * /*x*/) const {
-    POWERSERVE_ABORT("OpenCLBackend::transpose TODO");
+void OpenCLBackend::transpose(const Tensor *out, const Tensor *x) const {
+    POWERSERVE_ASSERT(out && x);
+    POWERSERVE_ASSERT(out->m_data && x->m_data);
+
+    // Ensure input is OpenCLBuffer-backed
+    try {
+        (void)const_cast<Tensor *>(x)->get<OpenCLBuffer>();
+    } catch (const std::bad_cast &e) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::transpose expects OpenCLBuffer input: {}", e.what());
+        POWERSERVE_ABORT("transpose: input not OpenCLBuffer");
+    }
+
+    // Share buffer object
+    auto *out_nc = const_cast<Tensor *>(out);
+    auto *x_nc   = const_cast<Tensor *>(x);
+    out_nc->m_data = x_nc->m_data;
+
+    // Now both point to same OpenCLBuffer object
+    auto &xbuf = x_nc->get<OpenCLBuffer>();
+    auto &obuf = out_nc->get<OpenCLBuffer>();
+
+    obuf.m_stride = xbuf.m_stride;
+    std::swap(obuf.m_stride[0], obuf.m_stride[1]);
 }
+
+
 
 void OpenCLBackend::ensure_kv_cache_allocated_v0() {
     // v0: batch fixed 1, FP32, prealloc
