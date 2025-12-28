@@ -77,8 +77,18 @@ OpenCLBuffer& OpenCLBuffer::operator=(OpenCLBuffer&& other) noexcept {
         return *this;
     }
 
-    // Release current
-    this->~OpenCLBuffer();
+    if (m_owns_buffer && m_device_buffer) {
+        if (m_is_subbuffer) {
+            clReleaseMemObject(m_device_buffer);
+        } else if (memory_pool) {
+            if (m_is_pooled) memory_pool->free_pooled(m_device_buffer);
+            else             memory_pool->free(m_device_buffer);
+        } else {
+            // 兜底：没有 pool 时避免泄漏
+            clReleaseMemObject(m_device_buffer);
+        }
+    }
+    m_device_buffer = nullptr;
 
     // Move assign
     m_stride        = other.m_stride;

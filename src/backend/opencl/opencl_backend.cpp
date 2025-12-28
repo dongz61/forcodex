@@ -141,6 +141,40 @@ void OpenCLBackend::plan(std::vector<std::shared_ptr<OpNode>> & /*ops*/) {
     // TODO: optional scheduling / workspace planning
 }
 
+static inline powerserve::Stride make_contig_stride_bytes(const powerserve::Shape &shape, size_t elem) {
+    powerserve::Stride s{};
+    s[0] = elem;
+    for (size_t i = 1; i < shape.size(); ++i) s[i] = s[i - 1] * shape[i - 1];
+    return s;
+}
+
+bool OpenCLBackend::is_contiguous(const Tensor *tensor, int n) const {
+    if (!tensor) return false;
+    const size_t elem = powerserve::get_type_size(tensor->m_dtype);
+
+    // Only care first n dims (caller decides), but we store strides for full rank=4
+    const auto expected = make_contig_stride_bytes(tensor->m_shape, elem);
+
+    try {
+        const auto &buf = const_cast<Tensor*>(tensor)->get<OpenCLBuffer>();
+        for (int i = 0; i < n; ++i) {
+            if (buf.m_stride[i] != expected[i]) return false;
+        }
+        return true;
+    } catch (...) {
+        // CPU path (optional, keeps function generic)
+        try {
+            const auto &buf = const_cast<Tensor*>(tensor)->get<powerserve::CPUBuffer>();
+            for (int i = 0; i < n; ++i) {
+                if (buf.m_stride[i] != expected[i]) return false;
+            }
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+}
+
 // ==================== 算子实现 ====================
 
 // for add_minimal
@@ -802,12 +836,85 @@ void OpenCLBackend::softmax(const Tensor * /*out*/, const Tensor * /*x*/) const 
     POWERSERVE_ABORT("OpenCLBackend::softmax TODO");
 }
 
-void OpenCLBackend::permute(const Tensor * /*out*/, const Tensor * /*x*/, Shape /*axes*/) const {
-    POWERSERVE_ABORT("OpenCLBackend::permute TODO");
+void OpenCLBackend::permute(const Tensor *out, const Tensor *x, Shape axes) const {
+    // Old code aborts: :contentReference[oaicite:5]{index=5}
+    if (!initialized) POWERSERVE_ABORT("OpenCL backend not initialized");
+    if (!out || !x)   POWERSERVE_ABORT("permute got null tensor");
+
+    // permute = view: share the same underlying buffer, only rewrite stride
+    auto *dst = const_cast<Tensor*>(out);
+
+    // require OpenCL buffers
+    auto &xbuf = const_cast<Tensor*>(x)->get<OpenCLBuffer>();
+    (void)xbuf.get_device_buffer(); // touch to validate
+
+    // share underlying cl_mem (including sub-buffer views)
+    dst->m_data = x->m_data;
+
+    auto &obuf = dst->get<OpenCLBuffer>();
+    // new_stride[i] = old_stride[axes[i]]  (same as ggml: :contentReference[oaicite:6]{index=6})
+    Stride new_stride{};
+    for (size_t i = 0; i < axes.size(); ++i) new_stride[i] = xbuf.m_stride[axes[i]];
+    obuf.m_stride = new_stride;
 }
 
-void OpenCLBackend::cont(const Tensor * /*out*/, const Tensor * /*x*/) const {
-    POWERSERVE_ABORT("OpenCLBackend::cont TODO");
+void OpenCLBackend::cont(const Tensor *out, const Tensor *x) const {
+    if (!initialized) POWERSERVE_ABORT("OpenCL backend not initialized");
+    if (!out || !x)   POWERSERVE_ABORT("cont got null tensor");
+
+    // If already contiguous, a plain copy is fine
+    if (is_contiguous(x, 4)) {
+        this->copy(out, x);
+        return;
+    }
+
+    const size_t elem = powerserve::get_type_size(x->m_dtype);
+
+    // D2H: read raw physical buffer bytes into host_in (contiguous physical)
+    Tensor host_in(x->m_dtype, x->m_shape);
+    Tensor host_out(x->m_dtype, x->m_shape);
+
+    // allocate CPU buffers with correct element type size
+    switch (x->m_dtype) {
+    case DataType::FP32:
+        host_in.m_data  = powerserve::CPUBuffer::create_buffer<float>(x->m_shape);
+        host_out.m_data = powerserve::CPUBuffer::create_buffer<float>(x->m_shape);
+        break;
+    case DataType::FP16:
+        host_in.m_data  = powerserve::CPUBuffer::create_buffer<uint16_t>(x->m_shape);
+        host_out.m_data = powerserve::CPUBuffer::create_buffer<uint16_t>(x->m_shape);
+        break;
+    case DataType::INT32:
+        host_in.m_data  = powerserve::CPUBuffer::create_buffer<int32_t>(x->m_shape);
+        host_out.m_data = powerserve::CPUBuffer::create_buffer<int32_t>(x->m_shape);
+        break;
+    default:
+        POWERSERVE_ABORT("cont: unsupported dtype={}", (int)x->m_dtype);
+    }
+
+    this->copy(&host_in, x);
+
+    // Reorder: logical -> contiguous
+    const auto &shape  = x->m_shape;
+    const auto &stride = const_cast<Tensor*>(x)->get<OpenCLBuffer>().m_stride; // bytes
+
+    const char *src = reinterpret_cast<const char*>(host_in.get<powerserve::CPUBuffer>().m_data);
+    char *dst       = reinterpret_cast<char*>(host_out.get<powerserve::CPUBuffer>().m_data);
+
+    size_t idx = 0;
+    for (size_t i3 = 0; i3 < shape[3]; ++i3) {
+        for (size_t i2 = 0; i2 < shape[2]; ++i2) {
+            for (size_t i1 = 0; i1 < shape[1]; ++i1) {
+                for (size_t i0 = 0; i0 < shape[0]; ++i0, ++idx) {
+                    const size_t off = i0 * stride[0] + i1 * stride[1] + i2 * stride[2] + i3 * stride[3];
+                    std::memcpy(dst + idx * elem, src + off, elem);
+                }
+            }
+        }
+    }
+
+    // H2D
+    this->copy(out, &host_out);
 }
 
 void OpenCLBackend::softmax_ext(
@@ -1124,8 +1231,6 @@ void OpenCLBackend::transpose(const Tensor *out, const Tensor *x) const {
     obuf.m_stride = xbuf.m_stride;
     std::swap(obuf.m_stride[0], obuf.m_stride[1]);
 }
-
-
 
 void OpenCLBackend::ensure_kv_cache_allocated_v0() {
     // v0: batch fixed 1, FP32, prealloc

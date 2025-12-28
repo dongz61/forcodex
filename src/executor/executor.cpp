@@ -340,8 +340,11 @@ void Executor::run() {
         } break;
 
         case OpType::VIEW: {
-            auto src = op->prev[0]->tensor();
             auto out = op->output();
+            auto *out_view_node = op->next[0]->tensor_view();
+            POWERSERVE_ASSERT(out_view_node && "VIEW op output is not a TensorViewNode");
+            Tensor *src = out_view_node->parent;
+            POWERSERVE_ASSERT(src && "TensorViewNode parent is null");
             auto [stride, offset] = op->get_params<ViewParams>();
 
             if (use_opencl) {

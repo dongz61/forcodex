@@ -220,7 +220,7 @@ auto Graph::cont(TensorNode *x, Shape shape) -> TensorNode * {
 auto Graph::view(const TensorNode *x, Shape shape, Shape stride, size_t offset) -> TensorViewNode * {
     auto out = view_tensor(x, shape);
     auto op  = new_op(OpType::VIEW);
-    op->set_inputs({});
+    op->set_inputs({const_cast<TensorNode *>(x)});
     op->set_outputs({out});
     op->set_params(ViewParams({.stride = stride, .offset = offset}));
 
