@@ -24,17 +24,17 @@ OpenCLBuffer::OpenCLBuffer(Stride stride,
     m_owns_buffer(owns_buffer),
     m_is_pooled(is_pooled),
     m_is_subbuffer(is_subbuffer) {
-    POWERSERVE_LOG_DEBUG(
-        "OpenCLBuffer created: size={} bytes, pooled={}, owns={}, subbuffer={}",
-        m_size, m_is_pooled, m_owns_buffer, m_is_subbuffer
-    );
+    // POWERSERVE_LOG_DEBUG(
+    //     "OpenCLBuffer created: size={} bytes, pooled={}, owns={}, subbuffer={}",
+    //     m_size, m_is_pooled, m_owns_buffer, m_is_subbuffer
+    // );
 }
 
 OpenCLBuffer::~OpenCLBuffer() {
-    POWERSERVE_LOG_DEBUG(
-        "OpenCLBuffer destroying: size={} bytes, pooled={}, owns={}, subbuffer={}",
-        m_size, m_is_pooled, m_owns_buffer, m_is_subbuffer
-    );
+    // POWERSERVE_LOG_DEBUG(
+    //     "OpenCLBuffer destroying: size={} bytes, pooled={}, owns={}, subbuffer={}",
+    //     m_size, m_is_pooled, m_owns_buffer, m_is_subbuffer
+    // );
 
     if (!m_owns_buffer || !m_device_buffer) {
         return;
@@ -69,7 +69,6 @@ OpenCLBuffer::OpenCLBuffer(OpenCLBuffer&& other) noexcept :
     other.m_device_buffer = nullptr;
     other.m_owns_buffer   = false;
     other.m_is_subbuffer  = false;
-    POWERSERVE_LOG_DEBUG("OpenCLBuffer move-constructed");
 }
 
 OpenCLBuffer& OpenCLBuffer::operator=(OpenCLBuffer&& other) noexcept {

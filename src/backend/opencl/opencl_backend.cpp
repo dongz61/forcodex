@@ -268,10 +268,6 @@ static inline const Tensor * ensure_contiguous_or_pack_f32(
         return src;
     }
 
-    POWERSERVE_LOG_DEBUG("ensure_contiguous: packing tensor (shape={},{},{},{})",
-                         (int)src->m_shape[0], (int)src->m_shape[1],
-                         (int)src->m_shape[2], (int)src->m_shape[3]);
-
     // Allocate a temporary OpenCLBuffer-backed tensor with same shape/dtype
     tmp_dev = Tensor(src->m_dtype, src->m_shape);
     tmp_dev.m_data = self->create_buffer(src->m_shape, src->m_dtype);
@@ -1437,7 +1433,6 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
         if (!memory_pool->copy_host_to_device(dev, host, src_bytes, 0)) {
             POWERSERVE_LOG_ERROR("H2D: copy_host_to_device failed");
         }
-        POWERSERVE_LOG_DEBUG("copy H2D bytes={}", src_bytes);
         return;
     }
 
@@ -1452,7 +1447,6 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
         if (!memory_pool->copy_device_to_host(host, dev, src_bytes, 0)) {
             POWERSERVE_LOG_ERROR("D2H: copy_device_to_host failed");
         }
-        POWERSERVE_LOG_DEBUG("copy D2H bytes={}", src_bytes);
         return;
     }
 
@@ -1467,14 +1461,12 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
         if (!memory_pool->copy_device_to_device(dst_dev, src_dev, src_bytes)) {
             POWERSERVE_LOG_ERROR("D2D: copy_device_to_device failed");
         }
-        POWERSERVE_LOG_DEBUG("copy D2D bytes={}", src_bytes);
         return;
     }
 
     // CPU2CPU
     if (src_cpu && dst_cpu) {
         std::memcpy(dst_cpu->m_data, src_cpu->m_data, src_bytes);
-        POWERSERVE_LOG_DEBUG("copy CPU2CPU bytes={}", src_bytes);
         return;
     }
 

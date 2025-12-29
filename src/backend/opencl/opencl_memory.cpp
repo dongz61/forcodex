@@ -34,7 +34,7 @@ cl_mem OpenCLMemoryPool::allocate_impl(size_t size, cl_mem_flags flags, bool upd
         std::lock_guard<std::mutex> lock(mutex_);
         total_allocated_ += size;
         update_peak_usage();
-        POWERSERVE_LOG_DEBUG("Allocated {} bytes of OpenCL memory, total: {}", size, total_allocated_);
+        // POWERSERVE_LOG_DEBUG("Allocated {} bytes of OpenCL memory, total: {}", size, total_allocated_);
     }
     
     return buffer;
@@ -55,7 +55,6 @@ cl_mem OpenCLMemoryPool::allocate_pooled(size_t size, cl_mem_flags flags) {
     // 首先在内存池中寻找合适的块
     cl_mem buffer = find_suitable_pool_entry(size);
     if (buffer) {
-        POWERSERVE_LOG_DEBUG("Reusing pooled buffer for {} bytes", size);
         return buffer;
     }
     
@@ -82,8 +81,6 @@ cl_mem OpenCLMemoryPool::allocate_pooled(size_t size, cl_mem_flags flags) {
     
     memory_pool_.push_back(block);
     
-    POWERSERVE_LOG_DEBUG("Allocated new pooled buffer: {} bytes, id: {}, pool size: {}", 
-                        size, block.allocation_id, memory_pool_.size());
     return buffer;
 }
 
@@ -101,8 +98,6 @@ cl_mem OpenCLMemoryPool::find_suitable_pool_entry(size_t size) {
     
     if (best_fit) {
         best_fit->in_use = true;
-        POWERSERVE_LOG_DEBUG("Found suitable pool entry: {} bytes (requested: {})", 
-                            best_fit->size, size);
         return best_fit->buffer;
     }
     
@@ -127,12 +122,9 @@ void OpenCLMemoryPool::free(cl_mem buffer) {
         memory_pool_.erase(it);
         total_allocated_ -= freed_size;
         
-        POWERSERVE_LOG_DEBUG("Freed pooled buffer: {} bytes, remaining: {}", 
-                            freed_size, total_allocated_);
     } else {
         // 不在池中：直接释放
         clReleaseMemObject(buffer);
-        POWERSERVE_LOG_DEBUG("Freed non-pooled buffer");
     }
 }
 
@@ -144,8 +136,6 @@ void OpenCLMemoryPool::free_pooled(cl_mem buffer) {
     for (auto& block : memory_pool_) {
         if (block.buffer == buffer) {
             block.in_use = false;
-            POWERSERVE_LOG_DEBUG("Marked pooled buffer as free: {} bytes, id: {}", 
-                                block.size, block.allocation_id);
             return;
         }
     }
@@ -205,9 +195,6 @@ bool OpenCLMemoryPool::copy_host_to_device(cl_mem dst, const void* src, size_t s
                              offset + size, dst_size);
         return false;
     }
-
-    POWERSERVE_LOG_DEBUG("H2D copy: dst={}, src={}, bytes={}, offset={}, dst_size={}",
-                         (void*)dst, src, size, offset, dst_size);
     
     // volatile uint8_t probe = 0;
     // const uint8_t* p = reinterpret_cast<const uint8_t*>(src);
@@ -246,9 +233,6 @@ bool OpenCLMemoryPool::copy_device_to_host(void* dst, cl_mem src, size_t size, s
         return false;
     }
 
-    POWERSERVE_LOG_DEBUG("D2H copy: src={}, dst={}, bytes={}, offset={}, src_size={}",
-                         (void*)src, dst, size, offset, src_size);
-
     cl_int err = clEnqueueReadBuffer(context_->get_queue(), src, CL_TRUE,
                                      offset, size, dst, 0, nullptr, nullptr);
     return context_->check_error(err, "clEnqueueReadBuffer");
@@ -277,8 +261,6 @@ bool OpenCLMemoryPool::copy_device_to_device(cl_mem dst, cl_mem src, size_t size
         return false;
     }
 
-    POWERSERVE_LOG_DEBUG("D2D copy: src={}, dst={}, bytes={}, src_size={}, dst_size={}",
-                         (void*)src, (void*)dst, size, src_size, dst_size);
 
     cl_int err = clEnqueueCopyBuffer(context_->get_queue(), src, dst,
                                      0, 0, size, 0, nullptr, nullptr);
@@ -340,7 +322,7 @@ bool OpenCLMemoryPool::unmap_memory(cl_mem buffer, void* mapped_ptr) {
 void OpenCLMemoryPool::update_peak_usage() {
     if (total_allocated_ > peak_usage_) {
         peak_usage_ = total_allocated_;
-        POWERSERVE_LOG_DEBUG("New peak memory usage: {} bytes", peak_usage_);
+        // POWERSERVE_LOG_DEBUG("New peak memory usage: {} bytes", peak_usage_);
     }
 }
 

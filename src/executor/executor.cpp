@@ -124,9 +124,6 @@ void Executor::allocate_buffers() {
                 if (tensor->m_dtype != DataType::FP32 &&
                     tensor->m_dtype != DataType::FP16 &&
                     tensor->m_dtype != DataType::INT32) {
-                    POWERSERVE_LOG_DEBUG("skip migrate CPU->OpenCL for dtype={} shape=[{}, {}, {}, {}]",
-                                         (int)tensor->m_dtype,
-                                         tensor->m_shape[0], tensor->m_shape[1], tensor->m_shape[2], tensor->m_shape[3]);
                     continue;
                 }
 

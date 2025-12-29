@@ -115,7 +115,22 @@ auto Qwen2Model::forward(
         return LogitsVector();
     }
 
+    // ziqian add: 增加把返回的opencl buffer转成cpu buffer的逻辑
+    // If logits buffer is not CPUBuffer (e.g., OpenCLBuffer), do a D2H copy first.
+    // LogitsVector currently assumes CPUBuffer.  :contentReference[oaicite:4]{index=4}
+    if (dynamic_cast<CPUBuffer*>(logits->m_data.get()) == nullptr) {
+        Tensor host_logits(DataType::FP32, logits->m_shape);
+        host_logits.m_data = CPUBuffer::create_buffer<float>(logits->m_shape);
+
+        // D2H (OpenCL->CPU) via backend copy() interface :contentReference[oaicite:5]{index=5}
+        auto *backend = m_platform->get_backend(m_config->model_id);  // :contentReference[oaicite:6]{index=6}
+        backend->copy(&host_logits, logits);
+
+        return LogitsVector(host_logits.m_data, m_config->llm.vocab_size, batch_size);
+    }
+
     return LogitsVector(logits->m_data, m_config->llm.vocab_size, batch_size);
+    // ziqian end
 }
 
 auto Qwen2Model::decode(Sampler &sampler, const std::vector<Token> tokens, const std::vector<int> pos, bool lm_head)
