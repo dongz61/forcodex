@@ -175,6 +175,115 @@ bool OpenCLBackend::is_contiguous(const Tensor *tensor, int n) const {
     }
 }
 
+static inline void pack_contiguous_cpu_f32(
+    powerserve::opencl::OpenCLBackend *self,
+    const Tensor *src,
+    Tensor *dst_contig_dev
+) {
+    POWERSERVE_ASSERT(self && src && dst_contig_dev);
+
+    if (src->m_dtype != DataType::FP32 || dst_contig_dev->m_dtype != DataType::FP32) {
+        POWERSERVE_LOG_ERROR("pack_contiguous_cpu_f32 only supports FP32 (got src={}, dst={})",
+                             (int)src->m_dtype, (int)dst_contig_dev->m_dtype);
+        return;
+    }
+    if (dst_contig_dev->m_shape != src->m_shape) {
+        POWERSERVE_LOG_ERROR("pack_contiguous_cpu_f32 shape mismatch");
+        return;
+    }
+
+    // ----------------------------
+    // D2H: src -> host_src
+    // ----------------------------
+    Tensor host_src(DataType::FP32, src->m_shape);
+    host_src.m_data = powerserve::CPUBuffer::create_buffer<float>(src->m_shape);
+
+    self->copy(&host_src, src);
+
+    // Get src strides in bytes (from CPUBuffer after D2H copy)
+    powerserve::CPUBuffer *src_cpu = nullptr;
+    try {
+        src_cpu = &host_src.get<powerserve::CPUBuffer>();
+    } catch (const std::bad_cast &e) {
+        POWERSERVE_LOG_ERROR("pack_contiguous_cpu_f32: host_src is not CPUBuffer? {}", e.what());
+        return;
+    }
+
+    const auto s = src->m_shape;         // {ne0,ne1,ne2,ne3}
+    const auto nb = src_cpu->m_stride;   // bytes stride for host_src
+
+    const size_t ne0 = s[0], ne1 = s[1], ne2 = s[2], ne3 = s[3];
+    const size_t elem = sizeof(float);
+
+    // ----------------------------
+    // CPU pack -> host_contig
+    // ----------------------------
+    Tensor host_contig(DataType::FP32, src->m_shape);
+    host_contig.m_data = powerserve::CPUBuffer::create_buffer<float>(src->m_shape);
+
+    float *dst_ptr = static_cast<float *>(host_contig.get<powerserve::CPUBuffer>().m_data);
+    const char *src_base = static_cast<const char *>(src_cpu->m_data);
+
+    // destination is standard contiguous row-major in your stride convention:
+    // linear index = (((i3*ne2 + i2)*ne1 + i1)*ne0 + i0)
+    size_t out_idx = 0;
+    for (size_t i3 = 0; i3 < ne3; ++i3) {
+        for (size_t i2 = 0; i2 < ne2; ++i2) {
+            for (size_t i1 = 0; i1 < ne1; ++i1) {
+                // Pointer to the start of this (i1,i2,i3) slice in src
+                const char *src_row = src_base
+                    + (size_t)i3 * (size_t)nb[3]
+                    + (size_t)i2 * (size_t)nb[2]
+                    + (size_t)i1 * (size_t)nb[1];
+
+                for (size_t i0 = 0; i0 < ne0; ++i0) {
+                    const char *p = src_row + (size_t)i0 * (size_t)nb[0];
+                    float v;
+                    std::memcpy(&v, p, elem);
+                    dst_ptr[out_idx++] = v;
+                }
+            }
+        }
+    }
+
+    // ----------------------------
+    // H2D: host_contig -> dst_contig_dev
+    // ----------------------------
+    self->copy(dst_contig_dev, &host_contig);
+}
+
+static inline const Tensor * ensure_contiguous_or_pack_f32(
+    powerserve::opencl::OpenCLBackend *self,
+    const Tensor *src,
+    int n_dims_check,
+    Tensor &tmp_dev
+) {
+    POWERSERVE_ASSERT(self && src);
+    if (self->is_contiguous(src, n_dims_check)) {
+        return src;
+    }
+
+    POWERSERVE_LOG_DEBUG("ensure_contiguous: packing tensor (shape={},{},{},{})",
+                         (int)src->m_shape[0], (int)src->m_shape[1],
+                         (int)src->m_shape[2], (int)src->m_shape[3]);
+
+    // Allocate a temporary OpenCLBuffer-backed tensor with same shape/dtype
+    tmp_dev = Tensor(src->m_dtype, src->m_shape);
+    tmp_dev.m_data = self->create_buffer(src->m_shape, src->m_dtype);
+    if (!tmp_dev.m_data) {
+        POWERSERVE_LOG_ERROR("ensure_contiguous: failed to allocate temp OpenCL buffer");
+        return src; // fallback: return src, but caller should be aware this may break
+    }
+
+    pack_contiguous_cpu_f32(self, src, &tmp_dev);
+
+    // Safety: packed result must be contiguous
+    if (!self->is_contiguous(&tmp_dev, n_dims_check)) {
+        POWERSERVE_LOG_ERROR("ensure_contiguous: pack produced non-contiguous tensor unexpectedly");
+    }
+    return &tmp_dev;
+}
+
 // ==================== 算子实现 ====================
 
 // for add_minimal
@@ -291,7 +400,14 @@ void OpenCLBackend::add(const Tensor *dst, const Tensor *src0, const Tensor *src
         POWERSERVE_LOG_ERROR("OpenCLBackend::add (Phase1) requires same shape (no broadcast)");
         return;
     }
-    this->add_minimal(const_cast<Tensor *>(dst), src0, src1);
+    // Ensure inputs are contiguous for minimal kernel
+    Tensor tmp0, tmp1;
+    auto *self = const_cast<OpenCLBackend*>(this);
+
+    const Tensor *src0_c = ensure_contiguous_or_pack_f32(self, src0, 4, tmp0);
+    const Tensor *src1_c = ensure_contiguous_or_pack_f32(self, src1, 4, tmp1);
+
+    self->add_minimal(const_cast<Tensor *>(dst), src0_c, src1_c);
 }
 
 void OpenCLBackend::get_embedding(
@@ -418,7 +534,14 @@ void OpenCLBackend::matmul(const Tensor *dst, const Tensor *src0, const Tensor *
     }
 
     // Route to minimal kernel
-    this->matmul_minimal(const_cast<Tensor *>(dst), src0, src1);
+    // Ensure A/B are contiguous for minimal kernel (2D matmul, but safest to check 2 dims only)
+    Tensor tmpA, tmpB;
+    auto *self = const_cast<OpenCLBackend*>(this);
+
+    const Tensor *A_c = ensure_contiguous_or_pack_f32(self, src0, 2, tmpA);
+    const Tensor *B_c = ensure_contiguous_or_pack_f32(self, src1, 2, tmpB);
+
+    self->matmul_minimal(const_cast<Tensor *>(dst), A_c, B_c);
 }
 
 void OpenCLBackend::matmul_minimal(Tensor * dst,
