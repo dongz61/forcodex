@@ -382,25 +382,57 @@ void Executor::run() {
             out->get<CPUBuffer>().m_data   = (char *)out->get<CPUBuffer>().m_data + offset;
         } break;
 
+        case OpType::SOFTMAX_EXT: {
+            auto out               = op->output();
+            auto x                 = op->prev[0]->tensor();
+            auto mask              = op->prev[1]->tensor();
+            auto [scale, max_bias] = op->get_params<SoftmaxExtParams>();
+
+            backend->softmax_ext(out, x, mask, scale, max_bias);
+        } break;
 
         case OpType::GET_MASK: {
-            if (use_opencl) {
-                POWERSERVE_ABORT("GET_MASK currently only supported on CPU backend");
-            }
             auto out         = op->output();
             auto [mask, pos] = op->get_params<GetMaskParams>();
             auto n_kv        = out->m_shape[0];
             auto batch_size  = out->m_shape[1];
 
             POWERSERVE_ASSERT(out->m_dtype == DataType::FP32);
-            auto mask_buf = (float *)out->get<CPUBuffer>().m_data;
+
+            if (!use_opencl) {
+                // ===== CPU original path =====
+                auto mask_buf = (float *)out->get<CPUBuffer>().m_data;
+                for (size_t i = 0; i < batch_size; i++) {
+                    size_t cur_pos = pos[i];
+                    for (size_t j = 0; j < n_kv; j++) {
+                        mask_buf[j + i * n_kv] = (j <= cur_pos) ? 0.f : -INFINITY;
+                    }
+                }
+                break;
+            }
+
+            // ===== OpenCL bring-up fallback path =====
+            // 1) create a temporary CPU tensor
+            Tensor tmp_cpu(DataType::FP32, out->m_shape);
+            tmp_cpu.m_data = powerserve::CPUBuffer::create_buffer<float>(out->m_shape);
+
+            // 2) fill mask on CPU (same logic)
+            auto mask_buf = (float *)tmp_cpu.get<CPUBuffer>().m_data;
             for (size_t i = 0; i < batch_size; i++) {
                 size_t cur_pos = pos[i];
                 for (size_t j = 0; j < n_kv; j++) {
                     mask_buf[j + i * n_kv] = (j <= cur_pos) ? 0.f : -INFINITY;
                 }
             }
+
+            // 3) copy CPU -> OpenCL output tensor
+            // backend is the current backend (OpenCLBackend when use_opencl)
+            auto *cl_backend = dynamic_cast<powerserve::opencl::OpenCLBackend *>(backend);
+            POWERSERVE_ASSERT(cl_backend && "backend is not OpenCLBackend while use_opencl=true");
+            cl_backend->copy(out, &tmp_cpu);
+
         } break;
+
 
         case OpType::TRANSPOSE: {
             auto x   = op->prev[0]->tensor();

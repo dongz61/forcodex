@@ -525,12 +525,172 @@ bool run_opencl_backend_rmsnorm_test() {
     POWERSERVE_LOG_INFO("OpenCL rmsnorm test: PASS");
     return true;
 }
+bool run_opencl_backend_softmax_ext_vs_ggml_test() {
+    POWERSERVE_LOG_INFO("OpenCL softmax_ext-vs-ggml test: start");
+
+    // ---- minimal config ----
+    ModelConfig::LLMConfig cfg{};
+    cfg.dim        = 16;
+    cfg.vocab_size = 8;
+    cfg.n_layers   = 1;
+
+    // IMPORTANT: ne02 is used as n_head in ggml slope computation.
+    // We'll set cfg.n_heads = ne02 for clarity.
+    cfg.n_heads    = 8;
+    cfg.n_kv_heads = 8;
+    cfg.kv_dim     = 16;
+    cfg.head_size  = 16;
+    cfg.seq_len    = 16;
+
+    HyperParams hp{};
+    hp.n_threads = 1;
+
+    // ---- init backends ----
+    OpenCLBackend ocl(cfg, hp);
+    if (!ocl.initialize()) {
+        POWERSERVE_LOG_ERROR("OpenCL softmax_ext-vs-ggml test: OpenCL backend.initialize failed");
+        return false;
+    }
+
+    powerserve::ggml::GGMLBackend ggml(cfg, hp);
+    // softmax_ext in GGMLBackend uses threadpool similarly to other ops in your wrapper;
+    // keep it safe for standalone test.
+    ggml.setup_threadpool();
+    // work size: allocate at least (nc + CACHE_LINE_SIZE_F32)*n_threads floats like ggml uses
+    // Here we use nc=ne00, and give it plenty.
+    const size_t ne00 = 64;
+    ggml.setup_work_data(sizeof(float) * (ne00 + 64) * (size_t)hp.n_threads);
+
+    // ---- shapes ----
+    // x shape: {ne00, ne01, ne02, ne03}
+    // ggml uses:
+    //   nc = ne00
+    //   row count nr = ne01*ne02*ne03
+    const int NE00 = 64;   // nc (kv length)
+    const int NE01 = 8;    // "n_q" like dimension; also controls mask broadcast row via (i1 % NE01)
+    const int NE02 = 8;    // n_head (critical for ALiBi slope)
+    const int NE03 = 2;    // batch-ish
+
+    Shape x_shape{};
+    x_shape[0] = NE00;
+    x_shape[1] = NE01;
+    x_shape[2] = NE02;
+    x_shape[3] = NE03;
+
+    // mask shape MUST be {NE00, NE01, 1, 1} to match ggml mp=(i1%ne01)*ne00
+    Shape m_shape{};
+    m_shape[0] = NE00;
+    m_shape[1] = NE01;
+    m_shape[2] = 1;
+    m_shape[3] = 1;
+
+    // ---- host tensors (CPU) ----
+    std::vector<float> x_storage;
+    Tensor x_cpu = make_cpu_tensor_f32(x_shape, x_storage);
+
+    std::vector<float> m_storage;
+    Tensor m_cpu = make_cpu_tensor_f32(m_shape, m_storage);
+
+    // Fill x deterministically (avoid RNG)
+    // Layout is contiguous row-major by your make_cpu_tensor_f32: index = i0 + ne00*(i1 + ne01*(i2 + ne02*i3))
+    for (int b = 0; b < NE03; ++b) {
+        for (int h = 0; h < NE02; ++h) {
+            for (int q = 0; q < NE01; ++q) {
+                for (int kv = 0; kv < NE00; ++kv) {
+                    const size_t idx =
+                        (size_t)kv +
+                        (size_t)NE00 * ((size_t)q + (size_t)NE01 * ((size_t)h + (size_t)NE02 * (size_t)b));
+                    x_storage[idx] = 0.001f * (float)kv + 0.01f * (float)q - 0.02f * (float)h + 0.005f * (float)b;
+                }
+            }
+        }
+    }
+
+    // Fill mask as "causal-like" per q row: mask[kv,q] = (kv<=q)?0:-inf
+    // NOTE: mask only has {kv,q}, broadcast over head/batch in ggml.
+    for (int q = 0; q < NE01; ++q) {
+        for (int kv = 0; kv < NE00; ++kv) {
+            m_storage[(size_t)kv + (size_t)q * (size_t)NE00] = (kv <= q) ? 0.0f : -INFINITY;
+        }
+    }
+
+    // ---- reference output (GGML) ----
+    std::vector<float> out_ggml_storage;
+    Tensor out_ggml_cpu = make_cpu_tensor_f32(x_shape, out_ggml_storage);
+
+    // ---- opencl output (device -> host) ----
+    std::vector<float> out_ocl_storage;
+    Tensor out_ocl_cpu = make_cpu_tensor_f32(x_shape, out_ocl_storage);
+
+    // ---- device tensors ----
+    Tensor x_dev   = make_opencl_tensor_f32(ocl, x_shape);
+    Tensor m_dev   = make_opencl_tensor_f32(ocl, m_shape);
+    Tensor out_dev = make_opencl_tensor_f32(ocl, x_shape);
+
+    // Upload
+    ocl.copy(&x_dev, &x_cpu);
+    ocl.copy(&m_dev, &m_cpu);
+
+    // ---- run test cases ----
+    struct Case { float scale; float max_bias; };
+    const Case cases[] = {
+        {1.0f, 0.0f},   // no ALiBi slope
+        {0.5f, 8.0f},   // enable ALiBi slope (max_bias > 0)
+    };
+
+    for (const auto &tc : cases) {
+        // GGML reference (CPU buffers)
+        ggml.softmax_ext(&out_ggml_cpu, &x_cpu, &m_cpu, tc.scale, tc.max_bias);
+
+        // OpenCL backend (will run your OpenCLBackend::softmax_ext CPU fallback, but taking dev tensors)
+        ocl.softmax_ext(&out_dev, &x_dev, &m_dev, tc.scale, tc.max_bias);
+
+        // Download
+        ocl.copy(&out_ocl_cpu, &out_dev);
+
+        // Compare
+        const float atol = 1e-5f;
+        const float rtol = 1e-5f;
+        size_t bad_i = 0;
+        float bad_diff = 0.f;
+
+        bool ok = allclose(out_ocl_storage, out_ggml_storage, atol, rtol, &bad_i, &bad_diff);
+        if (!ok) {
+            POWERSERVE_LOG_ERROR("OpenCL softmax_ext-vs-ggml test: FAILED (mismatch)");
+            printf("scale=%f max_bias=%f bad_i=%zu ocl=%f ggml=%f diff=%f\n",
+                   (double)tc.scale, (double)tc.max_bias,
+                   bad_i,
+                   (double)out_ocl_storage[bad_i],
+                   (double)out_ggml_storage[bad_i],
+                   (double)bad_diff);
+
+            // print a small head slice
+            printf("OCL out head:  ");
+            for (size_t i = 0; i < std::min<size_t>(8, out_ocl_storage.size()); ++i) {
+                printf("%f ", (double)out_ocl_storage[i]);
+            }
+            printf("\nGGML out head: ");
+            for (size_t i = 0; i < std::min<size_t>(8, out_ggml_storage.size()); ++i) {
+                printf("%f ", (double)out_ggml_storage[i]);
+            }
+            printf("\n");
+            return false;
+        }
+
+        POWERSERVE_LOG_INFO("OpenCL softmax_ext-vs-ggml test: PASS (scale={} max_bias={})",
+                            tc.scale, tc.max_bias);
+    }
+
+    POWERSERVE_LOG_INFO("OpenCL softmax_ext-vs-ggml test: PASS");
+    return true;
+}
 
 
 } // namespace powerserve::opencl
 
 int main() {
-    bool ok1 = true; //powerserve::opencl::run_opencl_backend_smoke_test();
+    bool ok1 = powerserve::opencl::run_opencl_backend_smoke_test();
     bool ok2 = powerserve::opencl::run_opencl_backend_rope_vs_ggml_test();
-    return (ok1 && ok2) ? 0 : 1;
+    bool ok3 = powerserve::opencl::run_opencl_backend_softmax_ext_vs_ggml_test();
+    return (ok1 && ok2 && ok3) ? 0 : 1;
 }

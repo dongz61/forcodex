@@ -202,6 +202,12 @@ private:
         const std::vector<const Tensor *> &tensors
     ) const;
 
+    // matmul helper
+    void matmul_batched_cpu_f32_fallback(
+        const Tensor *dst,
+        const Tensor *src0,
+        const Tensor *src1
+    ) const;
 private:
     // Tensor -> OpenCL buffer mapping (legacy path; if you已经把 buffer 放在 Tensor 内部，可逐步淘汰)
     mutable std::unordered_map<const Tensor *, cl_mem> tensor_buffers_;

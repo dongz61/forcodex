@@ -1,6 +1,10 @@
 #include "backend/opencl/opencl_backend.hpp"
 #include "backend/cpu_buffer.hpp"
 
+#include "backend/ggml/ggml.hpp"     
+#include "ggml.h"                  
+
+
 #include "core/logger.hpp"
 
 #include <iostream>
@@ -141,6 +145,7 @@ void OpenCLBackend::plan(std::vector<std::shared_ptr<OpNode>> & /*ops*/) {
     // TODO: optional scheduling / workspace planning
 }
 
+// contiguous check helpers
 static inline powerserve::Stride make_contig_stride_bytes(const powerserve::Shape &shape, size_t elem) {
     powerserve::Stride s{};
     s[0] = elem;
@@ -496,6 +501,100 @@ void OpenCLBackend::get_embedding(
     this->copy(dst, &host_tmp);
 }
 
+// matmul cpu fallback helpers
+static inline void cpu_gemm_f32_colmajorNK(
+    float*       C,    // [N, M] but stored as your tensor layout {N, M}
+    const float* A,    // {K, M}
+    const float* B,    // {N, K}
+    int K, int M, int N
+) {
+    // C(n,m) = sum_k B(n,k) * A(k,m)
+    // This matches your matmul_minimal contract:
+    // A shape {K,M}, B shape {N,K}, C shape {N,M} :contentReference[oaicite:7]{index=7}
+    for (int m = 0; m < M; ++m) {
+        for (int n = 0; n < N; ++n) {
+            float acc = 0.0f;
+            const float* b_row = B + (size_t)n * (size_t)K;
+            const float* a_col = A + (size_t)m * (size_t)K; // A is [K,M], contiguous in K
+            for (int k = 0; k < K; ++k) {
+                acc += b_row[k] * a_col[k];
+            }
+            C[(size_t)m * (size_t)N + (size_t)n] = acc;
+        }
+    }
+}
+
+void OpenCLBackend::matmul_batched_cpu_f32_fallback(
+    const Tensor *dst,
+    const Tensor *src0,
+    const Tensor *src1
+) const {
+    // ---- D2H: src0/src1 -> host tensors ----
+    Tensor host_a(DataType::FP32, src0->m_shape);
+    host_a.m_data = powerserve::CPUBuffer::create_buffer<float>(src0->m_shape);
+    this->copy(&host_a, src0);
+
+    Tensor host_b(DataType::FP32, src1->m_shape);
+    host_b.m_data = powerserve::CPUBuffer::create_buffer<float>(src1->m_shape);
+    this->copy(&host_b, src1);
+
+    auto *a_host = static_cast<float *>(host_a.get<powerserve::CPUBuffer>().m_data);
+    auto *b_host = static_cast<float *>(host_b.get<powerserve::CPUBuffer>().m_data);
+
+    // ---- CPU output ----
+    Tensor host_c(DataType::FP32, dst->m_shape);
+    host_c.m_data = powerserve::CPUBuffer::create_buffer<float>(dst->m_shape);
+    auto *c_host = static_cast<float *>(host_c.get<powerserve::CPUBuffer>().m_data);
+
+    // Shapes (your contract):
+    // A {K, M, H2, H3}
+    // B {N, K, H2, H3}
+    // C {N, M, H2, H3} :contentReference[oaicite:9]{index=9}
+    const int K = (int)src0->m_shape[0];
+    const int M = (int)src0->m_shape[1];
+    const int N = (int)src1->m_shape[0];
+
+    const int H2 = (int)dst->m_shape[2];
+    const int H3 = (int)dst->m_shape[3];
+
+    // Basic shape sanity
+    if ((int)src1->m_shape[1] != K) {
+        POWERSERVE_LOG_ERROR("matmul_batched_cpu_f32_fallback: B.shape[1]!=K");
+        return;
+    }
+    if ((int)dst->m_shape[0] != N || (int)dst->m_shape[1] != M) {
+        POWERSERVE_LOG_ERROR("matmul_batched_cpu_f32_fallback: C shape mismatch");
+        return;
+    }
+    if ((int)src0->m_shape[2] != H2 || (int)src0->m_shape[3] != H3 ||
+        (int)src1->m_shape[2] != H2 || (int)src1->m_shape[3] != H3) {
+        POWERSERVE_LOG_ERROR("matmul_batched_cpu_f32_fallback: batch dims mismatch");
+        return;
+    }
+
+    const size_t a_batch_elems = (size_t)K * (size_t)M;
+    const size_t b_batch_elems = (size_t)N * (size_t)K;
+    const size_t c_batch_elems = (size_t)N * (size_t)M;
+
+    for (int i3 = 0; i3 < H3; ++i3) {
+        for (int i2 = 0; i2 < H2; ++i2) {
+            const size_t batch = (size_t)i3 * (size_t)H2 + (size_t)i2;
+
+            const float* A = a_host + batch * a_batch_elems;
+            const float* B = b_host + batch * b_batch_elems;
+            float*       C = c_host + batch * c_batch_elems;
+
+            cpu_gemm_f32_colmajorNK(C, A, B, K, M, N);
+        }
+    }
+
+    // ---- H2D: host_c -> dst ----
+    this->copy(dst, &host_c);
+
+    POWERSERVE_LOG_DEBUG("OpenCLBackend::matmul batched CPU fallback done (K={},M={},N={},H2={},H3={})",
+                         K, M, N, H2, H3);
+}
+
 void OpenCLBackend::matmul(const Tensor *dst, const Tensor *src0, const Tensor *src1) const {
     if (!initialized) {
         POWERSERVE_LOG_ERROR("OpenCL backend not initialized");
@@ -506,42 +605,46 @@ void OpenCLBackend::matmul(const Tensor *dst, const Tensor *src0, const Tensor *
         return;
     }
 
-    // Strict mode (Phase 1), per matmul_minimal contract already documented in-file:
-    // A:{K,M,1,1}, B:{N,K,1,1}, C:{N,M,1,1}, FP32 only, 2D only.
+    // FP32 only (keep Phase1 strict)
     if (dst->m_dtype != DataType::FP32 || src0->m_dtype != DataType::FP32 || src1->m_dtype != DataType::FP32) {
         POWERSERVE_LOG_ERROR("OpenCLBackend::matmul (Phase1) only supports FP32");
         return;
     }
 
-    if (src0->m_shape[2] != 1 || src0->m_shape[3] != 1 ||
-        src1->m_shape[2] != 1 || src1->m_shape[3] != 1 ||
-        dst->m_shape[2]  != 1 || dst->m_shape[3]  != 1) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::matmul (Phase1) only supports 2D (shape[2]=shape[3]=1)");
+    auto *self = const_cast<OpenCLBackend *>(this);
+    Tensor tmpA_dev, tmpB_dev;
+
+    const int n_dims_check = 4;
+
+    const Tensor *A = ensure_contiguous_or_pack_f32(self, src0, n_dims_check, tmpA_dev);
+    const Tensor *B = ensure_contiguous_or_pack_f32(self, src1, n_dims_check, tmpB_dev);
+
+    // ---- 2D path: call OpenCL kernel ----
+    if (A->m_shape[2] == 1 && A->m_shape[3] == 1 &&
+        B->m_shape[2] == 1 && B->m_shape[3] == 1 &&
+        dst->m_shape[2] == 1 && dst->m_shape[3] == 1) {
+
+        const size_t K = A->m_shape[0];
+        const size_t M = A->m_shape[1];
+        const size_t N = B->m_shape[0];
+
+        if (B->m_shape[1] != K) {
+            POWERSERVE_LOG_ERROR("OpenCLBackend::matmul requires B.shape[1]==K");
+            return;
+        }
+        if (dst->m_shape[0] != N || dst->m_shape[1] != M) {
+            POWERSERVE_LOG_ERROR("OpenCLBackend::matmul requires C shape (N,M,1,1)");
+            return;
+        }
+
+        // ✅ 使用 contiguous 后的 A/B
+        self->matmul_minimal(const_cast<Tensor *>(dst), A, B);
         return;
     }
 
-    const size_t K = src0->m_shape[0];
-    const size_t M = src0->m_shape[1];
-    const size_t N = src1->m_shape[0];
-
-    if (src1->m_shape[1] != K) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::matmul (Phase1) requires B.shape[1]==A.shape[0] (K)");
-        return;
-    }
-    if (dst->m_shape[0] != N || dst->m_shape[1] != M) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::matmul (Phase1) requires C shape (N,M,1,1)");
-        return;
-    }
-
-    // Route to minimal kernel
-    // Ensure A/B are contiguous for minimal kernel (2D matmul, but safest to check 2 dims only)
-    Tensor tmpA, tmpB;
-    auto *self = const_cast<OpenCLBackend*>(this);
-
-    const Tensor *A_c = ensure_contiguous_or_pack_f32(self, src0, 2, tmpA);
-    const Tensor *B_c = ensure_contiguous_or_pack_f32(self, src1, 2, tmpB);
-
-    self->matmul_minimal(const_cast<Tensor *>(dst), A_c, B_c);
+    // ---- fallback path: batched CPU ----
+    // ✅ fallback 也必须用 contiguous A/B
+    self->matmul_batched_cpu_f32_fallback(dst, A, B);
 }
 
 void OpenCLBackend::matmul_minimal(Tensor * dst,
@@ -1040,14 +1143,154 @@ void OpenCLBackend::cont(const Tensor *out, const Tensor *x) const {
     this->copy(out, &host_out);
 }
 
+static inline uint32_t floor_log2_u32(uint32_t x) {
+    // x>0
+    uint32_t r = 0;
+    while ((1u << (r + 1)) <= x) ++r;
+    return r;
+}
+
+static void softmax_ext_cpu_f32_ggml_semantics(
+    float *dst,            // contiguous, same shape as src0
+    const float *src0,     // contiguous
+    const float *src1,     // contiguous mask, expected shape [ne00, ne01, 1, 1]
+    int ne00, int ne01, int ne02, int ne03,
+    float scale,
+    float max_bias
+) {
+    const uint32_t n_head = (uint32_t)ne02;
+    const uint32_t n_head_log2 = 1u << (uint32_t)floor_log2_u32(n_head);
+
+    const float m0 = std::pow(2.0f, -(max_bias)        / (float)n_head_log2);
+    const float m1 = std::pow(2.0f, -(max_bias / 2.0f) / (float)n_head_log2);
+
+    const int nc = ne00;
+    const int nr = ne01 * ne02 * ne03;
+
+    std::vector<float> wp((size_t)nc);
+
+    for (int i1 = 0; i1 < nr; ++i1) {
+        const uint32_t h = (uint32_t)((i1 / ne01) % ne02); // same as ggml: (i1/ne01)%ne02
+
+        const float slope =
+            (max_bias > 0.0f)
+            ? (h < n_head_log2
+                ? std::pow(m0, (float)(h + 1))
+                : std::pow(m1, (float)(2*(h - n_head_log2) + 1)))
+            : 1.0f;
+
+        const float *sp = src0 + (size_t)i1 * (size_t)nc;
+        float *dp       = dst  + (size_t)i1 * (size_t)nc;
+
+        // broadcast mask across rows: row chosen by (i1 % ne01)
+        const float *mp = src1 ? (src1 + (size_t)(i1 % ne01) * (size_t)ne00) : nullptr;
+
+        // wp = sp; wp *= scale; wp += slope*mask
+        for (int i = 0; i < nc; ++i) {
+            float v = sp[i] * scale;
+            if (mp) v += slope * mp[i];
+            wp[i] = v;
+        }
+
+        // max
+        float mx = -INFINITY;
+        for (int i = 0; i < nc; ++i) mx = std::max(mx, wp[i]);
+
+        // exp + sum (write exp to dp temporarily)
+        float sum = 0.0f;
+        for (int i = 0; i < nc; ++i) {
+            float e = std::exp(wp[i] - mx);
+            dp[i] = e;
+            sum += e;
+        }
+
+        // normalize
+        const float inv = 1.0f / sum;
+        for (int i = 0; i < nc; ++i) {
+            dp[i] *= inv;
+        }
+    }
+}
 void OpenCLBackend::softmax_ext(
-    const Tensor * /*out*/,
-    const Tensor * /*x*/,
-    const Tensor * /*mask*/,
-    float /*scale*/,
-    float /*max_bias*/
+    const Tensor *out,
+    const Tensor *x,
+    const Tensor *mask,
+    float scale,
+    float max_bias
 ) const {
-    POWERSERVE_ABORT("OpenCLBackend::softmax_ext TODO");
+    if (!initialized) {
+        POWERSERVE_LOG_ERROR("OpenCL backend not initialized");
+        return;
+    }
+    POWERSERVE_ASSERT(out && x && mask);
+
+    if (out->m_dtype != DataType::FP32 || x->m_dtype != DataType::FP32 || mask->m_dtype != DataType::FP32) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::softmax_ext (Phase1) only supports FP32");
+        return;
+    }
+
+    auto *self = const_cast<OpenCLBackend *>(this);
+
+    // 0) ensure contiguous (strict: 4 dims)
+    const int n_dims_check = 4;
+    Tensor tmp_x_dev, tmp_mask_dev;
+    const Tensor *x_dev    = ensure_contiguous_or_pack_f32(self, x,    n_dims_check, tmp_x_dev);
+    const Tensor *m_dev    = ensure_contiguous_or_pack_f32(self, mask, n_dims_check, tmp_mask_dev);
+
+    // shape locals
+    const int ne00 = (int)x_dev->m_shape[0];
+    const int ne01 = (int)x_dev->m_shape[1];
+    const int ne02 = (int)x_dev->m_shape[2];
+    const int ne03 = (int)x_dev->m_shape[3];
+
+    // out must match x (ggml asserts src0 same shape as dst)
+    if (out->m_shape != x_dev->m_shape) {
+        POWERSERVE_LOG_ERROR("softmax_ext: out shape != x shape");
+        return;
+    }
+
+    // ggml mask broadcast expects src1 laid out as [ne00, ne01] (and broadcast over head/batch)
+    // i.e., shape [ne00, ne01, 1, 1]
+    if (!(m_dev->m_shape[0] == x_dev->m_shape[0] &&
+          m_dev->m_shape[1] == x_dev->m_shape[1] &&
+          m_dev->m_shape[2] == 1 &&
+          m_dev->m_shape[3] == 1)) {
+        POWERSERVE_LOG_WARN(
+            "softmax_ext: mask shape [{},{},{},{}] not [ne00,ne01,1,1]=[{},{},1,1]; "
+            "ggml semantics will not match unless you feed that shape",
+            (int)m_dev->m_shape[0], (int)m_dev->m_shape[1], (int)m_dev->m_shape[2], (int)m_dev->m_shape[3],
+            ne00, ne01
+        );
+        return;
+    }
+
+    // 1) D2H
+    Tensor host_x(DataType::FP32, x_dev->m_shape);
+    host_x.m_data = powerserve::CPUBuffer::create_buffer<float>(x_dev->m_shape);
+    self->copy(&host_x, x_dev);
+
+    Tensor host_m(DataType::FP32, m_dev->m_shape);
+    host_m.m_data = powerserve::CPUBuffer::create_buffer<float>(m_dev->m_shape);
+    self->copy(&host_m, m_dev);
+
+    Tensor host_out(DataType::FP32, out->m_shape);
+    host_out.m_data = powerserve::CPUBuffer::create_buffer<float>(out->m_shape);
+
+    const float *x_buf = (const float *)host_x.get<CPUBuffer>().m_data;
+    const float *m_buf = (const float *)host_m.get<CPUBuffer>().m_data;
+    float *o_buf       = (float *)host_out.get<CPUBuffer>().m_data;
+
+    // 2) CPU compute (ggml-aligned)
+    softmax_ext_cpu_f32_ggml_semantics(
+        o_buf, x_buf, m_buf,
+        ne00, ne01, ne02, ne03,
+        scale, max_bias
+    );
+
+    // 3) H2D
+    self->copy(out, &host_out);
+
+    POWERSERVE_LOG_DEBUG("OpenCLBackend::softmax_ext CPU fallback (ggml-aligned) done");
 }
 
 void OpenCLBackend::silu_hadamard(const Tensor * out,
