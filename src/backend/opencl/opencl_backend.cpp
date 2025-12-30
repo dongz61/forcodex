@@ -29,6 +29,53 @@ std::shared_ptr<OpenCLBuffer> OpenCLBackend::debug_get_v_cache(size_t L) const {
     return m_kv->value[L];
 }
 
+static inline const char* dtype_name(DataType t) {
+    switch (t) {
+        case DataType::FP32: return "FP32";
+        case DataType::FP16: return "FP16";
+        case DataType::INT32: return "INT32";
+        default: return "OTHER";
+    }
+}
+
+static inline void log_tensor_meta(OpenCLBackend *self, const char *tag, const Tensor *t, int n = 4) {
+    if (!t) {
+        POWERSERVE_LOG_ERROR("[MATMUL][{}] <null>", tag);
+        return;
+    }
+    bool cont = self->is_contiguous(t, n);
+
+    powerserve::Stride st{};
+    bool has_stride = false;
+    try {
+        const auto &buf = const_cast<Tensor*>(t)->get<OpenCLBuffer>();
+        st = buf.m_stride;
+        has_stride = true;
+    } catch (...) {
+        try {
+            const auto &buf = const_cast<Tensor*>(t)->get<powerserve::CPUBuffer>();
+            st = buf.m_stride;
+            has_stride = true;
+        } catch (...) {
+            has_stride = false;
+        }
+    }
+
+    if (has_stride) {
+        POWERSERVE_LOG_ERROR("[MATMUL][{}] dtype={} shape={{{},{},{},{}}} strideB={{{},{},{},{}}} cont={}",
+            tag, dtype_name(t->m_dtype),
+            t->m_shape[0], t->m_shape[1], t->m_shape[2], t->m_shape[3],
+            st[0], st[1], st[2], st[3],
+            cont);
+    } else {
+        POWERSERVE_LOG_ERROR("[MATMUL][{}] dtype={} shape={{{},{},{},{}}} stride=<unknown> cont={}",
+            tag, dtype_name(t->m_dtype),
+            t->m_shape[0], t->m_shape[1], t->m_shape[2], t->m_shape[3],
+            cont);
+    }
+}
+
+
 static inline void dump_backtrace() {
     void* bt[32];
     int n = backtrace(bt, 32);
@@ -520,6 +567,98 @@ static inline void cpu_gemm_f32_colmajorNK(
     }
 }
 
+static inline powerserve::BufferPtr create_cpu_buffer_for_dtype(powerserve::DataType dt, const powerserve::Shape &shape) {
+    using powerserve::CPUBuffer;
+    switch (dt) {
+    case powerserve::DataType::FP32:
+        return CPUBuffer::create_buffer<float>(shape);
+    case powerserve::DataType::FP16:
+        return CPUBuffer::create_buffer<uint16_t>(shape);
+    case powerserve::DataType::INT32:
+        return CPUBuffer::create_buffer<int32_t>(shape);
+    case powerserve::DataType::INT64:
+        return CPUBuffer::create_buffer<int64_t>(shape);
+    default:
+        POWERSERVE_ABORT("create_cpu_buffer_for_dtype: unsupported dtype {}", (int)dt);
+    }
+}
+
+void OpenCLBackend::matmul_cpu_ggml_fallback(
+    const Tensor *dst,
+    const Tensor *src0,
+    const Tensor *src1
+) const {
+    using powerserve::ggml::convert_to_ggml;
+
+    // --- Reuse repo's existing pattern: dynamic_cast<CPUBuffer*> to check CPU-backed ---
+    auto is_cpu_tensor = [](const Tensor *t) -> bool {
+        return dynamic_cast<powerserve::CPUBuffer *>(t->m_data.get()) != nullptr;
+    };
+
+    // ---- 1) Prepare host views for src0/src1 ----
+    const Tensor *a_host = src0;
+    const Tensor *b_host = src1;
+
+    Tensor host_a; // only used if src0 is not CPU-backed
+    Tensor host_b; // only used if src1 is not CPU-backed
+
+    // A: if not CPU, do D2H copy
+    if (!is_cpu_tensor(src0)) {
+        host_a = Tensor(src0->m_dtype, src0->m_shape);
+        host_a.m_data = create_cpu_buffer_for_dtype(src0->m_dtype, src0->m_shape);
+        this->copy(&host_a, src0);
+        a_host = &host_a;
+    }
+
+    // B: if not CPU, do D2H copy
+    // guard: quant tensor on device is not supported (since quant copy not implemented)
+    if (!is_cpu_tensor(src1)) {
+        if (src1->m_dtype == DataType::GGML_Q4_0 || src1->m_dtype == DataType::GGML_Q8_0) {
+            POWERSERVE_ABORT(
+                "matmul_cpu_ggml_fallback: quant tensor (dtype={}) is on device, but quant D2H copy not implemented",
+                (int)src1->m_dtype
+            );
+        }
+        host_b = Tensor(src1->m_dtype, src1->m_shape);
+        host_b.m_data = create_cpu_buffer_for_dtype(src1->m_dtype, src1->m_shape);
+        this->copy(&host_b, src1);
+        b_host = &host_b;
+    }
+
+    // ---- 2) host output tensor (always CPU) ----
+    Tensor host_c(dst->m_dtype, dst->m_shape);
+    host_c.m_data = create_cpu_buffer_for_dtype(dst->m_dtype, dst->m_shape);
+
+    // ---- 3) ggml mul_mat ----
+    auto gt_a = convert_to_ggml(a_host);
+    auto gt_b = convert_to_ggml(b_host);
+    auto gt_c = convert_to_ggml(&host_c);
+
+    op_compute_params params = {
+        .ith           = 0,
+        .nth           = 1,
+        .wsize         = 0,
+        .wdata         = nullptr,
+        .thread_pool   = nullptr,
+        .barrier_fn    = nullptr,
+        .current_chunk = nullptr,
+    };
+
+    powerserve_compute_forward_mul_mat(&params, gt_c.get(), gt_a.get(), gt_b.get());
+
+    // ---- 4) H2D: host_c -> dst ----
+    this->copy(dst, &host_c);
+
+    POWERSERVE_LOG_DEBUG(
+        "OpenCLBackend::matmul ggml fallback done: dst={} a={}({}) b={}({})",
+        (int)dst->m_dtype,
+        (int)src0->m_dtype, is_cpu_tensor(src0) ? "CPU" : "DEV",
+        (int)src1->m_dtype, is_cpu_tensor(src1) ? "CPU" : "DEV"
+    );
+}
+
+
+
 void OpenCLBackend::matmul_batched_cpu_f32_fallback(
     const Tensor *dst,
     const Tensor *src0,
@@ -555,6 +694,10 @@ void OpenCLBackend::matmul_batched_cpu_f32_fallback(
 
     // Basic shape sanity
     if ((int)src1->m_shape[1] != K) {
+        auto *self = const_cast<OpenCLBackend *>(this);
+        log_tensor_meta(self, "dst(in)", dst);
+        log_tensor_meta(self, "A(in)",   src0);
+        log_tensor_meta(self, "B(in)",   src1);
         POWERSERVE_LOG_ERROR("matmul_batched_cpu_f32_fallback: B.shape[1]!=K");
         return;
     }
@@ -601,46 +744,40 @@ void OpenCLBackend::matmul(const Tensor *dst, const Tensor *src0, const Tensor *
         return;
     }
 
-    // FP32 only (keep Phase1 strict)
-    if (dst->m_dtype != DataType::FP32 || src0->m_dtype != DataType::FP32 || src1->m_dtype != DataType::FP32) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::matmul (Phase1) only supports FP32");
-        return;
-    }
-
     auto *self = const_cast<OpenCLBackend *>(this);
-    Tensor tmpA_dev, tmpB_dev;
 
-    const int n_dims_check = 4;
+    // ---- Try OpenCL minimal kernel only when it's safe ----
+    const bool all_f32 = (dst->m_dtype == DataType::FP32 &&
+                          src0->m_dtype == DataType::FP32 &&
+                          src1->m_dtype == DataType::FP32);
 
-    const Tensor *A = ensure_contiguous_or_pack_f32(self, src0, n_dims_check, tmpA_dev);
-    const Tensor *B = ensure_contiguous_or_pack_f32(self, src1, n_dims_check, tmpB_dev);
+    if (all_f32) {
+        Tensor tmpA_dev, tmpB_dev;
+        const int n_dims_check = 4;
 
-    // ---- 2D path: call OpenCL kernel ----
-    if (A->m_shape[2] == 1 && A->m_shape[3] == 1 &&
-        B->m_shape[2] == 1 && B->m_shape[3] == 1 &&
-        dst->m_shape[2] == 1 && dst->m_shape[3] == 1) {
+        const Tensor *A = ensure_contiguous_or_pack_f32(self, src0, n_dims_check, tmpA_dev);
+        const Tensor *B = ensure_contiguous_or_pack_f32(self, src1, n_dims_check, tmpB_dev);
 
-        const size_t K = A->m_shape[0];
-        const size_t M = A->m_shape[1];
-        const size_t N = B->m_shape[0];
+        // 2D-only kernel path
+        if (A->m_shape[2] == 1 && A->m_shape[3] == 1 &&
+            B->m_shape[2] == 1 && B->m_shape[3] == 1 &&
+            dst->m_shape[2] == 1 && dst->m_shape[3] == 1) {
 
-        if (B->m_shape[1] != K) {
-            POWERSERVE_LOG_ERROR("OpenCLBackend::matmul requires B.shape[1]==K");
-            return;
+            const size_t K = A->m_shape[0];
+            const size_t M = A->m_shape[1];
+            const size_t N = B->m_shape[0];
+
+            if (B->m_shape[1] == K &&
+                dst->m_shape[0] == N && dst->m_shape[1] == M) {
+
+                self->matmul_minimal(const_cast<Tensor *>(dst), A, B);
+                return;
+            }
         }
-        if (dst->m_shape[0] != N || dst->m_shape[1] != M) {
-            POWERSERVE_LOG_ERROR("OpenCLBackend::matmul requires C shape (N,M,1,1)");
-            return;
-        }
-
-        // ✅ 使用 contiguous 后的 A/B
-        self->matmul_minimal(const_cast<Tensor *>(dst), A, B);
-        return;
     }
 
-    // ---- fallback path: batched CPU ----
-    // ✅ fallback 也必须用 contiguous A/B
-    self->matmul_batched_cpu_f32_fallback(dst, A, B);
+    // ---- General fallback: ggml mul_mat (supports FP32/FP16/quant + arbitrary layout) ----
+    self->matmul_cpu_ggml_fallback(dst, src0, src1);
 }
 
 void OpenCLBackend::matmul_minimal(Tensor * dst,
