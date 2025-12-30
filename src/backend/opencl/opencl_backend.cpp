@@ -13,6 +13,17 @@
 #include <algorithm>
 #include <execinfo.h>
 
+#define CL_CHECK(call) \
+    do { \
+        cl_int _err = (call); \
+        if (_err != CL_SUCCESS) { \
+            POWERSERVE_LOG_ERROR("OpenCL error at {}:{} - {}: {}", \
+                __FILE__, __LINE__, #call, context->get_error_string(_err)); \
+            return; \
+        } \
+    } while (0)
+
+
 namespace powerserve::opencl {
 
 // for debug
@@ -432,6 +443,274 @@ void OpenCLBackend::add_minimal(Tensor * dst, const Tensor * src0, const Tensor 
     }
 }
 
+void OpenCLBackend::add_broadcast(Tensor *dst, const Tensor *src0, const Tensor *src1) const {
+    if (!initialized) {    
+        POWERSERVE_LOG_ERROR("OpenCL backend not initialized");
+        return;
+    }
+    try {
+        // 获取 OpenCL 缓冲区
+        auto& src0_buffer = src0->get<OpenCLBuffer>();
+        auto& src1_buffer = src1->get<OpenCLBuffer>();
+        auto& dst_buffer = dst->get<OpenCLBuffer>();
+        
+        // 获取形状和步长信息
+        Shape src0_shape = src0->m_shape;
+        Shape src1_shape = src1->m_shape;
+        Shape dst_shape = dst->m_shape;
+        
+        Stride src0_stride = src0_buffer.get_stride();
+        Stride src1_stride = src1_buffer.get_stride();
+        Stride dst_stride = dst_buffer.get_stride();
+        
+        // 参数命名参考 llama.cpp
+        const int ne00 = static_cast<int>(src0_shape[0]);
+        const int ne01 = static_cast<int>(src0_shape[1]);
+        const int ne02 = static_cast<int>(src0_shape[2]);
+        const int ne03 = static_cast<int>(src0_shape[3]);
+        
+        const int ne10 = static_cast<int>(src1_shape[0]);
+        const int ne11 = static_cast<int>(src1_shape[1]);
+        const int ne12 = static_cast<int>(src1_shape[2]);
+        const int ne13 = static_cast<int>(src1_shape[3]);
+        
+        const int ne0 = static_cast<int>(dst_shape[0]);
+        const int ne1 = static_cast<int>(dst_shape[1]);
+        const int ne2 = static_cast<int>(dst_shape[2]);
+        const int ne3 = static_cast<int>(dst_shape[3]);
+        
+        const cl_ulong nb00 = static_cast<cl_ulong>(src0_stride[0]);
+        const cl_ulong nb01 = static_cast<cl_ulong>(src0_stride[1]);
+        const cl_ulong nb02 = static_cast<cl_ulong>(src0_stride[2]);
+        const cl_ulong nb03 = static_cast<cl_ulong>(src0_stride[3]);
+        
+        const cl_ulong nb10 = static_cast<cl_ulong>(src1_stride[0]);
+        const cl_ulong nb11 = static_cast<cl_ulong>(src1_stride[1]);
+        const cl_ulong nb12 = static_cast<cl_ulong>(src1_stride[2]);
+        const cl_ulong nb13 = static_cast<cl_ulong>(src1_stride[3]);
+        
+        const cl_ulong nb0 = static_cast<cl_ulong>(dst_stride[0]);
+        const cl_ulong nb1 = static_cast<cl_ulong>(dst_stride[1]);
+        const cl_ulong nb2 = static_cast<cl_ulong>(dst_stride[2]);
+        const cl_ulong nb3 = static_cast<cl_ulong>(dst_stride[3]);
+        
+        // 获取设备缓冲区
+        cl_mem src0_data = src0_buffer.get_device_buffer();
+        cl_mem src1_data = src1_buffer.get_device_buffer();
+        cl_mem dst_data = dst_buffer.get_device_buffer();
+        
+        if (!src0_data || !src1_data || !dst_data) {
+            POWERSERVE_LOG_ERROR("Invalid OpenCL buffers for add");
+            return;
+        }
+        
+        bool bcast_row = false;
+        if (src1_shape[0] == src0_shape[0] &&
+            src1_shape[1] == 1 &&
+            src1_shape[2] == 1 &&
+            src1_shape[3] == 1 &&
+            (ne00 % 4 == 0)) {
+
+            // dim0 连续：nb10 == sizeof(float)
+            // 注意：你的 stride 是 bytes
+            const bool src1_contig_dim0 = (nb10 == sizeof(float));
+
+            // 如果你支持 sub-buffer offset，最好还要求 offset1 16B 对齐
+            const bool align_ok = true; // 你目前 offset1=0，天然对齐
+            bcast_row = src1_contig_dim0 && align_ok;
+        }
+        
+        // 选择正确的内核
+        cl_kernel kernel = nullptr;
+        std::string kernel_name;
+        
+        if (dst->m_dtype == DataType::FP32 && 
+            src0->m_dtype == DataType::FP32 && 
+            src1->m_dtype == DataType::FP32) {
+            
+            if (bcast_row) {
+                kernel_name = "kernel_add_row";
+                kernel = kernel_manager->get_kernel(kernel_name);
+            } else {
+                kernel_name = "kernel_add";
+                kernel = kernel_manager->get_kernel(kernel_name);
+            }
+        } 
+        // 可以后续添加 FP16 支持
+        
+        if (!kernel) {
+            POWERSERVE_LOG_ERROR("Add kernel not found: {}", kernel_name);
+            return;
+        }
+        
+        // 设置内核参数
+        cl_int err;
+        cl_uint arg_index = 0;
+        
+        // 所有版本的通用偏移（目前都设为0）
+        cl_ulong offset0 = 0;
+        cl_ulong offset1 = 0;
+        cl_ulong offsetd = 0;
+        
+        if (bcast_row) {
+            // 行广播版本（7个参数）
+            // kernel_add_row(src0, offset0, src1, offset1, dst, offsetd, ne)
+            
+            // 参数0: src0 buffer
+            err = clSetKernelArg(kernel, arg_index++, sizeof(cl_mem), &src0_data);
+            CL_CHECK(err);
+            
+            // 参数1: offset0
+            err = clSetKernelArg(kernel, arg_index++, sizeof(cl_ulong), &offset0);
+            CL_CHECK(err);
+            
+            // 参数2: src1 buffer
+            err = clSetKernelArg(kernel, arg_index++, sizeof(cl_mem), &src1_data);
+            CL_CHECK(err);
+            
+            // 参数3: offset1
+            err = clSetKernelArg(kernel, arg_index++, sizeof(cl_ulong), &offset1);
+            CL_CHECK(err);
+            
+            // 参数4: dst buffer
+            err = clSetKernelArg(kernel, arg_index++, sizeof(cl_mem), &dst_data);
+            CL_CHECK(err);
+            
+            // 参数5: offsetd
+            err = clSetKernelArg(kernel, arg_index++, sizeof(cl_ulong), &offsetd);
+            CL_CHECK(err);
+            
+            // 参数6: ne (元素数/4)
+            int ne = ne00 / 4;
+            err = clSetKernelArg(kernel, arg_index++, sizeof(int), &ne);
+            CL_CHECK(err);
+            
+        } else {
+            // 普通版本（30个参数，参考 llama.cpp）
+            // kernel_add(src0, offset0, src1, offset1, dst, offsetd, 
+            //            ne00, ne01, ne02, ne03, nb00, nb01, nb02, nb03,
+            //            ne10, ne11, ne12, ne13, nb10, nb11, nb12, nb13,
+            //            ne0, ne1, ne2, ne3, nb0, nb1, nb2, nb3)
+            
+            // 参数0-5: buffers 和 offsets
+            err = clSetKernelArg(kernel, arg_index++, sizeof(cl_mem), &src0_data);   // 0
+            CL_CHECK(err);
+            err = clSetKernelArg(kernel, arg_index++, sizeof(cl_ulong), &offset0);   // 1
+            CL_CHECK(err);
+            err = clSetKernelArg(kernel, arg_index++, sizeof(cl_mem), &src1_data);   // 2
+            CL_CHECK(err);
+            err = clSetKernelArg(kernel, arg_index++, sizeof(cl_ulong), &offset1);   // 3
+            CL_CHECK(err);
+            err = clSetKernelArg(kernel, arg_index++, sizeof(cl_mem), &dst_data);    // 4
+            CL_CHECK(err);
+            err = clSetKernelArg(kernel, arg_index++, sizeof(cl_ulong), &offsetd);   // 5
+            CL_CHECK(err);
+            
+            // 参数6-9: ne00, ne01, ne02, ne03
+            err = clSetKernelArg(kernel, arg_index++, sizeof(int), &ne00);  // 6
+            CL_CHECK(err);
+            err = clSetKernelArg(kernel, arg_index++, sizeof(int), &ne01);  // 7
+            CL_CHECK(err);
+            err = clSetKernelArg(kernel, arg_index++, sizeof(int), &ne02);  // 8
+            CL_CHECK(err);
+            err = clSetKernelArg(kernel, arg_index++, sizeof(int), &ne03);  // 9
+            CL_CHECK(err);
+            
+            // 参数10-13: nb00, nb01, nb02, nb03
+            err = clSetKernelArg(kernel, arg_index++, sizeof(cl_ulong), &nb00);  // 10
+            CL_CHECK(err);
+            err = clSetKernelArg(kernel, arg_index++, sizeof(cl_ulong), &nb01);  // 11
+            CL_CHECK(err);
+            err = clSetKernelArg(kernel, arg_index++, sizeof(cl_ulong), &nb02);  // 12
+            CL_CHECK(err);
+            err = clSetKernelArg(kernel, arg_index++, sizeof(cl_ulong), &nb03);  // 13
+            CL_CHECK(err);
+            
+            // 参数14-17: ne10, ne11, ne12, ne13
+            err = clSetKernelArg(kernel, arg_index++, sizeof(int), &ne10);  // 14
+            CL_CHECK(err);
+            err = clSetKernelArg(kernel, arg_index++, sizeof(int), &ne11);  // 15
+            CL_CHECK(err);
+            err = clSetKernelArg(kernel, arg_index++, sizeof(int), &ne12);  // 16
+            CL_CHECK(err);
+            err = clSetKernelArg(kernel, arg_index++, sizeof(int), &ne13);  // 17
+            CL_CHECK(err);
+            
+            // 参数18-21: nb10, nb11, nb12, nb13
+            err = clSetKernelArg(kernel, arg_index++, sizeof(cl_ulong), &nb10);  // 18
+            CL_CHECK(err);
+            err = clSetKernelArg(kernel, arg_index++, sizeof(cl_ulong), &nb11);  // 19
+            CL_CHECK(err);
+            err = clSetKernelArg(kernel, arg_index++, sizeof(cl_ulong), &nb12);  // 20
+            CL_CHECK(err);
+            err = clSetKernelArg(kernel, arg_index++, sizeof(cl_ulong), &nb13);  // 21
+            CL_CHECK(err);
+            
+            // 参数22-25: ne0, ne1, ne2, ne3
+            err = clSetKernelArg(kernel, arg_index++, sizeof(int), &ne0);  // 22
+            CL_CHECK(err);
+            err = clSetKernelArg(kernel, arg_index++, sizeof(int), &ne1);  // 23
+            CL_CHECK(err);
+            err = clSetKernelArg(kernel, arg_index++, sizeof(int), &ne2);  // 24
+            CL_CHECK(err);
+            err = clSetKernelArg(kernel, arg_index++, sizeof(int), &ne3);  // 25
+            CL_CHECK(err);
+            
+            // 参数26-29: nb0, nb1, nb2, nb3
+            err = clSetKernelArg(kernel, arg_index++, sizeof(cl_ulong), &nb0);  // 26
+            CL_CHECK(err);
+            err = clSetKernelArg(kernel, arg_index++, sizeof(cl_ulong), &nb1);  // 27
+            CL_CHECK(err);
+            err = clSetKernelArg(kernel, arg_index++, sizeof(cl_ulong), &nb2);  // 28
+            CL_CHECK(err);
+            err = clSetKernelArg(kernel, arg_index++, sizeof(cl_ulong), &nb3);  // 29
+            CL_CHECK(err);
+        }
+        
+        // 计算工作组大小（严格按照 llama.cpp 的逻辑）
+        if (bcast_row) {
+            // 行广播版本
+            int n = dst->n_elements() / 4;  // 使用 float4
+            size_t global_work_size[] = {static_cast<size_t>(n), 1, 1};
+            size_t local_work_size[] = {64, 1, 1};
+            
+            err = clEnqueueNDRangeKernel(context->get_queue(), kernel,
+                                         1, nullptr, global_work_size, local_work_size,
+                                         0, nullptr, nullptr);
+            CL_CHECK(err);
+            
+        } else {
+            // ✅ 普通版本：对齐 add.cl::kernel_add 的 get_group_id 语义
+            const size_t nth = 64;              // local threads along dim0
+            size_t local_work_size[3]  = { nth, 1, 1 };
+            size_t global_work_size[3] = {
+                static_cast<size_t>(ne01) * nth, // so get_group_id(0) ranges [0, ne01)
+                static_cast<size_t>(ne02),
+                static_cast<size_t>(ne03)
+            };
+
+            err = clEnqueueNDRangeKernel(context->get_queue(), kernel,
+                                        3, nullptr, global_work_size, local_work_size,
+                                        0, nullptr, nullptr);
+            CL_CHECK(err);
+        }
+
+        
+        // 等待完成
+        err = clFinish(context->get_queue());
+        if (err != CL_SUCCESS) {
+            POWERSERVE_LOG_WARN("clFinish failed: {}", context->get_error_string(err));
+            // 不返回，继续执行
+        }
+        
+        
+    } catch (const std::bad_cast& e) {
+        POWERSERVE_LOG_ERROR("Invalid buffer type for add: {}", e.what());
+    } catch (const std::exception& e) {
+        POWERSERVE_LOG_ERROR("Exception in add: {}", e.what());
+    }
+    
+}
 
 void OpenCLBackend::add(const Tensor *dst, const Tensor *src0, const Tensor *src1) const {
     if (!initialized) {
@@ -443,26 +722,26 @@ void OpenCLBackend::add(const Tensor *dst, const Tensor *src0, const Tensor *src
         return;
     }
 
-    // Strict mode (Phase 1):
-    // - FP32 only
-    // - same-shape only (no broadcast)
-    // - contiguous assumed by convention (views are handled by OpenCLBuffer sub-buffer already)
-    if (dst->m_dtype != DataType::FP32 || src0->m_dtype != DataType::FP32 || src1->m_dtype != DataType::FP32) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::add (Phase1) only supports FP32");
+    // Phase1: FP32 only
+    if (dst->m_dtype != DataType::FP32 ||
+        src0->m_dtype != DataType::FP32 ||
+        src1->m_dtype != DataType::FP32) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::add only supports FP32");
         return;
     }
-    if (dst->m_shape != src0->m_shape || dst->m_shape != src1->m_shape) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::add (Phase1) requires same shape (no broadcast)");
-        return;
-    }
-    // Ensure inputs are contiguous for minimal kernel
-    Tensor tmp0, tmp1;
+
     auto *self = const_cast<OpenCLBackend*>(this);
 
-    const Tensor *src0_c = ensure_contiguous_or_pack_f32(self, src0, 4, tmp0);
-    const Tensor *src1_c = ensure_contiguous_or_pack_f32(self, src1, 4, tmp1);
+    // ✅ 快路径：完全同 shape → 你已有的 minimal kernel
+    if (dst->m_shape == src0->m_shape && dst->m_shape == src1->m_shape) {
+        Tensor tmp0, tmp1;
+        const Tensor *src0_c = ensure_contiguous_or_pack_f32(self, src0, 4, tmp0);
+        const Tensor *src1_c = ensure_contiguous_or_pack_f32(self, src1, 4, tmp1);
+        self->add_minimal(const_cast<Tensor *>(dst), src0_c, src1_c);
+        return;
+    }
 
-    self->add_minimal(const_cast<Tensor *>(dst), src0_c, src1_c);
+    self->add_broadcast(const_cast<Tensor *>(dst), src0, src1);
 }
 
 void OpenCLBackend::get_embedding(const Tensor *dst,

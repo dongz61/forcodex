@@ -87,6 +87,7 @@ public:
     // ========= Backend interface (MUST match base) =========
     void plan(std::vector<std::shared_ptr<OpNode>> &ops) override;
 
+    void add_broadcast(Tensor *dst, const Tensor *src0, const Tensor *src1) const;
     void add_minimal(Tensor * dst, const Tensor * src0, const Tensor * src1) const;
     void add(const Tensor *dst, const Tensor *src0, const Tensor *src1) const override;
     void get_embedding(const Tensor *dst, const Tensor *weight, const std::vector<int> &tokens) const override;
