@@ -1,8 +1,5 @@
 #include "backend/opencl/opencl_backend.hpp"
-#include "backend/cpu_buffer.hpp"
-
-#include "backend/ggml/ggml.hpp"     
-#include "ggml.h"                  
+#include "backend/cpu_buffer.hpp"              
 
 
 #include "core/logger.hpp"
@@ -124,6 +121,9 @@ void OpenCLBackend::cleanup() {
         std::cout << "[DEBUG] Thread pool released" << std::endl;
     }
     
+    m_ggml_fallback.reset();
+    m_ggml_fallback_wsize = 0;
+
     initialized = false;
     std::cout << "[DEBUG] === CLEANUP DONE ===" << std::endl;
 }
@@ -161,6 +161,13 @@ bool OpenCLBackend::initialize() {
 
     // 5. 初始化kv cache
     ensure_kv_cache_allocated_v0();
+
+    // ---- setup reusable GGML fallback backend ----
+    if (!m_ggml_fallback) {
+        m_ggml_fallback = std::make_unique<powerserve::ggml::GGMLBackend>(m_llm, m_hparams);
+        // GGMLBackend::matmul uses m_thread_pool->run(...), so threadpool must exist
+        m_ggml_fallback->setup_threadpool();  // GGMLBackend::setup_threadpool() creates ThreadPool :contentReference[oaicite:4]{index=4}
+    }
     
     initialized = true;
     
@@ -458,89 +465,46 @@ void OpenCLBackend::add(const Tensor *dst, const Tensor *src0, const Tensor *src
     self->add_minimal(const_cast<Tensor *>(dst), src0_c, src1_c);
 }
 
-void OpenCLBackend::get_embedding(
-    const Tensor *dst,
-    const Tensor *weight,
-    const std::vector<int> &tokens
-) const {
-    if (!initialized) {
-        POWERSERVE_LOG_ERROR("OpenCL backend not initialized");
-        return;
-    }
-    if (!dst || !weight) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding got null tensor");
-        return;
-    }
-
-    // Phase 1 strict:
-    // - dst must be FP32 and OpenCLBuffer-backed (executor allocates it as OpenCLBuffer)
-    // - weight must be FP32 and CPUBuffer-backed (model weight lives on CPU in your flow)
-    // - do CPU gather then H2D copy
+void OpenCLBackend::get_embedding(const Tensor *dst,
+                                  const Tensor *weight,
+                                  const std::vector<int> &tokens) const {
+    // 1) basic checks
     if (dst->m_dtype != DataType::FP32) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding (Phase1) dst must be FP32");
-        return;
-    }
-    if (weight->m_dtype != DataType::FP32) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding (Phase1) weight must be FP32 (no dequant yet)");
+        POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding dst must be FP32");
         return;
     }
 
+    auto dst_device = dynamic_cast<OpenCLBuffer *>(dst->m_data.get());
+    if (!dst_device) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding dst must be OpenCLBuffer");
+        return;
+    }
+
+    auto weight_host = dynamic_cast<CPUBuffer *>(weight->m_data.get());
+    if (!weight_host) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding weight must be CPUBuffer");
+        return;
+    }
+
+    const size_t dim = weight->m_shape[0];
     const size_t batch_size = tokens.size();
-    const size_t dim        = dst->m_shape[0];
 
-    if (dst->m_shape[2] != 1 || dst->m_shape[3] != 1) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding (Phase1) dst must be 2D-like (dim,batch,1,1)");
-        return;
-    }
-    if (dst->m_shape[1] != batch_size) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding (Phase1) batch mismatch: dst.shape[1] != tokens.size()");
-        return;
-    }
+    // 2) ensure reusable ggml backend ready
+    POWERSERVE_ASSERT(m_ggml_fallback && "m_ggml_fallback must be initialized in OpenCLBackend::initialize()");
 
-    // Weight is expected to be an embedding table laid out like GGML path:
-    // each token row is contiguous with stride[1] bytes (see CPU reference):contentReference[oaicite:3]{index=3}
-    powerserve::CPUBuffer *w_cpu = nullptr;
-    try {
-        w_cpu = &const_cast<Tensor *>(weight)->get<powerserve::CPUBuffer>();
-    } catch (const std::bad_cast &e) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding (Phase1) expects weight backed by CPUBuffer");
-        return;
-    }
-    if (!w_cpu->m_data) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding (Phase1) weight CPUBuffer data is null");
-        return;
+    // optional: ensure minimum workspace
+    constexpr size_t kMinWSize = 1 * 1024 * 1024;
+    if (m_ggml_fallback_wsize < kMinWSize) {
+        m_ggml_fallback->setup_work_data(kMinWSize);
+        m_ggml_fallback_wsize = kMinWSize;
     }
 
-    // 1) CPU gather into a temporary host tensor
+    // 3) run ggml embedding on CPU
     Tensor host_tmp(DataType::FP32, dst->m_shape);
-    host_tmp.m_data = powerserve::CPUBuffer::create_buffer<float>(dst->m_shape);
+    host_tmp.m_data = CPUBuffer::create_buffer<float>(dst->m_shape);
+    m_ggml_fallback->get_embedding(&host_tmp, weight, tokens);
 
-    auto *dst_host = static_cast<float *>(host_tmp.get<powerserve::CPUBuffer>().m_data);
-    auto *embd_tb  = static_cast<char *>(w_cpu->m_data);
-    const auto w_stride = w_cpu->m_stride; // bytes
-
-    for (size_t i = 0; i < batch_size; i++) {
-        const int token = tokens[i];
-        if (token < 0) {
-            POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding (Phase1) got negative token id");
-            return;
-        }
-
-        // row pointer = base + stride[1] * token
-        char *src = embd_tb + w_stride[1] * static_cast<size_t>(token);
-
-        // (optional) basic bounds check like GGMLBackend does:contentReference[oaicite:4]{index=4}
-        // Here we only check that src doesn't go backwards and that stride[1] is sane.
-        // Full bound check would require knowing total table bytes; we keep it minimal & fail-fast-ish.
-        if (w_stride[1] == 0) {
-            POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding (Phase1) weight stride[1] is 0");
-            return;
-        }
-
-        std::memcpy(dst_host + i * dim, src, dim * sizeof(float));
-    }
-
-    // 2) H2D copy into dst OpenCLBuffer using existing copy() (CPU -> OpenCL path):contentReference[oaicite:5]{index=5}
+    // 4) H2D copy
     this->copy(dst, &host_tmp);
 }
 
@@ -629,32 +593,29 @@ void OpenCLBackend::matmul_cpu_ggml_fallback(
     Tensor host_c(dst->m_dtype, dst->m_shape);
     host_c.m_data = create_cpu_buffer_for_dtype(dst->m_dtype, dst->m_shape);
 
-    // ---- 3) ggml mul_mat ----
-    auto gt_a = convert_to_ggml(a_host);
-    auto gt_b = convert_to_ggml(b_host);
-    auto gt_c = convert_to_ggml(&host_c);
+    // ---- 3) ggml mul_mat (reusable GGMLBackend, correct params/workspace/threadpool) ----
+    POWERSERVE_ASSERT(m_ggml_fallback && "m_ggml_fallback must be initialized in OpenCLBackend::initialize()");
 
-    op_compute_params params = {
-        .ith           = 0,
-        .nth           = 1,
-        .wsize         = 0,
-        .wdata         = nullptr,
-        .thread_pool   = nullptr,
-        .barrier_fn    = nullptr,
-        .current_chunk = nullptr,
-    };
+    // workspace sizing (copy from GGMLBackend::plan() logic for MAT_MUL) :contentReference[oaicite:6]{index=6}
+    const enum ggml_type vec_dot_type = m_ggml_fallback->get_vec_dot_type(b_host);
+    const enum ggml_type w_type = powerserve::ggml::convert_datatype_to_ggml(a_host->m_dtype);
 
-    powerserve_compute_forward_mul_mat(&params, gt_c.get(), gt_a.get(), gt_b.get());
+    size_t required_wsize = 0;
+    if (w_type != vec_dot_type) {
+        required_wsize = ggml_row_size(vec_dot_type, a_host->n_elements());
+    }
+
+    // only grow, never shrink
+    if (required_wsize > m_ggml_fallback_wsize) {
+        m_ggml_fallback->setup_work_data(required_wsize); // will add cache line padding internally :contentReference[oaicite:7]{index=7}
+        m_ggml_fallback_wsize = required_wsize;
+    }
+
+    // run ggml matmul
+    m_ggml_fallback->matmul(&host_c, a_host, b_host);
 
     // ---- 4) H2D: host_c -> dst ----
     this->copy(dst, &host_c);
-
-    POWERSERVE_LOG_DEBUG(
-        "OpenCLBackend::matmul ggml fallback done: dst={} a={}({}) b={}({})",
-        (int)dst->m_dtype,
-        (int)src0->m_dtype, is_cpu_tensor(src0) ? "CPU" : "DEV",
-        (int)src1->m_dtype, is_cpu_tensor(src1) ? "CPU" : "DEV"
-    );
 }
 
 
@@ -995,9 +956,6 @@ void OpenCLBackend::rmsnorm(
     // H2D: host_y -> o
     // ----------------------------
     this->copy(o, &host_y);
-
-    POWERSERVE_LOG_DEBUG("OpenCLBackend::rmsnorm CPU fallback done (hidden={}, rows={}, eps={})",
-                         hidden, rows, eps);
 }
 
 // for rope
@@ -1185,9 +1143,6 @@ void OpenCLBackend::rope(
 
     // ---- H2D host_y -> out ----
     this->copy(out, &host_y);
-
-    POWERSERVE_LOG_ERROR("rope fallback: dim={}, heads={}, tokens={}, batch={}, n_dims={}, rope_type={}",
-                     dim, H, T, ne3, n_dims, rope_type);
 }
 
 
@@ -1422,8 +1377,6 @@ void OpenCLBackend::softmax_ext(
 
     // 3) H2D
     self->copy(out, &host_out);
-
-    POWERSERVE_LOG_DEBUG("OpenCLBackend::softmax_ext CPU fallback (ggml-aligned) done");
 }
 
 void OpenCLBackend::silu_hadamard(const Tensor * out,
