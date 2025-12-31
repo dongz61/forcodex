@@ -6,6 +6,9 @@
 #include "tokenizer/tokenizer.hpp"
 #include "core/config.hpp"
 #include "model/module/norm_attention.hpp"
+#include "executor/executor.hpp"
+#include "graph/op_type.hpp"
+#include "core/tensor.hpp"
 
 
 #include <algorithm>
@@ -15,8 +18,35 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <unordered_map>
 
 using namespace powerserve;
+
+static const char *op_type_to_string(OpType t) {
+    switch (t) {
+    case OpType::GET_EMBEDDING: return "GET_EMBEDDING";
+    case OpType::ADD: return "ADD";
+    case OpType::MAT_MUL: return "MAT_MUL";
+    case OpType::RMS_NORM: return "RMS_NORM";
+    case OpType::SILU_HADAMARD: return "SILU_HADAMARD";
+    case OpType::ROPE: return "ROPE";
+    case OpType::SOFTMAX: return "SOFTMAX";
+    case OpType::COPY: return "COPY";
+    case OpType::ADD_CACHE: return "ADD_CACHE";
+    case OpType::PERMUTE: return "PERMUTE";
+    case OpType::CONT: return "CONT";
+    case OpType::VIEW: return "VIEW";
+    case OpType::SOFTMAX_EXT: return "SOFTMAX_EXT";
+    case OpType::GET_MASK: return "GET_MASK";
+    case OpType::TRANSPOSE: return "TRANSPOSE";
+    case OpType::PRINT: return "PRINT";
+#if defined(POWERSERVE_WITH_QNN)
+    case OpType::QNN_FORWARD: return "QNN_FORWARD";
+    case OpType::QNN_FORWARD_VL: return "QNN_FORWARD_VL";
+#endif
+    default: return "UNKNOWN";
+    }
+}
 
 // ======================
 // 你只需要改这里：写死参数
@@ -69,6 +99,86 @@ static void dump_topk(std::span<const float> logits, int k, const char *tag) {
 static int argmax_token(std::span<const float> logits) {
     return (int)(std::max_element(logits.begin(), logits.end()) - logits.begin());
 }
+
+static std::vector<float> tensor_to_f32_vec_cpu(const Tensor *t) {
+    std::vector<float> out;
+    if (!t || t->m_dtype != DataType::FP32) return out;
+
+    auto shape = t->m_shape;
+    size_t n = t->n_elements();
+    out.resize(n);
+
+    auto &cb = const_cast<Tensor*>(t)->get<CPUBuffer>();
+    auto stride = cb.m_stride;
+
+    size_t idx = 0;
+    for (size_t i3 = 0; i3 < shape[3]; ++i3) {
+        for (size_t i2 = 0; i2 < shape[2]; ++i2) {
+            for (size_t i1 = 0; i1 < shape[1]; ++i1) {
+                for (size_t i0 = 0; i0 < shape[0]; ++i0) {
+                    float *ptr = (float *)((char *)cb.m_data +
+                                           i3 * stride[3] + i2 * stride[2] +
+                                           i1 * stride[1] + i0 * stride[0]);
+                    out[idx++] = *ptr;
+                }
+            }
+        }
+    }
+    return out;
+}
+
+static std::vector<float> tensor_to_f32_vec_opencl(const Tensor *t, powerserve::opencl::OpenCLBackend *cl_backend) {
+    std::vector<float> out;
+    if (!t || t->m_dtype != DataType::FP32) return out;
+    POWERSERVE_ASSERT(cl_backend);
+
+    // create tmp cpu tensor with same shape
+    Tensor tmp_cpu(DataType::FP32, t->m_shape);
+    tmp_cpu.m_data = powerserve::CPUBuffer::create_buffer<float>(t->m_shape);
+
+    // D2H copy
+    cl_backend->copy(&tmp_cpu, t);
+
+    // flatten
+    return tensor_to_f32_vec_cpu(&tmp_cpu);
+}
+
+static void print_tensor_meta(const Tensor *t, const char *tag) {
+    if (!t) {
+        fmt::print("  {}: <null>\n", tag);
+        return;
+    }
+    auto shape = t->m_shape;
+
+    // stride: CPUBuffer or OpenCLBuffer
+    std::array<size_t,4> stride = {0,0,0,0};
+    bool is_cl = false;
+
+#if defined(POWERSERVE_WITH_OPENCL)
+    try {
+        auto &clb = const_cast<Tensor*>(t)->get<powerserve::opencl::OpenCLBuffer>();
+        stride = {clb.m_stride[0], clb.m_stride[1], clb.m_stride[2], clb.m_stride[3]};
+        is_cl = true;
+    } catch (...) {
+        // not OpenCL
+    }
+#endif
+    if (!is_cl) {
+        auto &cb = const_cast<Tensor*>(t)->get<CPUBuffer>();
+        stride = {cb.m_stride[0], cb.m_stride[1], cb.m_stride[2], cb.m_stride[3]};
+    }
+
+    fmt::print("  {}: dtype={} shape=[{}, {}, {}, {}] strideB=[{}, {}, {}, {}]\n",
+               tag,
+               (int)t->m_dtype,
+               shape[0], shape[1], shape[2], shape[3],
+               stride[0], stride[1], stride[2], stride[3]);
+}
+
+static inline uint64_t op_out_key(int op_idx, int out_idx) {
+    return (uint64_t(uint32_t(op_idx)) << 32) | uint32_t(out_idx);
+}
+
 
 int main() {
     POWERSERVE_LOG_INFO("==== Qwen2 logits compare test (ggml vs opencl) ====");
@@ -151,23 +261,92 @@ int main() {
     {
         auto mask = CausalAttentionMask(tokens.size());
 
+        // ----------------------------------
+        // Pass 1: run GGML, record each op output
+        // ----------------------------------
+       std::unordered_map<uint64_t, std::vector<float>> ggml_op_outs;
+
+        set_op_after_exec_hook([&](int op_idx, const OpNode *op) {
+            // 遍历该 op 的所有输出 next[]
+            for (int oi = 0; oi < (int)op->next.size(); ++oi) {
+                Tensor *out = op->next[oi]->tensor();
+                if (!out) continue;
+                if (!out->m_data) continue;                // 跳过 view (m_data=nullptr)
+                if (out->m_dtype != DataType::FP32) continue;
+
+                ggml_op_outs[op_out_key(op_idx, oi)] = tensor_to_f32_vec_cpu(out);
+            }
+        });
+
+
         auto ret_g = model_ggml->forward(tokens, pos, mask, true);
+
+        // disable hook between passes
+        set_op_after_exec_hook(nullptr);
+
+        // ----------------------------------
+        // Pass 2: run OpenCL, compare each op output with GGML
+        // ----------------------------------
+        auto *cl_backend = dynamic_cast<powerserve::opencl::OpenCLBackend*>(
+            platform->get_backend(model_ocl->m_config->model_id));
+        POWERSERVE_ASSERT(cl_backend && "OpenCLBackend is null");
+
+        set_op_after_exec_hook([&](int op_idx, const OpNode *op) {
+            for (int oi = 0; oi < (int)op->next.size(); ++oi) {
+                Tensor *out = op->next[oi]->tensor();
+                if (!out) continue;
+                if (!out->m_data) continue;
+                if (out->m_dtype != DataType::FP32) continue;
+
+                auto it = ggml_op_outs.find(op_out_key(op_idx, oi));
+                if (it == ggml_op_outs.end()) continue;
+
+                auto ocl_vec = tensor_to_f32_vec_opencl(out, cl_backend);
+                auto &gg_vec = it->second;
+
+                if (ocl_vec.size() != gg_vec.size()) {
+                    fmt::print("\n[FIRST MISMATCH]\n");
+                    fmt::print("  op#{} type={} out#{} (size mismatch ocl={} ggml={})\n",
+                            op_idx, op_type_to_string(op->op), oi, ocl_vec.size(), gg_vec.size());
+                    print_tensor_meta(out, "out");
+                    std::exit(1);
+                }
+
+                size_t bad_i = 0;
+                float diff = 0.f;
+                if (!allclose_span(ocl_vec, gg_vec, ATOL, RTOL, &bad_i, &diff)) {
+                    fmt::print("\n[FIRST MISMATCH]\n");
+                    fmt::print("  op#{} type={} out#{}\n", op_idx, op_type_to_string(op->op), oi);
+                    print_tensor_meta(out, "out");
+                    fmt::print("  bad_i={} ggml={} ocl={} diff={}\n",
+                            bad_i, gg_vec[bad_i], ocl_vec[bad_i], diff);
+                    std::exit(1);
+                }
+            }
+        });
+
+
         auto ret_o = model_ocl->forward(tokens, pos, mask, true);
 
+        // disable hook for later code
+        set_op_after_exec_hook(nullptr);
+
+        // still keep logits compare (optional)
         auto lg = ret_g.logits_vector.back();
         auto lo = ret_o.logits_vector.back();
-
         size_t bad_i = 0;
         float diff = 0;
         if (!allclose_span(lo, lg, ATOL, RTOL, &bad_i, &diff)) {
-            fmt::print("PREFILL logits mismatch: bad_i={}, ocl={}, ggml={}, diff={}\n",
-                       bad_i, lo[bad_i], lg[bad_i], diff);
+            fmt::print("PREFILL logits mismatch (end-to-end): bad_i={}, ocl={}, ggml={}, diff={}\n",
+                    bad_i, lo[bad_i], lg[bad_i], diff);
             dump_topk(lg, TOPK, "ggml");
             dump_topk(lo, TOPK, "opencl");
             return 1;
         }
-        POWERSERVE_LOG_INFO("Prefill logits compare PASS");
+
+        POWERSERVE_LOG_INFO("Prefill per-op compare PASS");
     }
+
 
     // ----------------------------
     // 7) DECODE loop compare

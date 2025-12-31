@@ -22,6 +22,19 @@
 
 namespace powerserve {
 
+// ziqian add: debug hook impl
+// ===== Debug hook impl =====
+static OpAfterExecHook g_after_exec_hook = nullptr;
+
+void set_op_after_exec_hook(OpAfterExecHook hook) {
+    g_after_exec_hook = std::move(hook);
+}
+
+OpAfterExecHook & get_op_after_exec_hook() {
+    return g_after_exec_hook;
+}
+// ziqian: end
+
 // ziqian：增加通过后端决定分配buffer类型
 void Executor::allocate_buffers() {
     const bool use_opencl = m_platform.using_opencl(m_graph.m_model_id);
@@ -223,6 +236,8 @@ void Executor::run() {
     POWERSERVE_ASSERT(backend != nullptr);
     const bool use_opencl = m_platform.using_opencl(model_id);
     plan();
+
+    int op_idx = 0;
 
     for (auto op : m_graph.ops) {
         switch (op->op) {
@@ -439,6 +454,11 @@ void Executor::run() {
         default:
             POWERSERVE_ABORT("Unknown OpType: {}", static_cast<int>(op->op));
         }
+        if (get_op_after_exec_hook()) {
+            get_op_after_exec_hook()(op_idx, op.get());
+        }
+
+        op_idx++;
     }
     // ziqian：end
 } 

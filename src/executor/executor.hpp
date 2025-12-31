@@ -19,7 +19,7 @@
 #include "backend/opencl/opencl_buffer.hpp"  
 #include "backend/opencl/opencl_backend.hpp"
 
-
+#include <functional>
 
 namespace powerserve {
 
@@ -81,5 +81,13 @@ private:
     }
     // ziqian：end
 };
+
+// ziqian: add hook for debug
+using OpAfterExecHook = std::function<void(int op_idx, const OpNode *op)>;
+
+// set to nullptr to disable
+void set_op_after_exec_hook(OpAfterExecHook hook);
+OpAfterExecHook & get_op_after_exec_hook();
+// ziqian: end
 
 } // namespace powerserve

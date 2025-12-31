@@ -322,6 +322,85 @@ static inline void pack_contiguous_cpu_f32(
     self->copy(dst_contig_dev, &host_contig);
 }
 
+static inline void pack_contiguous_cl_f32(const OpenCLBackend* self,
+                                   const Tensor* src,
+                                   Tensor* dst_contig) {
+    auto context = self->context;
+    POWERSERVE_ASSERT(src && dst_contig);
+    auto& src_buf = src->get<OpenCLBuffer>();
+    auto& dst_buf = dst_contig->get<OpenCLBuffer>();
+
+    cl_mem src_mem = src_buf.get_device_buffer();
+    cl_mem dst_mem = dst_buf.get_device_buffer();
+    POWERSERVE_ASSERT(src_mem && dst_mem);
+
+    cl_kernel k = self->kernel_manager->get_kernel("kernel_cpy_f32_f32");
+    POWERSERVE_ASSERT(k);
+
+    // shape (assume 4D padded)
+    const int ne00 = (int)src->m_shape[0];
+    const int ne01 = (int)src->m_shape[1];
+    const int ne02 = (int)src->m_shape[2];
+    const int ne03 = (int)src->m_shape[3];
+
+    const int ne0  = (int)dst_contig->m_shape[0];
+    const int ne1  = (int)dst_contig->m_shape[1];
+    const int ne2  = (int)dst_contig->m_shape[2];
+    const int ne3  = (int)dst_contig->m_shape[3];
+
+    // strides in bytes
+    const auto sst = src_buf.get_stride();
+    const cl_ulong nb00 = (cl_ulong)sst[0];
+    const cl_ulong nb01 = (cl_ulong)sst[1];
+    const cl_ulong nb02 = (cl_ulong)sst[2];
+    const cl_ulong nb03 = (cl_ulong)sst[3];
+
+    const auto dstst = dst_buf.get_stride(); // dst 是 create_buffer 创建的，天然 contiguous
+    const cl_ulong nb0 = (cl_ulong)dstst[0];
+    const cl_ulong nb1 = (cl_ulong)dstst[1];
+    const cl_ulong nb2 = (cl_ulong)dstst[2];
+    const cl_ulong nb3 = (cl_ulong)dstst[3];
+
+    const cl_ulong off0 = 0;
+    const cl_ulong offd = 0;
+
+    cl_uint arg = 0;
+    CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_mem),   &src_mem));
+    CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_ulong), &off0));
+    CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_mem),   &dst_mem));
+    CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_ulong), &offd));
+
+    CL_CHECK(clSetKernelArg(k, arg++, sizeof(int), &ne00));
+    CL_CHECK(clSetKernelArg(k, arg++, sizeof(int), &ne01));
+    CL_CHECK(clSetKernelArg(k, arg++, sizeof(int), &ne02));
+    CL_CHECK(clSetKernelArg(k, arg++, sizeof(int), &ne03));
+
+    CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb00));
+    CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb01));
+    CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb02));
+    CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb03));
+
+    CL_CHECK(clSetKernelArg(k, arg++, sizeof(int), &ne0));
+    CL_CHECK(clSetKernelArg(k, arg++, sizeof(int), &ne1));
+    CL_CHECK(clSetKernelArg(k, arg++, sizeof(int), &ne2));
+    CL_CHECK(clSetKernelArg(k, arg++, sizeof(int), &ne3));
+
+    CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb0));
+    CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb1));
+    CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb2));
+    CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb3));
+
+    // 先用最稳妥配置避免 CL_INVALID_WORK_GROUP_SIZE（bring-up）
+    const size_t nth = 1;
+    const size_t local[3]  = { nth, 1, 1 };
+    const size_t global[3] = { (size_t)ne01 * nth, (size_t)ne02, (size_t)ne03 };
+
+    CL_CHECK(clEnqueueNDRangeKernel(self->context->get_queue(),
+                                    k, 3, nullptr, global, local,
+                                    0, nullptr, nullptr));
+    CL_CHECK(clFinish(self->context->get_queue()));
+}
+
 static inline const Tensor * ensure_contiguous_or_pack_f32(
     powerserve::opencl::OpenCLBackend *self,
     const Tensor *src,
