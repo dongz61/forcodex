@@ -114,6 +114,16 @@ int main() {
     platform->init_ggml_backend(model_ggml->m_config, hparams);
     platform->init_ggml_backend(model_ocl->m_config,  hparams); // 给 opencl model 也 init ggml（fallback 会用）
     platform->init_opencl_backend(model_ocl->m_config, hparams);
+    {
+        auto &id_g = model_ggml->m_config->model_id;
+        auto &id_o = model_ocl->m_config->model_id;
+
+        platform->reset_kv_position(id_g);
+        platform->reset_kv_position(id_o);
+
+        platform->ggml_backends[id_g]->setup_threadpool();
+        platform->ggml_backends[id_o]->setup_threadpool();
+    }
 
     // ----------------------------
     // 4) tokenizer
@@ -197,5 +207,8 @@ int main() {
     }
 
     POWERSERVE_LOG_INFO("All steps PASS: logits match within atol={} rtol={}", ATOL, RTOL);
+    // ✅ 对齐仓库 generate() 的做法：用完就 reset，避免析构顺序/资源泄漏问题
+    platform->ggml_backends[model_ggml->m_config->model_id]->reset_threadpool();
+    platform->ggml_backends[model_ocl->m_config->model_id]->reset_threadpool();
     return 0;
 }
