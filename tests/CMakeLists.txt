@@ -18,6 +18,7 @@ if (POWERSERVE_WITH_OPENCL)
         
         # 添加OpenCL测试程序
         add_executable(opencl_test "opencl_test.cpp")
+        add_executable(logits_cmp "logits_cmp.cpp")
         
         # 链接OpenCL
         target_link_libraries(opencl_test PRIVATE 
@@ -33,6 +34,24 @@ if (POWERSERVE_WITH_OPENCL)
                 -Wno-unused-parameter
             )
         endif()
+
+        target_link_libraries(logits_cmp PRIVATE
+            powerserve
+            OpenCL::OpenCL
+        )
+
+        if (NOT MSVC)
+            target_compile_options(logits_cmp PRIVATE
+                -Wall
+                -Wextra
+                -Wno-unused-parameter
+            )
+        endif()
+
+        target_include_directories(logits_cmp PRIVATE
+            ${CMAKE_SOURCE_DIR}
+        )
+
         
         # 添加一个方便运行测试的自定义命令
         add_custom_target(run_opencl_test
@@ -40,6 +59,12 @@ if (POWERSERVE_WITH_OPENCL)
             DEPENDS opencl_test
             WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
             COMMENT "Running OpenCL tests..."
+        )
+
+        add_custom_target(run_logits_cmp
+            COMMAND POWERSERVE_USE_OPENCL=1 ./logits_cmp
+            DEPENDS logits_cmp
+            WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
         )
         
     else()

@@ -12,7 +12,6 @@ namespace powerserve::opencl {
 // 构造函数和析构函数
 OpenCLKernelManager::OpenCLKernelManager(std::shared_ptr<OpenCLContext> context)
     : context_(std::move(context)) {
-    POWERSERVE_LOG_DEBUG("OpenCLKernelManager created");
 }
 
 OpenCLKernelManager::~OpenCLKernelManager() {
@@ -24,11 +23,8 @@ bool OpenCLKernelManager::initialize(const OpenCLCompileOptions& options) {
     std::lock_guard<std::mutex> lock(mutex_);
     compile_options_ = options;
     
-    POWERSERVE_LOG_DEBUG("OpenCLKernelManager::initialize called");
-    
     // 编译嵌入式内核
 #ifdef POWERSERVE_OPENCL_EMBED_KERNELS
-    POWERSERVE_LOG_DEBUG("POWERSERVE_OPENCL_EMBED_KERNELS is defined");
     bool success = compile_embedded_kernels();
     if (!success) {
         POWERSERVE_LOG_ERROR("Failed to compile embedded OpenCL kernels");
@@ -38,13 +34,11 @@ bool OpenCLKernelManager::initialize(const OpenCLCompileOptions& options) {
     POWERSERVE_LOG_DEBUG("POWERSERVE_OPENCL_EMBED_KERNELS is NOT defined");
 #endif
     
-    POWERSERVE_LOG_INFO("OpenCLKernelManager initialized");
     return true;
 }
 
 bool OpenCLKernelManager::compile_embedded_kernels() {
 #ifdef POWERSERVE_OPENCL_EMBED_KERNELS
-    POWERSERVE_LOG_INFO("Compiling embedded OpenCL kernels...");
     
     bool all_success = true;
     
@@ -57,8 +51,6 @@ bool OpenCLKernelManager::compile_embedded_kernels() {
             if (!compile_program("copy_kernels", cpy_source)) {
                 POWERSERVE_LOG_ERROR("Failed to compile copy kernels");
                 all_success = false;
-            } else {
-                POWERSERVE_LOG_INFO("Copy kernels compiled successfully");
             }
         }
     }
@@ -73,8 +65,6 @@ bool OpenCLKernelManager::compile_embedded_kernels() {
             if (!compile_program("add_kernels", add_source)) {
                 POWERSERVE_LOG_ERROR("Failed to compile add kernels");
                 all_success = false;
-            } else {
-                POWERSERVE_LOG_INFO("Add kernels compiled successfully");
             }
         } else {
             POWERSERVE_LOG_ERROR("Add kernel source is empty!");
@@ -92,8 +82,6 @@ bool OpenCLKernelManager::compile_embedded_kernels() {
             if (!compile_program("silu_kernels", silu_source)) {
                 POWERSERVE_LOG_ERROR("Failed to compile silu kernels");
                 all_success = false;
-            } else {
-                POWERSERVE_LOG_INFO("silu kernels compiled successfully");
             }
         } else {
             POWERSERVE_LOG_ERROR("silu kernel source is empty!");
@@ -111,8 +99,6 @@ bool OpenCLKernelManager::compile_embedded_kernels() {
             if (!compile_program("gelu_kernels", gelu_source)) {
                 POWERSERVE_LOG_ERROR("Failed to compile gelu kernels");
                 all_success = false;
-            } else {
-                POWERSERVE_LOG_INFO("gelu kernels compiled successfully");
             }
         } else {
             POWERSERVE_LOG_ERROR("gelu kernel source is empty!");
@@ -130,8 +116,6 @@ bool OpenCLKernelManager::compile_embedded_kernels() {
             if (!compile_program("matmul_kernels", matmul_source)) {
                 POWERSERVE_LOG_ERROR("Failed to compile matmul kernels");
                 all_success = false;
-            } else {
-                POWERSERVE_LOG_INFO("matmul kernels compiled successfully");
             }
         } else {
             POWERSERVE_LOG_ERROR("matmul kernel source is empty!");
@@ -149,8 +133,6 @@ bool OpenCLKernelManager::compile_embedded_kernels() {
             if (!compile_program("rms_norm_kernels", rms_norm_source)) {
                 POWERSERVE_LOG_ERROR("Failed to compile rms_norm kernels");
                 all_success = false;
-            } else {
-                POWERSERVE_LOG_INFO("rms_norm kernels compiled successfully");
             }
         } else {
             POWERSERVE_LOG_ERROR("rms_norm kernel source is empty!");
@@ -168,8 +150,6 @@ bool OpenCLKernelManager::compile_embedded_kernels() {
             if (!compile_program("softmax_kernels", softmax_source)) {
                 POWERSERVE_LOG_ERROR("Failed to compile softmax kernels");
                 all_success = false;
-            } else {
-                POWERSERVE_LOG_INFO("softmax kernels compiled successfully");
             }
         } else {
             POWERSERVE_LOG_ERROR("softmax kernel source is empty!");
@@ -187,8 +167,6 @@ bool OpenCLKernelManager::compile_embedded_kernels() {
             if (!compile_program("rope_kernels", rope_source)) {
                 POWERSERVE_LOG_ERROR("Failed to compile rope kernels");
                 all_success = false;
-            } else {
-                POWERSERVE_LOG_INFO("rope kernels compiled successfully");
             }
         }
     }
@@ -203,8 +181,6 @@ bool OpenCLKernelManager::compile_embedded_kernels() {
             if (!compile_program("diag_mask_inf_kernels", diag_mask_inf_source)) {
                 POWERSERVE_LOG_ERROR("Failed to compile diag_mask_inf kernels");
                 all_success = false;
-            } else {
-                POWERSERVE_LOG_INFO("diag_mask_inf kernels compiled successfully");
             }
         } else {
             POWERSERVE_LOG_ERROR("diag_mask_inf kernel source is empty!");
@@ -226,7 +202,6 @@ bool OpenCLKernelManager::compile_program(const std::string& program_name,
                                          const std::string& source_code,
                                          const std::string& extra_options) {
     
-    POWERSERVE_LOG_DEBUG("compile_program START: {}", program_name);
     
     // 检查是否已存在
     if (programs_.find(program_name) != programs_.end()) {
@@ -242,9 +217,7 @@ bool OpenCLKernelManager::compile_program(const std::string& program_name,
     
     // 构建编译选项
     std::string options = build_compile_options(extra_options);
-    POWERSERVE_LOG_DEBUG("Compile options: {}", options);
     
-    POWERSERVE_LOG_DEBUG("Calling compile_program_impl...");
     // 编译program
     cl_program program = compile_program_impl(source_code, options);
     
@@ -252,8 +225,6 @@ bool OpenCLKernelManager::compile_program(const std::string& program_name,
         POWERSERVE_LOG_ERROR("Failed to compile program '{}'", program_name);
         return false;
     }
-    
-    POWERSERVE_LOG_DEBUG("compile_program_impl returned successfully");
     
     std::vector<std::string> kernel_names = split_kernel_names(source_code);
     
@@ -327,8 +298,6 @@ bool OpenCLKernelManager::compile_program(const std::string& program_name,
     
     programs_[program_name] = std::move(item);
     
-    POWERSERVE_LOG_INFO("Program '{}' compiled successfully with {} kernels", 
-                       program_name, programs_[program_name].kernels.size());
     return true;
 }
 
@@ -464,13 +433,10 @@ std::string OpenCLKernelManager::build_compile_options(const std::string& extra_
 // 编译program实现
 cl_program OpenCLKernelManager::compile_program_impl(const std::string& source_code,
                                                     const std::string& options) {
-    POWERSERVE_LOG_DEBUG("compile_program_impl START");
     
     cl_int err;
     const char* source_cstr = source_code.c_str();
     size_t source_len = source_code.length();
-    
-    POWERSERVE_LOG_DEBUG("Creating program with source (length: {})", source_len);
     
     cl_program program = clCreateProgramWithSource(context_->get_context(), 1,
                                                    &source_cstr, &source_len, &err);
@@ -480,15 +446,9 @@ cl_program OpenCLKernelManager::compile_program_impl(const std::string& source_c
         return nullptr;
     }
     
-    POWERSERVE_LOG_DEBUG("clCreateProgramWithSource succeeded");
-    
     cl_device_id device = context_->get_device();
-    POWERSERVE_LOG_DEBUG("Building program with options: {}", options);
-    POWERSERVE_LOG_DEBUG("Calling clBuildProgram...");
     
     err = clBuildProgram(program, 1, &device, options.c_str(), nullptr, nullptr);
-    
-    POWERSERVE_LOG_DEBUG("clBuildProgram returned: {}", err);
     
     if (err != CL_SUCCESS) {
         // 获取构建日志
@@ -503,8 +463,6 @@ cl_program OpenCLKernelManager::compile_program_impl(const std::string& source_c
         clReleaseProgram(program);
         return nullptr;
     }
-    
-    POWERSERVE_LOG_DEBUG("compile_program_impl END: success");
     return program;
 }
 

@@ -667,34 +667,51 @@ void OpenCLBackend::add_broadcast(Tensor *dst, const Tensor *src0, const Tensor 
             CL_CHECK(err);
         }
         
-        // 计算工作组大小（严格按照 llama.cpp 的逻辑）
         if (bcast_row) {
-            // 行广播版本
-            int n = dst->n_elements() / 4;  // 使用 float4
-            size_t global_work_size[] = {static_cast<size_t>(n), 1, 1};
-            size_t local_work_size[] = {64, 1, 1};
-            
-            err = clEnqueueNDRangeKernel(context->get_queue(), kernel,
-                                         1, nullptr, global_work_size, local_work_size,
-                                         0, nullptr, nullptr);
+            // 行广播版本 bring-up：local=1，保证合法
+            int n = dst->n_elements() / 4;
+            if (n <= 0) return;
+
+            size_t global_work_size[] = { static_cast<size_t>(n), 1, 1 };
+            size_t local_work_size[]  = { 1, 1, 1 };
+
+            err = clEnqueueNDRangeKernel(
+                context->get_queue(),
+                kernel,
+                1,
+                nullptr,
+                global_work_size,
+                local_work_size,
+                0,
+                nullptr,
+                nullptr
+            );
             CL_CHECK(err);
-            
+
         } else {
-            // ✅ 普通版本：对齐 add.cl::kernel_add 的 get_group_id 语义
-            const size_t nth = 64;              // local threads along dim0
-            size_t local_work_size[3]  = { nth, 1, 1 };
+            // 普通版本 bring-up：local=1，保证合法
+            if (ne01 <= 0 || ne02 <= 0 || ne03 <= 0) return;
+
             size_t global_work_size[3] = {
-                static_cast<size_t>(ne01) * nth, // so get_group_id(0) ranges [0, ne01)
+                static_cast<size_t>(ne01),   // 注意：local=1 时 global 直接等于 group-count
                 static_cast<size_t>(ne02),
                 static_cast<size_t>(ne03)
             };
+            size_t local_work_size[3]  = { 1, 1, 1 };
 
-            err = clEnqueueNDRangeKernel(context->get_queue(), kernel,
-                                        3, nullptr, global_work_size, local_work_size,
-                                        0, nullptr, nullptr);
+            err = clEnqueueNDRangeKernel(
+                context->get_queue(),
+                kernel,
+                3,
+                nullptr,
+                global_work_size,
+                local_work_size,
+                0,
+                nullptr,
+                nullptr
+            );
             CL_CHECK(err);
         }
-
         
         // 等待完成
         err = clFinish(context->get_queue());
