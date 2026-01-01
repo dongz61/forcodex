@@ -1082,12 +1082,34 @@ void OpenCLBackend::matmul(const Tensor *dst, const Tensor *src0, const Tensor *
 
     auto *self = const_cast<OpenCLBackend *>(this);
 
+    // --------------------------------------------
+    // Inline helper: check if tensor holds OpenCLBuffer
+    // --------------------------------------------
+    auto is_opencl = [](const Tensor *t) -> bool {
+#if defined(POWERSERVE_WITH_OPENCL)
+        return t && t->m_data &&
+               dynamic_cast<powerserve::opencl::OpenCLBuffer*>(t->m_data.get()) != nullptr;
+#else
+        (void)t;
+        return false;
+#endif
+    };
+
+    // for debug: confirm this compiled code is actually running
+    POWERSERVE_LOG_ERROR("[MATMUL] compiled from {}:{}", __FILE__, __LINE__);  // for debug
+
     // ---- Try OpenCL minimal kernel only when it's safe ----
-    const bool all_f32 = (dst->m_dtype == DataType::FP32 &&
+    const bool all_f32 = (dst->m_dtype  == DataType::FP32 &&
                           src0->m_dtype == DataType::FP32 &&
                           src1->m_dtype == DataType::FP32);
 
-    if (all_f32) {
+    const bool all_opencl = is_opencl(dst) && is_opencl(src0) && is_opencl(src1);
+
+    // for debug: print dispatch condition summary
+    POWERSERVE_LOG_ERROR("[MATMUL DISPATCH] all_f32={} all_opencl={} (dst/src0/src1 opencl: {} {} {})",  // for debug
+                         all_f32, all_opencl, is_opencl(dst), is_opencl(src0), is_opencl(src1));
+
+    if (all_f32 && all_opencl) {
         Tensor tmpA_dev, tmpB_dev;
         const int n_dims_check = 4;
 
@@ -1106,6 +1128,7 @@ void OpenCLBackend::matmul(const Tensor *dst, const Tensor *src0, const Tensor *
             if (B->m_shape[1] == K &&
                 dst->m_shape[0] == N && dst->m_shape[1] == M) {
 
+                POWERSERVE_LOG_ERROR("[MATMUL PATH] minimal");  // for debug
                 self->matmul_minimal(const_cast<Tensor *>(dst), A, B);
                 return;
             }
@@ -1113,8 +1136,81 @@ void OpenCLBackend::matmul(const Tensor *dst, const Tensor *src0, const Tensor *
     }
 
     // ---- General fallback: ggml mul_mat (supports FP32/FP16/quant + arbitrary layout) ----
-    self->matmul_cpu_ggml_fallback(dst, src0, src1);
+    // Important: ggml fallback requires CPU tensors.
+    // We must materialize OpenCL inputs to CPU, and if dst is OpenCL, copy the result back.
+    POWERSERVE_LOG_ERROR("[MATMUL PATH] ggml_fallback");  // for debug
+
+    const Tensor *A_cpu = src0;  // src0 may be CPU quant weight (dtype=6), keep as-is
+    const Tensor *B_cpu = src1;
+
+    Tensor tmpB_cpu;
+    if (is_opencl(src1)) {
+        // D2H src1 into tmpB_cpu (FP32)
+        tmpB_cpu = Tensor(DataType::FP32, src1->m_shape);
+        tmpB_cpu.m_data = powerserve::CPUBuffer::create_buffer<float>(src1->m_shape);
+        self->copy(&tmpB_cpu, src1);
+
+        // for debug: spot check B after D2H
+        {
+            auto &bcb = tmpB_cpu.get<CPUBuffer>();
+            float *bptr = (float *)bcb.m_data;
+            POWERSERVE_LOG_ERROR("[MATMUL] B_cpu[0]={} B_cpu[1]={} B_cpu[909]={}",  // for debug
+                                 bptr[0], bptr[1], bptr[909]);
+        }
+
+        B_cpu = &tmpB_cpu;
+    }
+
+    // If dst is OpenCL, use CPU temp output then H2D back.
+    Tensor tmpC_cpu;
+    const Tensor *C_cpu = dst;
+
+    if (is_opencl(dst)) {
+        tmpC_cpu = Tensor(DataType::FP32, dst->m_shape);
+        tmpC_cpu.m_data = powerserve::CPUBuffer::create_buffer<float>(dst->m_shape);
+        C_cpu = &tmpC_cpu;
+    }
+
+    // Run ggml fallback matmul on CPU
+    self->matmul_cpu_ggml_fallback(C_cpu, A_cpu, B_cpu);
+
+    // for debug: spot check C_cpu after ggml matmul
+    if (C_cpu && C_cpu->m_data) {
+        if (auto *cb = dynamic_cast<CPUBuffer*>(C_cpu->m_data.get())) {
+            float *cptr = (float *)cb->m_data;
+            POWERSERVE_LOG_ERROR("[MATMUL] C_cpu[0]={} C_cpu[1]={} C_cpu[909]={}",  // for debug
+                                 cptr[0], cptr[1], cptr[909]);
+        } else {
+            POWERSERVE_LOG_ERROR("[MATMUL] C_cpu is not CPUBuffer?!");  // for debug
+        }
+    } else {
+        POWERSERVE_LOG_ERROR("[MATMUL] C_cpu has null m_data?!");  // for debug
+    }
+
+    // If dst is OpenCL, H2D copy result back, then immediately D2H check
+    if (is_opencl(dst)) {
+        self->copy(const_cast<Tensor*>(dst), C_cpu);  // H2D
+
+        // for debug: read dst back from OpenCL and compare one element
+        {
+            Tensor check(DataType::FP32, dst->m_shape);
+            check.m_data = powerserve::CPUBuffer::create_buffer<float>(dst->m_shape);
+
+            self->copy(&check, dst);  // D2H
+
+            auto &ccb = check.get<CPUBuffer>();
+            float *dev_back = (float *)ccb.m_data;
+
+            auto *cb = dynamic_cast<CPUBuffer*>(C_cpu->m_data.get());
+            float *cpu_out = (float *)cb->m_data;
+
+            float diff = std::abs(cpu_out[909] - dev_back[909]);
+            POWERSERVE_LOG_ERROR("[MATMUL] dst_dev_back[909]={} cpu_out[909]={} diff={}",  // for debug
+                                 dev_back[909], cpu_out[909], diff);
+        }
+    }
 }
+
 
 void OpenCLBackend::matmul_minimal(Tensor * dst,
                                   const Tensor * src0,

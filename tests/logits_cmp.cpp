@@ -148,32 +148,42 @@ static void print_tensor_meta(const Tensor *t, const char *tag) {
         fmt::print("  {}: <null>\n", tag);
         return;
     }
+
     auto shape = t->m_shape;
 
-    // stride: CPUBuffer or OpenCLBuffer
+    // view tensor: m_data==nullptr
+    if (!t->m_data) {
+        fmt::print("  {}: dtype={} shape=[{}, {}, {}, {}] strideB=<view(null)>\n",
+                   tag, (int)t->m_dtype,
+                   shape[0], shape[1], shape[2], shape[3]);
+        return;
+    }
+
     std::array<size_t,4> stride = {0,0,0,0};
-    bool is_cl = false;
+    const char *buf_kind = "unknown";
 
 #if defined(POWERSERVE_WITH_OPENCL)
-    try {
-        auto &clb = const_cast<Tensor*>(t)->get<powerserve::opencl::OpenCLBuffer>();
-        stride = {clb.m_stride[0], clb.m_stride[1], clb.m_stride[2], clb.m_stride[3]};
-        is_cl = true;
-    } catch (...) {
-        // not OpenCL
-    }
+    if (auto *clb = dynamic_cast<powerserve::opencl::OpenCLBuffer*>(t->m_data.get())) {
+        stride   = {clb->m_stride[0], clb->m_stride[1], clb->m_stride[2], clb->m_stride[3]};
+        buf_kind = "opencl";
+    } else
 #endif
-    if (!is_cl) {
-        auto &cb = const_cast<Tensor*>(t)->get<CPUBuffer>();
-        stride = {cb.m_stride[0], cb.m_stride[1], cb.m_stride[2], cb.m_stride[3]};
+    if (auto *cb = dynamic_cast<CPUBuffer*>(t->m_data.get())) {
+        stride   = {cb->m_stride[0], cb->m_stride[1], cb->m_stride[2], cb->m_stride[3]};
+        buf_kind = "cpu";
+    } else {
+        // 兜底：避免炸
+        buf_kind = typeid(*t->m_data).name();
     }
 
-    fmt::print("  {}: dtype={} shape=[{}, {}, {}, {}] strideB=[{}, {}, {}, {}]\n",
+    fmt::print("  {}: dtype={} shape=[{}, {}, {}, {}] strideB=[{}, {}, {}, {}] buf={}\n",
                tag,
                (int)t->m_dtype,
                shape[0], shape[1], shape[2], shape[3],
-               stride[0], stride[1], stride[2], stride[3]);
+               stride[0], stride[1], stride[2], stride[3],
+               buf_kind);
 }
+
 
 static inline uint64_t op_out_key(int op_idx, int out_idx) {
     return (uint64_t(uint32_t(op_idx)) << 32) | uint32_t(out_idx);
@@ -318,6 +328,13 @@ int main() {
                     fmt::print("\n[FIRST MISMATCH]\n");
                     fmt::print("  op#{} type={} out#{}\n", op_idx, op_type_to_string(op->op), oi);
                     print_tensor_meta(out, "out");
+                    if (op->op == OpType::MAT_MUL) {
+                        Tensor *A = op->prev.size() > 0 ? op->prev[0]->tensor() : nullptr;
+                        Tensor *B = op->prev.size() > 1 ? op->prev[1]->tensor() : nullptr;
+
+                        print_tensor_meta(A, "in0(A)");
+                        print_tensor_meta(B, "in1(B)");
+                    }
                     fmt::print("  bad_i={} ggml={} ocl={} diff={}\n",
                             bad_i, gg_vec[bad_i], ocl_vec[bad_i], diff);
                     std::exit(1);
