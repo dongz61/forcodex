@@ -3,6 +3,8 @@
 
 #include "backend/opencl/opencl_context.hpp"
 #include "core/logger.hpp"
+#include "core/data_type.hpp"
+
 #include <CL/cl.h>
 #include <string>
 #include <unordered_map>
@@ -36,7 +38,7 @@ struct OpenCLCompileOptions {
 struct KernelCacheItem {
     cl_kernel kernel = nullptr;
     std::string name;
-    size_t last_used = 0;  // 用于LRU缓存
+    mutable size_t last_used = 0;  // 用于LRU缓存
 };
 
 // 程序缓存项
@@ -79,7 +81,8 @@ public:
     // === 内核获取接口 ===
     
     // 获取已编译的内核
-    cl_kernel get_kernel(const std::string& kernel_name);
+    cl_kernel get_kernel(const std::string& kernel_name) const;
+    cl_kernel get_cpy_kernel(powerserve::DataType src_t, powerserve::DataType dst_t) const;
     
     // 检查内核是否存在
     bool has_kernel(const std::string& kernel_name) const;

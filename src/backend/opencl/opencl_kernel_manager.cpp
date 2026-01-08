@@ -312,7 +312,7 @@ bool OpenCLKernelManager::extract_kernels_from_program(cl_program program,
 }
 
 // 获取内核（如果没有则从program中创建）
-cl_kernel OpenCLKernelManager::get_kernel(const std::string& kernel_name) {
+cl_kernel OpenCLKernelManager::get_kernel(const std::string& kernel_name) const {
     std::lock_guard<std::mutex> lock(mutex_);
     
     // 检查缓存
@@ -330,6 +330,24 @@ cl_kernel OpenCLKernelManager::get_kernel(const std::string& kernel_name) {
                         kernel_name);
     return nullptr;
 }
+
+cl_kernel OpenCLKernelManager::get_cpy_kernel(powerserve::DataType src_t,
+                                              powerserve::DataType dst_t) const {
+    if (src_t == powerserve::DataType::FP16 && dst_t == powerserve::DataType::FP16) {
+        return get_kernel("kernel_cpy_f16_f16");
+    }
+    if (src_t == powerserve::DataType::FP16 && dst_t == powerserve::DataType::FP32) {
+        return get_kernel("kernel_cpy_f16_f32");
+    }
+    if (src_t == powerserve::DataType::FP32 && dst_t == powerserve::DataType::FP16) {
+        return get_kernel("kernel_cpy_f32_f16");
+    }
+    if (src_t == powerserve::DataType::FP32 && dst_t == powerserve::DataType::FP32) {
+        return get_kernel("kernel_cpy_f32_f32");
+    }
+    return nullptr;
+}
+
 
 // 内核执行方法（1D）
 bool OpenCLKernelManager::enqueue_kernel_1d(cl_kernel kernel,
