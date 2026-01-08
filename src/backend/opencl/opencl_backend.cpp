@@ -322,39 +322,46 @@ static inline void pack_contiguous_cpu_f32(
     self->copy(dst_contig_dev, &host_contig);
 }
 
-static inline void pack_contiguous_cl(const OpenCLBackend* self,
-                                      const Tensor* src,
-                                      Tensor* dst_contig) {
-    POWERSERVE_ASSERT(self && src && dst_contig);
+static inline void cpy_tensor_cl(const OpenCLBackend* self,
+                                 const Tensor* src,
+                                 const Tensor* dst) {
+    POWERSERVE_ASSERT(self && src && dst);
 
-    auto* context = self->context.get(); 
+    // CL_CHECK requires a variable named `context` in scope
+    auto* context = self->context.get();
     POWERSERVE_ASSERT(context != nullptr);
 
     // Must be OpenCL tensors
-    auto* src_cl = dynamic_cast<OpenCLBuffer*>(&const_cast<Tensor*>(src)->get<BaseBuffer>());
-    auto* dst_cl = dynamic_cast<OpenCLBuffer*>(&dst_contig->get<BaseBuffer>());
+    // NOTE: Tensor::get<BaseBuffer>() is non-const in this repo, so we const_cast locally.
+    auto* src_cl = dynamic_cast<OpenCLBuffer*>(
+        &const_cast<Tensor*>(src)->get<BaseBuffer>());
+
+    auto* dst_cl = dynamic_cast<OpenCLBuffer*>(
+        &const_cast<Tensor*>(dst)->get<BaseBuffer>());
+
     if (!src_cl || !dst_cl) {
-        POWERSERVE_LOG_ERROR("pack_contiguous_cl: src/dst not OpenCLBuffer");
+        POWERSERVE_LOG_ERROR("cpy_tensor_cl: src/dst not OpenCLBuffer");
         return;
     }
 
     // Same logical shape required
-    if (src->m_shape != dst_contig->m_shape) {
-        POWERSERVE_LOG_ERROR("pack_contiguous_cl: shape mismatch");
+    if (src->m_shape != dst->m_shape) {
+        POWERSERVE_LOG_ERROR("cpy_tensor_cl: shape mismatch");
         return;
     }
 
-    cl_kernel k = self->kernel_manager->get_cpy_kernel(src->m_dtype, dst_contig->m_dtype);
+    // Kernel dispatch by dtype pair
+    cl_kernel k = self->kernel_manager->get_cpy_kernel(src->m_dtype, dst->m_dtype);
     if (!k) {
-        POWERSERVE_LOG_ERROR("pack_contiguous_cl: unsupported dtype pair src={} dst={}",
-                             (int)src->m_dtype, (int)dst_contig->m_dtype);
+        POWERSERVE_LOG_ERROR("cpy_tensor_cl: unsupported dtype pair src={} dst={}",
+                             (int)src->m_dtype, (int)dst->m_dtype);
         return;
     }
 
     cl_mem src_mem = src_cl->get_device_buffer();
     cl_mem dst_mem = dst_cl->get_device_buffer();
     if (!src_mem || !dst_mem) {
-        POWERSERVE_LOG_ERROR("pack_contiguous_cl: invalid cl_mem");
+        POWERSERVE_LOG_ERROR("cpy_tensor_cl: invalid cl_mem");
         return;
     }
 
@@ -364,12 +371,12 @@ static inline void pack_contiguous_cl(const OpenCLBackend* self,
     const int ne02 = (int)src->m_shape[2];
     const int ne03 = (int)src->m_shape[3];
 
-    const int ne0  = (int)dst_contig->m_shape[0];
-    const int ne1  = (int)dst_contig->m_shape[1];
-    const int ne2  = (int)dst_contig->m_shape[2];
-    const int ne3  = (int)dst_contig->m_shape[3];
+    const int ne0  = (int)dst->m_shape[0];
+    const int ne1  = (int)dst->m_shape[1];
+    const int ne2  = (int)dst->m_shape[2];
+    const int ne3  = (int)dst->m_shape[3];
 
-    // strides in bytes
+    // strides in bytes (from OpenCLBuffer stride metadata)
     const auto sst = src_cl->get_stride();
     const cl_ulong nb00 = (cl_ulong)sst[0];
     const cl_ulong nb01 = (cl_ulong)sst[1];
@@ -383,7 +390,7 @@ static inline void pack_contiguous_cl(const OpenCLBackend* self,
     const cl_ulong nb3 = (cl_ulong)dstst[3];
 
     // Offsets:
-    // In your backend, views are represented via OpenCL sub-buffer,
+    // In this backend, views are represented via OpenCL sub-buffer,
     // so base offset is already encoded in cl_mem and we can pass 0.
     const cl_ulong off0 = 0;
     const cl_ulong offd = 0;
@@ -412,8 +419,9 @@ static inline void pack_contiguous_cl(const OpenCLBackend* self,
     CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb2));
     CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb3));
 
-    // Work sizes: for correctness (bring-up), use local=1.
-    // If you want llama.cpp perf parity, you can adopt nth=MIN(64, ne00) later.
+    // Work sizes:
+    // This matches llama.cpp's cpy.cl style where each work-item handles (i1,i2,i3)
+    // and the kernel loops over i0 internally.
     const size_t local[3]  = { 1, 1, 1 };
     const size_t global[3] = { (size_t)ne01, (size_t)ne02, (size_t)ne03 };
 
@@ -442,7 +450,7 @@ static inline const Tensor * ensure_contiguous_or_pack_f32(
         return src; // fallback: return src, but caller should be aware this may break
     }
 
-    pack_contiguous_cl(self, src, &tmp_dev);
+    cpy_tensor_cl(self, src, &tmp_dev);
 
     // Safety: packed result must be contiguous
     if (!self->is_contiguous(&tmp_dev, n_dims_check)) {
@@ -1924,15 +1932,21 @@ static inline size_t numel_4d(const Tensor* t) {
     return n;
 }
 
-static inline bool is_cpy_kernel_supported(DataType t) {
+static inline bool is_cpy_kernel_supported(powerserve::DataType t) {
     return t == DataType::FP16 || t == DataType::FP32;
 }
 
-static inline Tensor make_contiguous_device_tensor(DataType dtype, const Shape &shape) {
+static inline Tensor make_contig_dev_tensor(
+    OpenCLBackend* self,
+    powerserve::DataType dtype,
+    const powerserve::Shape& shape
+) {
     Tensor t(dtype, shape);
-    t.m_data = OpenCLBuffer::create_buffer(dtype, shape);
+    auto buf = self->create_buffer(shape, dtype);
+    t.m_data = std::static_pointer_cast<BaseBuffer>(buf);
     return t;
 }
+
 
 // for copy end
 
@@ -1989,7 +2003,9 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
             return;
         }
 
-        Tensor staging = make_contiguous_device_tensor(dst->m_dtype, dst->m_shape);
+        Tensor staging = make_contig_dev_tensor(const_cast<OpenCLBackend*>(this),
+                                        dst->m_dtype,
+                                        dst->m_shape);
 
         // 1) write host -> staging (staging contiguous so raw write ok)
         auto &staging_buf = staging.get<OpenCLBuffer>();
@@ -2000,10 +2016,9 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
         }
 
         // 2) scatter staging(contig) -> dst(strided) using cpy kernel
-        // NOTE: pack_contiguous_cl assumes src may be strided and dst contiguous,
         // so for scatter we must call the same kernel but swap args:
         // dst is "dst", staging is "src".
-        pack_contiguous_cl(this, &staging, dst);
+        cpy_tensor_cl(this, &staging, dst);
         return;
     }
 
@@ -2032,10 +2047,12 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
             return;
         }
 
-        Tensor staging = make_contiguous_device_tensor(src->m_dtype, src->m_shape);
+        Tensor staging = make_contig_dev_tensor(const_cast<OpenCLBackend*>(this),
+                                        dst->m_dtype,
+                                        dst->m_shape);
 
         // pack: src(strided) -> staging(contig)
-        pack_contiguous_cl(this, src, &staging);
+        cpy_tensor_cl(this, src, &staging);
 
         // staging must be contiguous
         POWERSERVE_ASSERT(is_contiguous(&staging, 4));
