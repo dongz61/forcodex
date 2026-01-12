@@ -218,34 +218,60 @@ static inline powerserve::Stride make_contig_stride_bytes(const powerserve::Shap
     return s;
 }
 
-bool OpenCLBackend::is_contiguous(const Tensor *tensor, int n) const {
-    if (!tensor) return false;
-    const size_t elem = powerserve::get_type_size(tensor->m_dtype);
+bool OpenCLBackend::is_contiguous(const Tensor *t, int n) const {
+    if (!t) return false;
+    if (n <= 0) return true;
 
-    // Only care first n dims (caller decides), but we store strides for full rank=4
-    const auto expected = make_contig_stride_bytes(tensor->m_shape, elem);
+    // 1) 计算 expected stride（单位：bytes）
+    size_t expected[GGML_MAX_DIMS] = {0};
+
+    // nb0：第 0 维的“步长”= 一个元素/一个block的字节数
+    size_t nb0 = 0;
+    bool is_quant = (t->m_dtype == DataType::GGML_Q4_0 || t->m_dtype == DataType::GGML_Q8_0);
+
+    if (is_quant) {
+        const enum ggml_type gt = powerserve::ggml::convert_datatype_to_ggml(t->m_dtype);
+        nb0 = (size_t)ggml_type_size(gt);               // e.g. Q8_0: 34
+        expected[0] = nb0;
+        if (n > 1) {
+            expected[1] = (size_t)ggml_row_size(gt, (int64_t)t->m_shape[0]); // nb1（关键）
+        }
+    } else {
+        nb0 = powerserve::get_type_size(t->m_dtype);    // fp32=4, fp16=2...
+        expected[0] = nb0;
+        if (n > 1) {
+            expected[1] = expected[0] * (size_t)t->m_shape[0];
+        }
+    }
+
+    // 2) 维度 >=2 的 stride 都是前一维 stride * 前一维长度（循环形式）
+    for (int i = 2; i < n; ++i) {
+        expected[i] = expected[i - 1] * (size_t)t->m_shape[i - 1];
+    }
+
+    // 3) 取出实际 stride 并比较
+    const size_t *actual = nullptr;
 
     try {
-        const auto &buf = const_cast<Tensor*>(tensor)->get<OpenCLBuffer>();
-        for (int i = 0; i < n; ++i) {
-            if (buf.m_stride[i] != expected[i]) return false;
-        }
-        return true;
+        const auto &buf = const_cast<Tensor*>(t)->get<OpenCLBuffer>();
+        actual = buf.m_stride.data();
     } catch (...) {
-        // CPU path (optional, keeps function generic)
         try {
-            const auto &buf = const_cast<Tensor*>(tensor)->get<powerserve::CPUBuffer>();
-            for (int i = 0; i < n; ++i) {
-                if (buf.m_stride[i] != expected[i]) return false;
-            }
-            return true;
+            const auto &buf = const_cast<Tensor*>(t)->get<powerserve::CPUBuffer>();
+            actual = buf.m_stride.data();
         } catch (...) {
             return false;
         }
     }
+
+    for (int i = 0; i < n; ++i) {
+        if ((size_t)actual[i] != expected[i]) return false;
+    }
+    return true;
 }
 
-static inline void tiguous_cpu_f32pack_con(
+
+static inline void pack_contiguous_cpu_f32(
     powerserve::opencl::OpenCLBackend *self,
     const Tensor *src,
     Tensor *dst_contig_dev
@@ -1173,22 +1199,8 @@ void OpenCLBackend::matmul(const Tensor *dst, const Tensor *src0, const Tensor *
         B_cpu = &tmpB_cpu;
     }
 
-    // If dst is OpenCL, use CPU temp output then H2D back.
-    Tensor tmpC_cpu;
-    const Tensor *C_cpu = dst;
-
-    if (is_opencl(dst)) {
-        tmpC_cpu = Tensor(DataType::FP32, dst->m_shape);
-        tmpC_cpu.m_data = powerserve::CPUBuffer::create_buffer<float>(dst->m_shape);
-        C_cpu = &tmpC_cpu;
-    }
-
     // Run ggml fallback matmul on CPU
-    self->matmul_cpu_ggml_fallback(C_cpu, A_cpu, B_cpu);
-    
-    if (is_opencl(dst)) {
-        self->copy(const_cast<Tensor *>(dst), C_cpu);
-    }
+    self->matmul_cpu_ggml_fallback(dst, A_cpu, B_cpu);
 }
 
 
