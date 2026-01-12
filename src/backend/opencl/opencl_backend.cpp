@@ -2012,7 +2012,8 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
         cl_mem staging_mem = staging_buf.get_device_buffer();
         if (!memory_pool->copy_host_to_device(staging_mem, host, src_bytes, 0)) {
             POWERSERVE_LOG_ERROR("H2D: staging copy_host_to_device failed");
-            return;
+            dump_backtrace();
+            std::abort();
         }
 
         // 2) scatter staging(contig) -> dst(strided) using cpy kernel
@@ -2075,6 +2076,8 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
         }
         if (!memory_pool->copy_device_to_device(dst_dev, src_dev, src_bytes)) {
             POWERSERVE_LOG_ERROR("D2D: copy_device_to_device failed");
+            dump_backtrace();
+            std::abort();
         }
         return;
     }

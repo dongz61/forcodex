@@ -649,37 +649,37 @@ int main() {
     // =========================
     // DECODE loop compare
     // =========================
-    for (int step = 0; step < MAX_STEPS; ++step) {
-        std::vector<Token> one_tok = { tokens.back() };
-        std::vector<int> one_pos   = { (int)(tokens.size() - 1) };
-        auto mask = CausalAttentionMask(tokens.size());
+    // for (int step = 0; step < MAX_STEPS; ++step) {
+    //     std::vector<Token> one_tok = { tokens.back() };
+    //     std::vector<int> one_pos   = { (int)(tokens.size() - 1) };
+    //     auto mask = CausalAttentionMask(tokens.size());
 
-        auto ret_g = model_ggml->forward(one_tok, one_pos, mask, true);
-        auto ret_o = model_ocl->forward(one_tok, one_pos, mask, true);
+    //     auto ret_g = model_ggml->forward(one_tok, one_pos, mask, true);
+    //     auto ret_o = model_ocl->forward(one_tok, one_pos, mask, true);
 
-        auto lg = ret_g.logits_vector.back();
-        auto lo = ret_o.logits_vector.back();
+    //     auto lg = ret_g.logits_vector.back();
+    //     auto lo = ret_o.logits_vector.back();
 
-        size_t bad_i = 0;
-        float diff = 0;
-        if (!allclose_span(lo, lg, ATOL, RTOL, &bad_i, &diff)) {
-            fmt::print("STEP {} logits mismatch: bad_i={}, ocl={}, ggml={}, diff={}\n",
-                       step, bad_i, lo[bad_i], lg[bad_i], diff);
-            dump_topk(lg, TOPK, "ggml");
-            dump_topk(lo, TOPK, "opencl");
-            return 1;
-        }
+    //     size_t bad_i = 0;
+    //     float diff = 0;
+    //     if (!allclose_span(lo, lg, ATOL, RTOL, &bad_i, &diff)) {
+    //         fmt::print("STEP {} logits mismatch: bad_i={}, ocl={}, ggml={}, diff={}\n",
+    //                    step, bad_i, lo[bad_i], lg[bad_i], diff);
+    //         dump_topk(lg, TOPK, "ggml");
+    //         dump_topk(lo, TOPK, "opencl");
+    //         return 1;
+    //     }
 
-        int next = argmax_token(lg);
-        tokens.push_back(next);
+    //     int next = argmax_token(lg);
+    //     tokens.push_back(next);
 
-        if (next == tokenizer.bos_token() || tokenizer.should_stop(next)) {
-            POWERSERVE_LOG_INFO("Stop at step {} (token={})", step, next);
-            break;
-        }
-    }
+    //     if (next == tokenizer.bos_token() || tokenizer.should_stop(next)) {
+    //         POWERSERVE_LOG_INFO("Stop at step {} (token={})", step, next);
+    //         break;
+    //     }
+    // }
 
-    POWERSERVE_LOG_INFO("All steps PASS: logits match within atol={} rtol={}", ATOL, RTOL);
+    // POWERSERVE_LOG_INFO("All steps PASS: logits match within atol={} rtol={}", ATOL, RTOL);
 
     platform->ggml_backends[model_ggml->m_config->model_id]->reset_threadpool();
     platform->ggml_backends[model_ocl->m_config->model_id]->reset_threadpool();

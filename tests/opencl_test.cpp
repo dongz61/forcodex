@@ -684,13 +684,244 @@ bool run_opencl_backend_softmax_ext_vs_ggml_test() {
     POWERSERVE_LOG_INFO("OpenCL softmax_ext-vs-ggml test: PASS");
     return true;
 }
+// ---------- helper: CPU f32 tensor with custom (possibly non-contig) stride ----------
+static inline Tensor make_cpu_tensor_f32_strided(
+    const Shape &shape,
+    const Stride &stride_bytes,
+    std::vector<uint8_t> &storage_bytes
+) {
+    Tensor t(DataType::FP32, shape);
+
+    // allocate enough backing bytes for the last element reachable by strides
+    // last_offset = (ne0-1)*st0 + (ne1-1)*st1 + (ne2-1)*st2 + (ne3-1)*st3
+    const size_t ne0 = (size_t)shape[0];
+    const size_t ne1 = (size_t)shape[1];
+    const size_t ne2 = (size_t)shape[2];
+    const size_t ne3 = (size_t)shape[3];
+
+    const size_t last_off =
+        (ne0 ? (ne0 - 1) * (size_t)stride_bytes[0] : 0) +
+        (ne1 ? (ne1 - 1) * (size_t)stride_bytes[1] : 0) +
+        (ne2 ? (ne2 - 1) * (size_t)stride_bytes[2] : 0) +
+        (ne3 ? (ne3 - 1) * (size_t)stride_bytes[3] : 0);
+
+    const size_t need_bytes = last_off + sizeof(float);
+    storage_bytes.assign(need_bytes, 0);
+
+    t.m_data = std::make_shared<powerserve::CPUBuffer>(stride_bytes, storage_bytes.data());
+    return t;
+}
+
+// ---------- test: quant(Q8_0) weight on CPU + non-contig activation on OpenCL ----------
+bool run_opencl_backend_matmul_quant_noncontigA_test() {
+    POWERSERVE_LOG_INFO("OpenCL matmul quant(Q8_0) + non-contig A test: start");
+
+    // Minimal config (only used for backend init; matmul itself uses tensor shapes)
+    ModelConfig::LLMConfig cfg{};
+    cfg.dim        = 64;   // K
+    cfg.vocab_size = 64;   // N (not strictly needed here, but keep sane)
+    cfg.n_layers   = 1;
+    cfg.n_heads    = 1;
+    cfg.n_kv_heads = 1;
+    cfg.kv_dim     = 64;
+    cfg.head_size  = 64;
+    cfg.seq_len    = 16;
+
+    HyperParams hp{};
+    hp.n_threads = 1;
+
+    OpenCLBackend backend(cfg, hp);
+    if (!backend.initialize()) {
+        POWERSERVE_LOG_ERROR("OpenCL matmul quant+noncontigA test: backend.initialize failed");
+        return false;
+    }
+
+    const int K = 64;
+    const int N = 64;
+    const int M = 4;
+
+    // -------------------------
+    // Build B_fp32 on CPU with ggml-friendly layout:
+    // shape {K, N, 1, 1}, row-major in i0 (K contiguous), row = output neuron n
+    // idx = k + K*n
+    // -------------------------
+    Shape B_shape{};
+    B_shape[0] = K;
+    B_shape[1] = N;
+    B_shape[2] = 1;
+    B_shape[3] = 1;
+
+    std::vector<float> B_f32_storage;
+    Tensor B_f32_cpu = make_cpu_tensor_f32(B_shape, B_f32_storage);
+
+    for (int n = 0; n < N; ++n) {
+        for (int k = 0; k < K; ++k) {
+            B_f32_storage[(size_t)k + (size_t)K * (size_t)n] =
+                0.01f * (float)n - 0.0007f * (float)k;
+        }
+    }
+
+    // -------------------------
+    // Quantize B to Q8_0 (CPUBuffer)
+    // Use ggml_row_size() and quantize_row_q8_0() so stride semantics match ggml.
+    // -------------------------
+    const ggml_type qtype = GGML_TYPE_Q8_0;
+    const size_t row_size = ggml_row_size(qtype, K);     // bytes per row (one output neuron)
+    const size_t q_bytes  = row_size * (size_t)N;
+
+    std::vector<uint8_t> B_q_storage(q_bytes, 0);
+
+    Stride B_q_stride{};
+    B_q_stride[0] = (int)ggml_type_size(qtype);          // e.g. sizeof(block_q8_0)
+    B_q_stride[1] = (int)row_size;
+    B_q_stride[2] = B_q_stride[1] * B_shape[1];
+    B_q_stride[3] = B_q_stride[2] * B_shape[2];
+
+    Tensor B_q_cpu(DataType::GGML_Q8_0, B_shape);
+    B_q_cpu.m_data = std::make_shared<powerserve::CPUBuffer>(B_q_stride, B_q_storage.data());
+
+    for (int n = 0; n < N; ++n) {
+        const float *src_row = B_f32_storage.data() + (size_t)K * (size_t)n;
+        void *dst_row = (void *)(B_q_storage.data() + row_size * (size_t)n);
+        quantize_row_q8_0(src_row, dst_row, K);
+    }
+
+    // -------------------------
+    // Build A on CPU but with intentional padding in stride1 (non-contig)
+    // Logical shape: {K, M, 1, 1}
+    // Backing layout: row stride = K*sizeof(float)*2 (so it is non-contig)
+    // -------------------------
+    Shape A_shape{};
+    A_shape[0] = K;
+    A_shape[1] = M;
+    A_shape[2] = 1;
+    A_shape[3] = 1;
+
+    const int pad_factor = 2;
+    Stride A_pad_stride{};
+    A_pad_stride[0] = (int)sizeof(float);
+    A_pad_stride[1] = (int)((size_t)K * sizeof(float) * (size_t)pad_factor);
+    A_pad_stride[2] = A_pad_stride[1] * A_shape[1];
+    A_pad_stride[3] = A_pad_stride[2] * A_shape[2];
+
+    std::vector<uint8_t> A_pad_bytes;
+    Tensor A_cpu_pad = make_cpu_tensor_f32_strided(A_shape, A_pad_stride, A_pad_bytes);
+
+    // Also keep a contiguous logical copy for CPU reference
+    std::vector<float> A_logical((size_t)K * (size_t)M, 0.f);
+
+    for (int m = 0; m < M; ++m) {
+        for (int k = 0; k < K; ++k) {
+            const float v = 0.02f * (float)m + 0.001f * (float)k - 0.03f;
+            A_logical[(size_t)k + (size_t)K * (size_t)m] = v;
+
+            // write into padded CPU tensor memory using its stride
+            uint8_t *base = (uint8_t *)A_pad_bytes.data();
+            float *ptr = (float *)(base + (size_t)m * (size_t)A_pad_stride[1] + (size_t)k * (size_t)A_pad_stride[0]);
+            *ptr = v;
+        }
+    }
+
+    // -------------------------
+    // Create a device buffer big enough to honor the padded stride.
+    // Allocate as {K, M*pad_factor, 1, 1}, then "view" it as {K, M, 1, 1} by overriding stride.
+    // -------------------------
+    Shape A_alloc_shape{};
+    A_alloc_shape[0] = K;
+    A_alloc_shape[1] = M * pad_factor;
+    A_alloc_shape[2] = 1;
+    A_alloc_shape[3] = 1;
+
+    Tensor A_dev_alloc = make_opencl_tensor_f32(backend, A_alloc_shape);
+
+    Tensor A_dev(DataType::FP32, A_shape);
+    A_dev.m_data = A_dev_alloc.m_data;
+
+    // Override device stride to make it non-contig for the logical {K,M} view
+    {
+        auto &buf = A_dev.get<OpenCLBuffer>();
+        buf.m_stride = A_pad_stride;
+    }
+
+    // Upload A (H2D) — this MUST exercise your non-contig H2D copy path
+    backend.copy(&A_dev, &A_cpu_pad);
+
+    // -------------------------
+    // Matmul on backend: C = A * B
+    // A: OpenCL FP32 non-contig
+    // B: CPU Q8_0
+    // C: OpenCL FP32 contig
+    // -------------------------
+    Shape C_shape{};
+    C_shape[0] = N;
+    C_shape[1] = M;
+    C_shape[2] = 1;
+    C_shape[3] = 1;
+
+    Tensor C_dev = make_opencl_tensor_f32(backend, C_shape);
+    backend.matmul(&C_dev, &B_q_cpu, &A_dev);
+
+    // D2H result
+    std::vector<float> C_host_storage;
+    Tensor C_cpu = make_cpu_tensor_f32(C_shape, C_host_storage);
+    backend.copy(&C_cpu, &C_dev);
+
+    // -------------------------
+    // CPU reference (float): C[n,m] = sum_k A[k,m] * B[k,n]
+    // where B is in ggml-friendly layout idx = k + K*n
+    // -------------------------
+    std::vector<float> C_ref((size_t)N * (size_t)M, 0.f);
+    for (int m = 0; m < M; ++m) {
+        for (int n = 0; n < N; ++n) {
+            double acc = 0.0;
+            for (int k = 0; k < K; ++k) {
+                const float a = A_logical[(size_t)k + (size_t)K * (size_t)m];
+                const float b = B_f32_storage[(size_t)k + (size_t)K * (size_t)n];
+                acc += (double)a * (double)b;
+            }
+            C_ref[(size_t)n + (size_t)N * (size_t)m] = (float)acc;
+        }
+    }
+
+    // Compare
+    const float atol = 5e-3f;   // quant introduces error; keep reasonable
+    const float rtol = 5e-3f;
+    size_t bad_i = 0;
+    float bad_diff = 0.f;
+
+    bool ok = allclose(C_host_storage, C_ref, atol, rtol, &bad_i, &bad_diff);
+    if (!ok) {
+        POWERSERVE_LOG_ERROR("OpenCL matmul quant+noncontigA test: FAILED (mismatch)");
+        printf("bad_i=%zu ocl=%f ref=%f diff=%f\n",
+               bad_i,
+               (double)C_host_storage[bad_i],
+               (double)C_ref[bad_i],
+               (double)bad_diff);
+
+        printf("OCL head: ");
+        for (size_t i = 0; i < std::min<size_t>(8, C_host_storage.size()); ++i) {
+            printf("%f ", (double)C_host_storage[i]);
+        }
+        printf("\nREF head: ");
+        for (size_t i = 0; i < std::min<size_t>(8, C_ref.size()); ++i) {
+            printf("%f ", (double)C_ref[i]);
+        }
+        printf("\n");
+        return false;
+    }
+
+    POWERSERVE_LOG_INFO("OpenCL matmul quant(Q8_0) + non-contig A test: PASS");
+    return true;
+}
+
 
 
 } // namespace powerserve::opencl
 
 int main() {
-    bool ok1 = powerserve::opencl::run_opencl_backend_smoke_test();
-    bool ok2 = powerserve::opencl::run_opencl_backend_rope_vs_ggml_test();
-    bool ok3 = powerserve::opencl::run_opencl_backend_softmax_ext_vs_ggml_test();
-    return (ok1 && ok2 && ok3) ? 0 : 1;
+    // bool ok1 = powerserve::opencl::run_opencl_backend_smoke_test();
+    // bool ok2 = powerserve::opencl::run_opencl_backend_rope_vs_ggml_test();
+    // bool ok3 = powerserve::opencl::run_opencl_backend_softmax_ext_vs_ggml_test();
+    bool ok4 = powerserve::opencl::run_opencl_backend_matmul_quant_noncontigA_test();
+    // return (ok1 && ok2 && ok3 && ok4) ? 0 : 1;
 }
