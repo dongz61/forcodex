@@ -245,7 +245,7 @@ bool OpenCLBackend::is_contiguous(const Tensor *tensor, int n) const {
     }
 }
 
-static inline void pack_contiguous_cpu_f32(
+static inline void tiguous_cpu_f32pack_con(
     powerserve::opencl::OpenCLBackend *self,
     const Tensor *src,
     Tensor *dst_contig_dev
