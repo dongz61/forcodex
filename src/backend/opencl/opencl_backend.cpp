@@ -1933,6 +1933,7 @@ static inline size_t dtype_size(DataType dt) {
         case DataType::FP32: return 4;
         case DataType::FP16: return 2;
         case DataType::INT32: return 4;
+        case DataType::INT64: return 8;
         default: return 0;
     }
 }
@@ -1946,6 +1947,98 @@ static inline size_t numel_4d(const Tensor* t) {
 
 static inline bool is_cpy_kernel_supported(powerserve::DataType t) {
     return t == DataType::FP16 || t == DataType::FP32;
+}
+
+static inline bool pack_cpu_strided_to_contig(const Tensor* src, void* dst_contig) {
+    POWERSERVE_ASSERT(src != nullptr);
+    POWERSERVE_ASSERT(dst_contig != nullptr);
+
+    const size_t elem = dtype_size(src->m_dtype);
+    if (elem == 0) {
+        POWERSERVE_LOG_ERROR("pack_cpu_strided_to_contig: unsupported dtype {}", (int)src->m_dtype);
+        return false;
+    }
+
+    powerserve::CPUBuffer* src_cpu = nullptr;
+    try {
+        src_cpu = &const_cast<Tensor*>(src)->get<powerserve::CPUBuffer>();
+    } catch (const std::bad_cast &e) {
+        POWERSERVE_LOG_ERROR("pack_cpu_strided_to_contig: src is not CPUBuffer? {}", e.what());
+        return false;
+    }
+
+    const auto s = src->m_shape;
+    const auto nb = src_cpu->m_stride;
+    const size_t ne0 = s[0], ne1 = s[1], ne2 = s[2], ne3 = s[3];
+
+    const char* src_base = static_cast<const char*>(src_cpu->m_data);
+    char* dst_ptr = static_cast<char*>(dst_contig);
+
+    size_t out_idx = 0;
+    for (size_t i3 = 0; i3 < ne3; ++i3) {
+        for (size_t i2 = 0; i2 < ne2; ++i2) {
+            for (size_t i1 = 0; i1 < ne1; ++i1) {
+                const char* src_row = src_base
+                    + (size_t)i3 * (size_t)nb[3]
+                    + (size_t)i2 * (size_t)nb[2]
+                    + (size_t)i1 * (size_t)nb[1];
+
+                for (size_t i0 = 0; i0 < ne0; ++i0) {
+                    const char* p = src_row + (size_t)i0 * (size_t)nb[0];
+                    std::memcpy(dst_ptr + out_idx * elem, p, elem);
+                    ++out_idx;
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+static inline bool unpack_contig_to_cpu_strided(const void* src_contig, const Tensor* dst) {
+    POWERSERVE_ASSERT(src_contig != nullptr);
+    POWERSERVE_ASSERT(dst != nullptr);
+
+    const size_t elem = dtype_size(dst->m_dtype);
+    if (elem == 0) {
+        POWERSERVE_LOG_ERROR("unpack_contig_to_cpu_strided: unsupported dtype {}", (int)dst->m_dtype);
+        return false;
+    }
+
+    powerserve::CPUBuffer* dst_cpu = nullptr;
+    try {
+        dst_cpu = &const_cast<Tensor*>(dst)->get<powerserve::CPUBuffer>();
+    } catch (const std::bad_cast &e) {
+        POWERSERVE_LOG_ERROR("unpack_contig_to_cpu_strided: dst is not CPUBuffer? {}", e.what());
+        return false;
+    }
+
+    const auto s = dst->m_shape;
+    const auto nb = dst_cpu->m_stride;
+    const size_t ne0 = s[0], ne1 = s[1], ne2 = s[2], ne3 = s[3];
+
+    const char* src_ptr = static_cast<const char*>(src_contig);
+    char* dst_base = static_cast<char*>(dst_cpu->m_data);
+
+    size_t in_idx = 0;
+    for (size_t i3 = 0; i3 < ne3; ++i3) {
+        for (size_t i2 = 0; i2 < ne2; ++i2) {
+            for (size_t i1 = 0; i1 < ne1; ++i1) {
+                char* dst_row = dst_base
+                    + (size_t)i3 * (size_t)nb[3]
+                    + (size_t)i2 * (size_t)nb[2]
+                    + (size_t)i1 * (size_t)nb[1];
+
+                for (size_t i0 = 0; i0 < ne0; ++i0) {
+                    char* p = dst_row + (size_t)i0 * (size_t)nb[0];
+                    std::memcpy(p, src_ptr + in_idx * elem, elem);
+                    ++in_idx;
+                }
+            }
+        }
+    }
+
+    return true;
 }
 
 static inline Tensor make_contig_dev_tensor(
@@ -2000,9 +2093,30 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
             return;
         }
 
+        const bool src_contig = is_contiguous(src, 4);
+        const bool dst_contig = is_contiguous(dst, 4);
+
         // Fast-path: contiguous dst -> linear write
-        if (is_contiguous(dst, 4)) {
+        if (src_contig && dst_contig) {
             if (!memory_pool->copy_host_to_device(dev, host, src_bytes, 0)) {
+                POWERSERVE_LOG_ERROR("H2D: copy_host_to_device failed");
+            }
+            return;
+        }
+
+        std::vector<uint8_t> host_contig;
+        const void* host_src = host;
+        if (!src_contig) {
+            host_contig.resize(src_bytes);
+            if (!pack_cpu_strided_to_contig(src, host_contig.data())) {
+                POWERSERVE_LOG_ERROR("H2D: failed to pack CPU strided tensor");
+                return;
+            }
+            host_src = host_contig.data();
+        }
+
+        if (dst_contig) {
+            if (!memory_pool->copy_host_to_device(dev, host_src, src_bytes, 0)) {
                 POWERSERVE_LOG_ERROR("H2D: copy_host_to_device failed");
             }
             return;
@@ -2022,7 +2136,7 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
         // 1) write host -> staging (staging contiguous so raw write ok)
         auto &staging_buf = staging.get<OpenCLBuffer>();
         cl_mem staging_mem = staging_buf.get_device_buffer();
-        if (!memory_pool->copy_host_to_device(staging_mem, host, src_bytes, 0)) {
+        if (!memory_pool->copy_host_to_device(staging_mem, host_src, src_bytes, 0)) {
             POWERSERVE_LOG_ERROR("H2D: staging copy_host_to_device failed");
             dump_backtrace();
             std::abort();
@@ -2045,35 +2159,48 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
             return;
         }
 
-        // Fast-path: contiguous -> linear read
-        if (is_contiguous(src, 4)) {
-            if (!memory_pool->copy_device_to_host(host, dev, src_bytes, 0)) {
+        const bool src_contig = is_contiguous(src, 4);
+        const bool dst_contig = is_contiguous(dst, 4);
+
+        // Slow-path: non-contiguous src -> pack on device -> linear read
+        Tensor staging;
+        const Tensor* read_src = src;
+        if (!src_contig) {
+            if (!is_cpy_kernel_supported(src->m_dtype)) {
+                POWERSERVE_LOG_ERROR("D2H: non-contiguous copy requires cpy kernel, unsupported dtype={}",
+                                    (int)src->m_dtype);
+                return;
+            }
+
+            staging = make_contig_dev_tensor(const_cast<OpenCLBackend*>(this),
+                                            dst->m_dtype,
+                                            dst->m_shape);
+
+            // pack: src(strided) -> staging(contig)
+            cpy_tensor_cl(this, src, &staging);
+
+            // staging must be contiguous
+            POWERSERVE_ASSERT(is_contiguous(&staging, 4));
+            read_src = &staging;
+        }
+
+        auto &read_buf = const_cast<Tensor*>(read_src)->get<OpenCLBuffer>();
+        cl_mem read_mem = read_buf.get_device_buffer();
+
+        if (dst_contig) {
+            if (!memory_pool->copy_device_to_host(host, read_mem, src_bytes, 0)) {
                 POWERSERVE_LOG_ERROR("D2H: copy_device_to_host failed");
             }
             return;
         }
 
-        // Slow-path: non-contiguous src -> pack on device -> linear read
-        if (!is_cpy_kernel_supported(src->m_dtype)) {
-            POWERSERVE_LOG_ERROR("D2H: non-contiguous copy requires cpy kernel, unsupported dtype={}",
-                                (int)src->m_dtype);
+        std::vector<uint8_t> host_contig(src_bytes);
+        if (!memory_pool->copy_device_to_host(host_contig.data(), read_mem, src_bytes, 0)) {
+            POWERSERVE_LOG_ERROR("D2H: staging copy_device_to_host failed");
             return;
         }
-
-        Tensor staging = make_contig_dev_tensor(const_cast<OpenCLBackend*>(this),
-                                        dst->m_dtype,
-                                        dst->m_shape);
-
-        // pack: src(strided) -> staging(contig)
-        cpy_tensor_cl(this, src, &staging);
-
-        // staging must be contiguous
-        POWERSERVE_ASSERT(is_contiguous(&staging, 4));
-
-        auto &staging_buf = staging.get<OpenCLBuffer>();
-        cl_mem staging_mem = staging_buf.get_device_buffer();
-        if (!memory_pool->copy_device_to_host(host, staging_mem, src_bytes, 0)) {
-            POWERSERVE_LOG_ERROR("D2H: staging copy_device_to_host failed");
+        if (!unpack_contig_to_cpu_strided(host_contig.data(), dst)) {
+            POWERSERVE_LOG_ERROR("D2H: failed to unpack to CPU strided tensor");
         }
         return;
     }
