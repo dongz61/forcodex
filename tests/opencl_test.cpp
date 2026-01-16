@@ -914,6 +914,327 @@ bool run_opencl_backend_matmul_quant_noncontigA_test() {
     return true;
 }
 
+// ---------- test: non-contig A (OpenCL) + non-contig B (OpenCL) ----------
+bool run_opencl_backend_matmul_noncontig_noncontig_test() {
+    POWERSERVE_LOG_INFO("OpenCL matmul non-contig A + non-contig B test: start");
+
+    ModelConfig::LLMConfig cfg{};
+    cfg.dim        = 64;   // K
+    cfg.vocab_size = 64;   // N
+    cfg.n_layers   = 1;
+    cfg.n_heads    = 1;
+    cfg.n_kv_heads = 1;
+    cfg.kv_dim     = 64;
+    cfg.head_size  = 64;
+    cfg.seq_len    = 16;
+
+    HyperParams hp{};
+    hp.n_threads = 1;
+
+    OpenCLBackend backend(cfg, hp);
+    if (!backend.initialize()) {
+        POWERSERVE_LOG_ERROR("OpenCL matmul noncontig+noncontig test: backend.initialize failed");
+        return false;
+    }
+
+    const int K = 64;
+    const int N = 64;
+    const int M = 4;
+    const int pad_factor = 2;
+
+    // -------------------------
+    // Build A (non-contig) on CPU: shape {K, M, 1, 1}
+    // -------------------------
+    Shape A_shape{};
+    A_shape[0] = K;
+    A_shape[1] = M;
+    A_shape[2] = 1;
+    A_shape[3] = 1;
+
+    Stride A_pad_stride{};
+    A_pad_stride[0] = (int)sizeof(float);
+    A_pad_stride[1] = (int)((size_t)K * sizeof(float) * (size_t)pad_factor);
+    A_pad_stride[2] = A_pad_stride[1] * A_shape[1];
+    A_pad_stride[3] = A_pad_stride[2] * A_shape[2];
+
+    std::vector<uint8_t> A_pad_bytes;
+    Tensor A_cpu_pad = make_cpu_tensor_f32_strided(A_shape, A_pad_stride, A_pad_bytes);
+
+    std::vector<float> A_logical((size_t)K * (size_t)M, 0.f);
+    for (int m = 0; m < M; ++m) {
+        for (int k = 0; k < K; ++k) {
+            const float v = 0.02f * (float)m + 0.001f * (float)k - 0.03f;
+            A_logical[(size_t)k + (size_t)K * (size_t)m] = v;
+
+            uint8_t *base = (uint8_t *)A_pad_bytes.data();
+            float *ptr = (float *)(base + (size_t)m * (size_t)A_pad_stride[1] + (size_t)k * (size_t)A_pad_stride[0]);
+            *ptr = v;
+        }
+    }
+
+    // -------------------------
+    // Build B (non-contig) on CPU: shape {N, K, 1, 1}
+    // stored as [K,N] row-major with padding on stride1
+    // -------------------------
+    Shape B_shape{};
+    B_shape[0] = N;
+    B_shape[1] = K;
+    B_shape[2] = 1;
+    B_shape[3] = 1;
+
+    Stride B_pad_stride{};
+    B_pad_stride[0] = (int)sizeof(float);
+    B_pad_stride[1] = (int)((size_t)N * sizeof(float) * (size_t)pad_factor);
+    B_pad_stride[2] = B_pad_stride[1] * B_shape[1];
+    B_pad_stride[3] = B_pad_stride[2] * B_shape[2];
+
+    std::vector<uint8_t> B_pad_bytes;
+    Tensor B_cpu_pad = make_cpu_tensor_f32_strided(B_shape, B_pad_stride, B_pad_bytes);
+
+    std::vector<float> B_logical((size_t)K * (size_t)N, 0.f);
+    for (int k = 0; k < K; ++k) {
+        for (int n = 0; n < N; ++n) {
+            const float v = 0.01f * (float)n - 0.0007f * (float)k;
+            B_logical[(size_t)k * (size_t)N + (size_t)n] = v;
+
+            uint8_t *base = (uint8_t *)B_pad_bytes.data();
+            float *ptr = (float *)(base + (size_t)k * (size_t)B_pad_stride[1] + (size_t)n * (size_t)B_pad_stride[0]);
+            *ptr = v;
+        }
+    }
+
+    // -------------------------
+    // Allocate device buffers with padded physical size, then override stride
+    // -------------------------
+    Shape A_alloc_shape{};
+    A_alloc_shape[0] = K;
+    A_alloc_shape[1] = M * pad_factor;
+    A_alloc_shape[2] = 1;
+    A_alloc_shape[3] = 1;
+
+    Tensor A_dev_alloc = make_opencl_tensor_f32(backend, A_alloc_shape);
+    Tensor A_dev(DataType::FP32, A_shape);
+    A_dev.m_data = A_dev_alloc.m_data;
+    {
+        auto &buf = A_dev.get<OpenCLBuffer>();
+        buf.m_stride = A_pad_stride;
+    }
+
+    Shape B_alloc_shape{};
+    B_alloc_shape[0] = N;
+    B_alloc_shape[1] = K * pad_factor;
+    B_alloc_shape[2] = 1;
+    B_alloc_shape[3] = 1;
+
+    Tensor B_dev_alloc = make_opencl_tensor_f32(backend, B_alloc_shape);
+    Tensor B_dev(DataType::FP32, B_shape);
+    B_dev.m_data = B_dev_alloc.m_data;
+    {
+        auto &buf = B_dev.get<OpenCLBuffer>();
+        buf.m_stride = B_pad_stride;
+    }
+
+    // Upload A/B (H2D) — exercises non-contig H2D copy path
+    backend.copy(&A_dev, &A_cpu_pad);
+    backend.copy(&B_dev, &B_cpu_pad);
+
+    // -------------------------
+    // Matmul on backend: C = A * B => shape {N,M,1,1}
+    // -------------------------
+    Shape C_shape{};
+    C_shape[0] = N;
+    C_shape[1] = M;
+    C_shape[2] = 1;
+    C_shape[3] = 1;
+
+    Tensor C_dev = make_opencl_tensor_f32(backend, C_shape);
+    backend.matmul(&C_dev, &A_dev, &B_dev);
+
+    // D2H result
+    std::vector<float> C_host_storage;
+    Tensor C_cpu = make_cpu_tensor_f32(C_shape, C_host_storage);
+    backend.copy(&C_cpu, &C_dev);
+
+    // CPU reference
+    std::vector<float> C_ref((size_t)N * (size_t)M, 0.f);
+    for (int m = 0; m < M; ++m) {
+        for (int n = 0; n < N; ++n) {
+            double acc = 0.0;
+            for (int k = 0; k < K; ++k) {
+                const float a = A_logical[(size_t)k + (size_t)K * (size_t)m];
+                const float b = B_logical[(size_t)k * (size_t)N + (size_t)n];
+                acc += (double)a * (double)b;
+            }
+            C_ref[(size_t)n + (size_t)N * (size_t)m] = (float)acc;
+        }
+    }
+
+    const float atol = 1e-4f;
+    const float rtol = 1e-4f;
+    size_t bad_i = 0;
+    float bad_diff = 0.f;
+
+    bool ok = allclose(C_host_storage, C_ref, atol, rtol, &bad_i, &bad_diff);
+    if (!ok) {
+        POWERSERVE_LOG_ERROR("OpenCL matmul noncontig+noncontig test: FAILED (mismatch)");
+        printf("bad_i=%zu ocl=%f ref=%f diff=%f\n",
+               bad_i,
+               (double)C_host_storage[bad_i],
+               (double)C_ref[bad_i],
+               (double)bad_diff);
+        return false;
+    }
+
+    POWERSERVE_LOG_INFO("OpenCL matmul non-contig A + non-contig B test: PASS");
+    return true;
+}
+
+// ---------- test: quant(Q8_0) weight on CPU + quant(Q8_0) activation on CPU ----------
+bool run_opencl_backend_matmul_quant_quant_test() {
+    POWERSERVE_LOG_INFO("OpenCL matmul quant(Q8_0) + quant(Q8_0) test: start");
+
+    ModelConfig::LLMConfig cfg{};
+    cfg.dim        = 64;   // K
+    cfg.vocab_size = 64;   // N
+    cfg.n_layers   = 1;
+    cfg.n_heads    = 1;
+    cfg.n_kv_heads = 1;
+    cfg.kv_dim     = 64;
+    cfg.head_size  = 64;
+    cfg.seq_len    = 16;
+
+    HyperParams hp{};
+    hp.n_threads = 1;
+
+    OpenCLBackend backend(cfg, hp);
+    if (!backend.initialize()) {
+        POWERSERVE_LOG_ERROR("OpenCL matmul quant+quant test: backend.initialize failed");
+        return false;
+    }
+
+    const int K = 64;
+    const int N = 64;
+    const int M = 4;
+
+    // Build B_fp32 on CPU with ggml-friendly layout: shape {K,N}
+    Shape B_shape{};
+    B_shape[0] = K;
+    B_shape[1] = N;
+    B_shape[2] = 1;
+    B_shape[3] = 1;
+
+    std::vector<float> B_f32_storage;
+    Tensor B_f32_cpu = make_cpu_tensor_f32(B_shape, B_f32_storage);
+
+    for (int n = 0; n < N; ++n) {
+        for (int k = 0; k < K; ++k) {
+            B_f32_storage[(size_t)k + (size_t)K * (size_t)n] =
+                0.01f * (float)n - 0.0007f * (float)k;
+        }
+    }
+
+    // Build A_fp32 on CPU: shape {K,M}
+    Shape A_shape{};
+    A_shape[0] = K;
+    A_shape[1] = M;
+    A_shape[2] = 1;
+    A_shape[3] = 1;
+
+    std::vector<float> A_f32_storage;
+    Tensor A_f32_cpu = make_cpu_tensor_f32(A_shape, A_f32_storage);
+
+    for (int m = 0; m < M; ++m) {
+        for (int k = 0; k < K; ++k) {
+            A_f32_storage[(size_t)k + (size_t)K * (size_t)m] =
+                0.02f * (float)m + 0.001f * (float)k - 0.03f;
+        }
+    }
+
+    // Quantize B and A to Q8_0
+    const ggml_type qtype = GGML_TYPE_Q8_0;
+    const size_t row_size = ggml_row_size(qtype, K);
+
+    std::vector<uint8_t> B_q_storage(row_size * (size_t)N, 0);
+    std::vector<uint8_t> A_q_storage(row_size * (size_t)M, 0);
+
+    Stride B_q_stride{};
+    B_q_stride[0] = (int)ggml_type_size(qtype);
+    B_q_stride[1] = (int)row_size;
+    B_q_stride[2] = B_q_stride[1] * B_shape[1];
+    B_q_stride[3] = B_q_stride[2] * B_shape[2];
+
+    Stride A_q_stride{};
+    A_q_stride[0] = (int)ggml_type_size(qtype);
+    A_q_stride[1] = (int)row_size;
+    A_q_stride[2] = A_q_stride[1] * A_shape[1];
+    A_q_stride[3] = A_q_stride[2] * A_shape[2];
+
+    Tensor B_q_cpu(DataType::GGML_Q8_0, B_shape);
+    B_q_cpu.m_data = std::make_shared<powerserve::CPUBuffer>(B_q_stride, B_q_storage.data());
+
+    Tensor A_q_cpu(DataType::GGML_Q8_0, A_shape);
+    A_q_cpu.m_data = std::make_shared<powerserve::CPUBuffer>(A_q_stride, A_q_storage.data());
+
+    for (int n = 0; n < N; ++n) {
+        const float *src_row = B_f32_storage.data() + (size_t)K * (size_t)n;
+        void *dst_row = (void *)(B_q_storage.data() + row_size * (size_t)n);
+        quantize_row_q8_0(src_row, dst_row, K);
+    }
+
+    for (int m = 0; m < M; ++m) {
+        const float *src_row = A_f32_storage.data() + (size_t)K * (size_t)m;
+        void *dst_row = (void *)(A_q_storage.data() + row_size * (size_t)m);
+        quantize_row_q8_0(src_row, dst_row, K);
+    }
+
+    // Matmul on backend: C = A * B
+    Shape C_shape{};
+    C_shape[0] = N;
+    C_shape[1] = M;
+    C_shape[2] = 1;
+    C_shape[3] = 1;
+
+    Tensor C_dev = make_opencl_tensor_f32(backend, C_shape);
+    backend.matmul(&C_dev, &B_q_cpu, &A_q_cpu);
+
+    std::vector<float> C_host_storage;
+    Tensor C_cpu = make_cpu_tensor_f32(C_shape, C_host_storage);
+    backend.copy(&C_cpu, &C_dev);
+
+    // CPU reference (float): C[n,m] = sum_k A[k,m] * B[k,n]
+    std::vector<float> C_ref((size_t)N * (size_t)M, 0.f);
+    for (int m = 0; m < M; ++m) {
+        for (int n = 0; n < N; ++n) {
+            double acc = 0.0;
+            for (int k = 0; k < K; ++k) {
+                const float a = A_f32_storage[(size_t)k + (size_t)K * (size_t)m];
+                const float b = B_f32_storage[(size_t)k + (size_t)K * (size_t)n];
+                acc += (double)a * (double)b;
+            }
+            C_ref[(size_t)n + (size_t)N * (size_t)m] = (float)acc;
+        }
+    }
+
+    const float atol = 1e-2f;
+    const float rtol = 1e-2f;
+    size_t bad_i = 0;
+    float bad_diff = 0.f;
+
+    bool ok = allclose(C_host_storage, C_ref, atol, rtol, &bad_i, &bad_diff);
+    if (!ok) {
+        POWERSERVE_LOG_ERROR("OpenCL matmul quant+quant test: FAILED (mismatch)");
+        printf("bad_i=%zu ocl=%f ref=%f diff=%f\n",
+               bad_i,
+               (double)C_host_storage[bad_i],
+               (double)C_ref[bad_i],
+               (double)bad_diff);
+        return false;
+    }
+
+    POWERSERVE_LOG_INFO("OpenCL matmul quant(Q8_0) + quant(Q8_0) test: PASS");
+    return true;
+}
+
 
 
 } // namespace powerserve::opencl
@@ -923,5 +1244,7 @@ int main() {
     // bool ok2 = powerserve::opencl::run_opencl_backend_rope_vs_ggml_test();
     // bool ok3 = powerserve::opencl::run_opencl_backend_softmax_ext_vs_ggml_test();
     bool ok4 = powerserve::opencl::run_opencl_backend_matmul_quant_noncontigA_test();
-    // return (ok1 && ok2 && ok3 && ok4) ? 0 : 1;
+    bool ok5 = powerserve::opencl::run_opencl_backend_matmul_noncontig_noncontig_test();
+    bool ok6 = powerserve::opencl::run_opencl_backend_matmul_quant_quant_test();
+    return (ok4 && ok5 && ok6) ? 0 : 1;
 }
