@@ -859,6 +859,7 @@ bool run_opencl_backend_matmul_quant_noncontigA_test() {
     C_shape[3] = 1;
 
     Tensor C_dev = make_opencl_tensor_f32(backend, C_shape);
+    // backend.matmul expects weight (B) first, activation (A) second
     backend.matmul(&C_dev, &B_q_cpu, &A_dev);
 
     // D2H result
@@ -897,6 +898,20 @@ bool run_opencl_backend_matmul_quant_noncontigA_test() {
                (double)C_host_storage[bad_i],
                (double)C_ref[bad_i],
                (double)bad_diff);
+
+        // Debug: verify D2H pack for non-contig A
+        std::vector<float> A_dev_host_storage;
+        Tensor A_dev_host = make_cpu_tensor_f32(A_shape, A_dev_host_storage);
+        backend.copy(&A_dev_host, &A_dev);
+        printf("A_dev D2H head: ");
+        for (size_t i = 0; i < std::min<size_t>(8, A_dev_host_storage.size()); ++i) {
+            printf("%f ", (double)A_dev_host_storage[i]);
+        }
+        printf("\nA_logical head: ");
+        for (size_t i = 0; i < std::min<size_t>(8, A_logical.size()); ++i) {
+            printf("%f ", (double)A_logical[i]);
+        }
+        printf("\n");
 
         printf("OCL head: ");
         for (size_t i = 0; i < std::min<size_t>(8, C_host_storage.size()); ++i) {
@@ -1089,9 +1104,9 @@ bool run_opencl_backend_matmul_noncontig_noncontig_test() {
     return true;
 }
 
-// ---------- test: quant(Q8_0) weight on CPU + quant(Q8_0) activation on CPU ----------
-bool run_opencl_backend_matmul_quant_quant_test() {
-    POWERSERVE_LOG_INFO("OpenCL matmul quant(Q8_0) + quant(Q8_0) test: start");
+// ---------- test: quant(Q8_0) weight on CPU + dequantized activation on CPU ----------
+bool run_opencl_backend_matmul_quant_dequantA_test() {
+    POWERSERVE_LOG_INFO("OpenCL matmul quant(Q8_0) weight + dequantized activation test: start");
 
     ModelConfig::LLMConfig cfg{};
     cfg.dim        = 64;   // K
@@ -1108,7 +1123,7 @@ bool run_opencl_backend_matmul_quant_quant_test() {
 
     OpenCLBackend backend(cfg, hp);
     if (!backend.initialize()) {
-        POWERSERVE_LOG_ERROR("OpenCL matmul quant+quant test: backend.initialize failed");
+        POWERSERVE_LOG_ERROR("OpenCL matmul quant+dequantA test: backend.initialize failed");
         return false;
     }
 
@@ -1150,7 +1165,7 @@ bool run_opencl_backend_matmul_quant_quant_test() {
         }
     }
 
-    // Quantize B and A to Q8_0
+    // Quantize B and A to Q8_0 (B stays quantized; A will be dequantized for ggml mul_mat)
     const ggml_type qtype = GGML_TYPE_Q8_0;
     const size_t row_size = ggml_row_size(qtype, K);
 
@@ -1187,7 +1202,16 @@ bool run_opencl_backend_matmul_quant_quant_test() {
         quantize_row_q8_0(src_row, dst_row, K);
     }
 
-    // Matmul on backend: C = A * B
+    // Dequantize A to FP32 because ggml mul_mat expects FP32 activations.
+    std::vector<float> A_deq_storage((size_t)K * (size_t)M, 0.f);
+    Tensor A_deq_cpu = make_cpu_tensor_f32(A_shape, A_deq_storage);
+    for (int m = 0; m < M; ++m) {
+        const void *src_row = (const void *)(A_q_storage.data() + row_size * (size_t)m);
+        float *dst_row = A_deq_storage.data() + (size_t)K * (size_t)m;
+        dequantize_row_q8_0((const block_q8_0 *)src_row, dst_row, K);
+    }
+
+    // Matmul on backend: C = A * B (weight first, activation second)
     Shape C_shape{};
     C_shape[0] = N;
     C_shape[1] = M;
@@ -1195,7 +1219,7 @@ bool run_opencl_backend_matmul_quant_quant_test() {
     C_shape[3] = 1;
 
     Tensor C_dev = make_opencl_tensor_f32(backend, C_shape);
-    backend.matmul(&C_dev, &B_q_cpu, &A_q_cpu);
+    backend.matmul(&C_dev, &B_q_cpu, &A_deq_cpu);
 
     std::vector<float> C_host_storage;
     Tensor C_cpu = make_cpu_tensor_f32(C_shape, C_host_storage);
@@ -1207,7 +1231,7 @@ bool run_opencl_backend_matmul_quant_quant_test() {
         for (int n = 0; n < N; ++n) {
             double acc = 0.0;
             for (int k = 0; k < K; ++k) {
-                const float a = A_f32_storage[(size_t)k + (size_t)K * (size_t)m];
+                const float a = A_deq_storage[(size_t)k + (size_t)K * (size_t)m];
                 const float b = B_f32_storage[(size_t)k + (size_t)K * (size_t)n];
                 acc += (double)a * (double)b;
             }
@@ -1222,7 +1246,7 @@ bool run_opencl_backend_matmul_quant_quant_test() {
 
     bool ok = allclose(C_host_storage, C_ref, atol, rtol, &bad_i, &bad_diff);
     if (!ok) {
-        POWERSERVE_LOG_ERROR("OpenCL matmul quant+quant test: FAILED (mismatch)");
+        POWERSERVE_LOG_ERROR("OpenCL matmul quant+dequantA test: FAILED (mismatch)");
         printf("bad_i=%zu ocl=%f ref=%f diff=%f\n",
                bad_i,
                (double)C_host_storage[bad_i],
@@ -1231,7 +1255,7 @@ bool run_opencl_backend_matmul_quant_quant_test() {
         return false;
     }
 
-    POWERSERVE_LOG_INFO("OpenCL matmul quant(Q8_0) + quant(Q8_0) test: PASS");
+    POWERSERVE_LOG_INFO("OpenCL matmul quant(Q8_0) weight + dequantized activation test: PASS");
     return true;
 }
 
@@ -1245,6 +1269,6 @@ int main() {
     // bool ok3 = powerserve::opencl::run_opencl_backend_softmax_ext_vs_ggml_test();
     bool ok4 = powerserve::opencl::run_opencl_backend_matmul_quant_noncontigA_test();
     bool ok5 = powerserve::opencl::run_opencl_backend_matmul_noncontig_noncontig_test();
-    bool ok6 = powerserve::opencl::run_opencl_backend_matmul_quant_quant_test();
+    bool ok6 = powerserve::opencl::run_opencl_backend_matmul_quant_dequantA_test();
     return (ok4 && ok5 && ok6) ? 0 : 1;
 }

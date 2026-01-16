@@ -3,6 +3,7 @@
 
 
 #include "core/logger.hpp"
+#include "ggml-quants.h"
 
 #include <iostream>
 #include <CL/cl.h>
@@ -12,6 +13,7 @@
 #include <cmath>
 #include <algorithm>
 #include <execinfo.h>
+#include <fmt/core.h>
 
 #define CL_CHECK(call) \
     do { \
@@ -1016,6 +1018,53 @@ void OpenCLBackend::matmul_cpu_ggml_fallback(
     // ---- 2) host output tensor (always CPU) ----
     Tensor host_c(dst->m_dtype, dst->m_shape);
     host_c.m_data = create_cpu_buffer_for_dtype(dst->m_dtype, dst->m_shape);
+
+    // ---- Debug: log first row of inputs once (helps diagnose quant/stride issues) ----
+    static bool s_logged_inputs = false;
+    if (!s_logged_inputs) {
+        s_logged_inputs = true;
+        const auto &a_stride = a_host->get<powerserve::CPUBuffer>().m_stride;
+        const auto &b_stride = b_host->get<powerserve::CPUBuffer>().m_stride;
+        POWERSERVE_LOG_INFO(
+            "matmul_cpu_ggml_fallback inputs: A(dtype={}, shape=[{}, {}, {}, {}], stride=[{}, {}, {}, {}]) "
+            "B(dtype={}, shape=[{}, {}, {}, {}], stride=[{}, {}, {}, {}])",
+            (int)a_host->m_dtype,
+            a_host->m_shape[0], a_host->m_shape[1], a_host->m_shape[2], a_host->m_shape[3],
+            a_stride[0], a_stride[1], a_stride[2], a_stride[3],
+            (int)b_host->m_dtype,
+            b_host->m_shape[0], b_host->m_shape[1], b_host->m_shape[2], b_host->m_shape[3],
+            b_stride[0], b_stride[1], b_stride[2], b_stride[3]
+        );
+
+        // Dump head of A (weight) and B (activation)
+        if (a_host->m_dtype == DataType::GGML_Q8_0) {
+            const size_t K = a_host->m_shape[0];
+            const char *a_base = static_cast<const char *>(a_host->get<powerserve::CPUBuffer>().m_data);
+            std::vector<float> a_deq(K, 0.f);
+            dequantize_row_q8_0(reinterpret_cast<const block_q8_0 *>(a_base), a_deq.data(), (int)K);
+            std::string head;
+            for (size_t i = 0; i < std::min<size_t>(8, a_deq.size()); ++i) {
+                head += fmt::format("{:.6f} ", a_deq[i]);
+            }
+            POWERSERVE_LOG_INFO("A(Q8_0) dequant head: {}", head);
+        } else if (a_host->m_dtype == DataType::FP32) {
+            const float *a_f = static_cast<const float *>(a_host->get<powerserve::CPUBuffer>().m_data);
+            std::string head;
+            for (size_t i = 0; i < std::min<size_t>(8, a_host->n_elements()); ++i) {
+                head += fmt::format("{:.6f} ", a_f[i]);
+            }
+            POWERSERVE_LOG_INFO("A(FP32) head: {}", head);
+        }
+
+        if (b_host->m_dtype == DataType::FP32) {
+            const float *b_f = static_cast<const float *>(b_host->get<powerserve::CPUBuffer>().m_data);
+            std::string head;
+            for (size_t i = 0; i < std::min<size_t>(8, b_host->n_elements()); ++i) {
+                head += fmt::format("{:.6f} ", b_f[i]);
+            }
+            POWERSERVE_LOG_INFO("B(FP32) head: {}", head);
+        }
+    }
 
     // ---- 3) ggml mul_mat (reusable GGMLBackend, correct params/workspace/threadpool) ----
     POWERSERVE_ASSERT(m_ggml_fallback && "m_ggml_fallback must be initialized in OpenCLBackend::initialize()");
