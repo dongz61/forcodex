@@ -1066,6 +1066,18 @@ void OpenCLBackend::matmul_cpu_ggml_fallback(
         }
     }
 
+    // ---- Debug: bytes check for quant layouts ----
+    {
+        const size_t a_bytes = ggml_compat_nbytes(a_host->m_dtype, a_host->m_shape);
+        const size_t b_bytes = ggml_compat_nbytes(b_host->m_dtype, b_host->m_shape);
+
+        POWERSERVE_LOG_INFO(
+            "matmul_cpu_ggml_fallback nbytes(compat): A={} B={}",
+            a_bytes, b_bytes
+        );
+    }
+
+
     // ---- 3) ggml mul_mat (reusable GGMLBackend, correct params/workspace/threadpool) ----
     POWERSERVE_ASSERT(m_ggml_fallback && "m_ggml_fallback must be initialized in OpenCLBackend::initialize()");
 
@@ -1987,6 +1999,47 @@ static inline size_t numel_4d(const Tensor* t) {
     return n;
 }
 
+// ---- ggml-compat helpers for quant nbytes/stride ----
+static inline bool is_ggml_quant_dtype(powerserve::DataType dt) {
+    using powerserve::DataType;
+    return dt == DataType::GGML_Q4_0 || dt == DataType::GGML_Q8_0;
+}
+
+// contiguous logical tensor bytes in ggml layout
+static inline size_t ggml_compat_nbytes(powerserve::DataType dt, const powerserve::Shape &s) {
+    const size_t ne0 = (size_t)s[0];
+    const size_t ne1 = (size_t)s[1];
+    const size_t ne2 = (size_t)s[2];
+    const size_t ne3 = (size_t)s[3];
+
+    if (is_ggml_quant_dtype(dt)) {
+        const ggml_type gt = powerserve::ggml::convert_datatype_to_ggml(dt);
+        // ggml_nbytes for quant types is row_size(ne0) * ne1 * ne2 * ne3
+        return (size_t)ggml_row_size(gt, (int64_t)ne0) * ne1 * ne2 * ne3;
+    }
+
+    const size_t elem = powerserve::get_type_size(dt); // fp32=4, fp16=2...
+    POWERSERVE_ASSERT(elem > 0);
+    return elem * ne0 * ne1 * ne2 * ne3;
+}
+
+static inline powerserve::Stride ggml_compat_contig_stride_bytes(powerserve::DataType dt, const powerserve::Shape &s) {
+    powerserve::Stride st{};
+    if (is_ggml_quant_dtype(dt)) {
+        const ggml_type gt = powerserve::ggml::convert_datatype_to_ggml(dt);
+        st[0] = (size_t)ggml_type_size(gt);                 // Q8_0 => 34
+        st[1] = (size_t)ggml_row_size(gt, (int64_t)s[0]);   // Q8_0 row bytes
+    } else {
+        const size_t elem = powerserve::get_type_size(dt);
+        POWERSERVE_ASSERT(elem > 0);
+        st[0] = elem;
+        st[1] = st[0] * (size_t)s[0];
+    }
+    st[2] = st[1] * (size_t)s[1];
+    st[3] = st[2] * (size_t)s[2];
+    return st;
+}
+
 static inline bool is_cpy_kernel_supported(powerserve::DataType t) {
     return t == DataType::FP16 || t == DataType::FP32;
 }
@@ -2111,8 +2164,10 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
         return;
     }
 
-    const size_t src_bytes = numel_4d(src) * dtype_size(src->m_dtype);
-    const size_t dst_bytes = numel_4d(dst) * dtype_size(dst->m_dtype);
+    const size_t src_bytes = ggml_compat_nbytes(src->m_dtype, src->m_shape);
+    const size_t dst_bytes = ggml_compat_nbytes(dst->m_dtype, dst->m_shape);
+
+
     if (src_bytes == 0 || dst_bytes == 0 || src_bytes != dst_bytes) {
         POWERSERVE_LOG_ERROR("copy: size mismatch src_bytes={} dst_bytes={}", src_bytes, dst_bytes);
         return;
