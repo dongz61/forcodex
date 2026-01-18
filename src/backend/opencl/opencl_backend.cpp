@@ -95,6 +95,47 @@ static inline void dump_backtrace() {
 }
 // for debug end
 
+// ---- ggml-compat helpers for quant nbytes/stride ----
+static inline bool is_ggml_quant_dtype(powerserve::DataType dt) {
+    using powerserve::DataType;
+    return dt == DataType::GGML_Q4_0 || dt == DataType::GGML_Q8_0;
+}
+
+// contiguous logical tensor bytes in ggml layout
+static inline size_t ggml_compat_nbytes(powerserve::DataType dt, const powerserve::Shape &s) {
+    const size_t ne0 = (size_t)s[0];
+    const size_t ne1 = (size_t)s[1];
+    const size_t ne2 = (size_t)s[2];
+    const size_t ne3 = (size_t)s[3];
+
+    if (is_ggml_quant_dtype(dt)) {
+        const ggml_type gt = powerserve::ggml::convert_datatype_to_ggml(dt);
+        // ggml_nbytes for quant types is row_size(ne0) * ne1 * ne2 * ne3
+        return (size_t)ggml_row_size(gt, (int64_t)ne0) * ne1 * ne2 * ne3;
+    }
+
+    const size_t elem = powerserve::get_type_size(dt); // fp32=4, fp16=2...
+    POWERSERVE_ASSERT(elem > 0);
+    return elem * ne0 * ne1 * ne2 * ne3;
+}
+
+static inline powerserve::Stride ggml_compat_contig_stride_bytes(powerserve::DataType dt, const powerserve::Shape &s) {
+    powerserve::Stride st{};
+    if (is_ggml_quant_dtype(dt)) {
+        const ggml_type gt = powerserve::ggml::convert_datatype_to_ggml(dt);
+        st[0] = (size_t)ggml_type_size(gt);                 // Q8_0 => 34
+        st[1] = (size_t)ggml_row_size(gt, (int64_t)s[0]);   // Q8_0 row bytes
+    } else {
+        const size_t elem = powerserve::get_type_size(dt);
+        POWERSERVE_ASSERT(elem > 0);
+        st[0] = elem;
+        st[1] = st[0] * (size_t)s[0];
+    }
+    st[2] = st[1] * (size_t)s[1];
+    st[3] = st[2] * (size_t)s[2];
+    return st;
+}
+
 OpenCLBackend::OpenCLBackend(const ModelConfig::LLMConfig &llm,
                              const HyperParams &hparams)
     : m_llm(llm), m_hparams(hparams) {
@@ -265,84 +306,6 @@ bool OpenCLBackend::is_contiguous(const Tensor *t, int n) const {
     return true;
 }
 
-
-static inline void pack_contiguous_cpu_f32(
-    powerserve::opencl::OpenCLBackend *self,
-    const Tensor *src,
-    Tensor *dst_contig_dev
-) {
-    POWERSERVE_ASSERT(self && src && dst_contig_dev);
-
-    if (src->m_dtype != DataType::FP32 || dst_contig_dev->m_dtype != DataType::FP32) {
-        POWERSERVE_LOG_ERROR("pack_contiguous_cpu_f32 only supports FP32 (got src={}, dst={})",
-                             (int)src->m_dtype, (int)dst_contig_dev->m_dtype);
-        return;
-    }
-    if (dst_contig_dev->m_shape != src->m_shape) {
-        POWERSERVE_LOG_ERROR("pack_contiguous_cpu_f32 shape mismatch");
-        return;
-    }
-
-    // ----------------------------
-    // D2H: src -> host_src
-    // ----------------------------
-    Tensor host_src(DataType::FP32, src->m_shape);
-    host_src.m_data = powerserve::CPUBuffer::create_buffer<float>(src->m_shape);
-
-    self->copy(&host_src, src);
-
-    // Get src strides in bytes (from CPUBuffer after D2H copy)
-    powerserve::CPUBuffer *src_cpu = nullptr;
-    try {
-        src_cpu = &host_src.get<powerserve::CPUBuffer>();
-    } catch (const std::bad_cast &e) {
-        POWERSERVE_LOG_ERROR("pack_contiguous_cpu_f32: host_src is not CPUBuffer? {}", e.what());
-        return;
-    }
-
-    const auto s = src->m_shape;         // {ne0,ne1,ne2,ne3}
-    const auto nb = src_cpu->m_stride;   // bytes stride for host_src
-
-    const size_t ne0 = s[0], ne1 = s[1], ne2 = s[2], ne3 = s[3];
-    const size_t elem = sizeof(float);
-
-    // ----------------------------
-    // CPU pack -> host_contig
-    // ----------------------------
-    Tensor host_contig(DataType::FP32, src->m_shape);
-    host_contig.m_data = powerserve::CPUBuffer::create_buffer<float>(src->m_shape);
-
-    float *dst_ptr = static_cast<float *>(host_contig.get<powerserve::CPUBuffer>().m_data);
-    const char *src_base = static_cast<const char *>(src_cpu->m_data);
-
-    // destination is standard contiguous row-major in your stride convention:
-    // linear index = (((i3*ne2 + i2)*ne1 + i1)*ne0 + i0)
-    size_t out_idx = 0;
-    for (size_t i3 = 0; i3 < ne3; ++i3) {
-        for (size_t i2 = 0; i2 < ne2; ++i2) {
-            for (size_t i1 = 0; i1 < ne1; ++i1) {
-                // Pointer to the start of this (i1,i2,i3) slice in src
-                const char *src_row = src_base
-                    + (size_t)i3 * (size_t)nb[3]
-                    + (size_t)i2 * (size_t)nb[2]
-                    + (size_t)i1 * (size_t)nb[1];
-
-                for (size_t i0 = 0; i0 < ne0; ++i0) {
-                    const char *p = src_row + (size_t)i0 * (size_t)nb[0];
-                    float v;
-                    std::memcpy(&v, p, elem);
-                    dst_ptr[out_idx++] = v;
-                }
-            }
-        }
-    }
-
-    // ----------------------------
-    // H2D: host_contig -> dst_contig_dev
-    // ----------------------------
-    self->copy(dst_contig_dev, &host_contig);
-}
-
 static inline void cpy_tensor_cl(const OpenCLBackend* self,
                                  const Tensor* src,
                                  const Tensor* dst) {
@@ -479,6 +442,37 @@ static inline const Tensor * ensure_contiguous_or_pack_f32(
     }
     return &tmp_dev;
 }
+
+static inline void pack_contiguous_cpu_f32(
+    powerserve::opencl::OpenCLBackend *self,
+    const Tensor *src,
+    Tensor *dst_contig_dev
+) {
+    POWERSERVE_ASSERT(self && src && dst_contig_dev);
+
+    if (src->m_dtype != DataType::FP32 || dst_contig_dev->m_dtype != DataType::FP32) {
+        POWERSERVE_LOG_ERROR("pack_contiguous_cpu_f32 only supports FP32 (got src={}, dst={})",
+                             (int)src->m_dtype, (int)dst_contig_dev->m_dtype);
+        return;
+    }
+    if (dst_contig_dev->m_shape != src->m_shape) {
+        POWERSERVE_LOG_ERROR("pack_contiguous_cpu_f32 shape mismatch");
+        return;
+    }
+
+    // 1) 先在 device 上把 non-contig view pack 成 contig（stride-aware）
+    Tensor tmp_dev;
+    const Tensor *src_packed = ensure_contiguous_or_pack_f32(self, src, /*n_dims_check=*/4, tmp_dev);
+
+    // 2) D2H：读回已经连续的 src_packed
+    Tensor host_contig(DataType::FP32, src->m_shape);
+    host_contig.m_data = powerserve::CPUBuffer::create_buffer<float>(src->m_shape);
+    self->copy(&host_contig, src_packed);
+
+    // 3) H2D：写入 dst_contig_dev（连续）
+    self->copy(dst_contig_dev, &host_contig);
+}
+
 
 // ==================== 算子实现 ====================
 
@@ -1081,23 +1075,58 @@ void OpenCLBackend::matmul_cpu_ggml_fallback(
     // ---- 3) ggml mul_mat (reusable GGMLBackend, correct params/workspace/threadpool) ----
     POWERSERVE_ASSERT(m_ggml_fallback && "m_ggml_fallback must be initialized in OpenCLBackend::initialize()");
 
-    // workspace sizing (copy from GGMLBackend::plan() logic for MAT_MUL) :contentReference[oaicite:6]{index=6}
-    const enum ggml_type vec_dot_type = m_ggml_fallback->get_vec_dot_type(b_host);
-    const enum ggml_type w_type = powerserve::ggml::convert_datatype_to_ggml(a_host->m_dtype);
+    // IMPORTANT:
+    // In this repo, matmul fallback must keep operand order as (A=weight, B=activation).
+    // Swapping them triggers ggml.c assertion (GGML_ASSERT(ne0 == ne01)).
+    const Tensor *w_host = a_host; // weight (often quant)
+    const Tensor *x_host = b_host; // activation (usually FP32)
 
-    size_t required_wsize = 0;
-    if (w_type != vec_dot_type) {
-        required_wsize = ggml_row_size(vec_dot_type, a_host->n_elements());
+    // ---- shape sanity check (fail fast with readable logs instead of ggml assert) ----
+    // Expected (ggml-style) here: w:[K,N], x:[K,M]  => dst:[N,M]
+    const int64_t K_w = (int64_t)w_host->m_shape[0];
+    const int64_t N_w = (int64_t)w_host->m_shape[1];
+    const int64_t K_x = (int64_t)x_host->m_shape[0];
+    const int64_t M_x = (int64_t)x_host->m_shape[1];
+
+    const int64_t N_dst = (int64_t)dst->m_shape[0];
+    const int64_t M_dst = (int64_t)dst->m_shape[1];
+
+    if (!(K_w == K_x && N_w == N_dst && M_x == M_dst)) {
+        POWERSERVE_LOG_ERROR(
+            "matmul_cpu_ggml_fallback shape mismatch: "
+            "w=[K={},N={}] x=[K={},M={}] dst=[N={},M={}]",
+            (long long)K_w, (long long)N_w,
+            (long long)K_x, (long long)M_x,
+            (long long)N_dst, (long long)M_dst
+        );
+        POWERSERVE_ABORT("matmul_cpu_ggml_fallback: abort due to incompatible shapes (would trigger ggml assert)");
+    }
+
+    // ---- workspace sizing ----
+    // Your tests allocate at least sizeof(float) * (K + 64) * n_threads for ggml ops
+    // (same idea as ggml's scratch usage). See tests/opencl_test.cpp. :contentReference[oaicite:0]{index=0}
+    const size_t n_threads = (size_t)m_hparams.n_threads;
+    size_t required_wsize = sizeof(float) * (size_t)(K_w + 64) * n_threads;
+
+    // Also keep your original "type conversion" workspace logic (only increases, never hurts)
+    {
+        const enum ggml_type vec_dot_type = m_ggml_fallback->get_vec_dot_type(x_host);
+        const enum ggml_type w_type       = powerserve::ggml::convert_datatype_to_ggml(w_host->m_dtype);
+        if (w_type != vec_dot_type) {
+            const size_t extra = (size_t)ggml_row_size(vec_dot_type, (int64_t)w_host->n_elements());
+            required_wsize = std::max(required_wsize, extra);
+        }
     }
 
     // only grow, never shrink
     if (required_wsize > m_ggml_fallback_wsize) {
-        m_ggml_fallback->setup_work_data(required_wsize); // will add cache line padding internally :contentReference[oaicite:7]{index=7}
+        m_ggml_fallback->setup_work_data(required_wsize);
         m_ggml_fallback_wsize = required_wsize;
     }
 
-    // run ggml matmul
-    m_ggml_fallback->matmul(&host_c, a_host, b_host);
+    // run ggml matmul (KEEP ORDER: weight first, activation second)
+    m_ggml_fallback->matmul(&host_c, w_host, x_host);
+
 
     // ---- 4) H2D: host_c -> dst ----
     this->copy(dst, &host_c);
@@ -1997,47 +2026,6 @@ static inline size_t numel_4d(const Tensor* t) {
     // 按你们 shape 维度数改；你摘要里是 4 维
     for (int i = 0; i < 4; ++i) n *= static_cast<size_t>(t->m_shape[i]);
     return n;
-}
-
-// ---- ggml-compat helpers for quant nbytes/stride ----
-static inline bool is_ggml_quant_dtype(powerserve::DataType dt) {
-    using powerserve::DataType;
-    return dt == DataType::GGML_Q4_0 || dt == DataType::GGML_Q8_0;
-}
-
-// contiguous logical tensor bytes in ggml layout
-static inline size_t ggml_compat_nbytes(powerserve::DataType dt, const powerserve::Shape &s) {
-    const size_t ne0 = (size_t)s[0];
-    const size_t ne1 = (size_t)s[1];
-    const size_t ne2 = (size_t)s[2];
-    const size_t ne3 = (size_t)s[3];
-
-    if (is_ggml_quant_dtype(dt)) {
-        const ggml_type gt = powerserve::ggml::convert_datatype_to_ggml(dt);
-        // ggml_nbytes for quant types is row_size(ne0) * ne1 * ne2 * ne3
-        return (size_t)ggml_row_size(gt, (int64_t)ne0) * ne1 * ne2 * ne3;
-    }
-
-    const size_t elem = powerserve::get_type_size(dt); // fp32=4, fp16=2...
-    POWERSERVE_ASSERT(elem > 0);
-    return elem * ne0 * ne1 * ne2 * ne3;
-}
-
-static inline powerserve::Stride ggml_compat_contig_stride_bytes(powerserve::DataType dt, const powerserve::Shape &s) {
-    powerserve::Stride st{};
-    if (is_ggml_quant_dtype(dt)) {
-        const ggml_type gt = powerserve::ggml::convert_datatype_to_ggml(dt);
-        st[0] = (size_t)ggml_type_size(gt);                 // Q8_0 => 34
-        st[1] = (size_t)ggml_row_size(gt, (int64_t)s[0]);   // Q8_0 row bytes
-    } else {
-        const size_t elem = powerserve::get_type_size(dt);
-        POWERSERVE_ASSERT(elem > 0);
-        st[0] = elem;
-        st[1] = st[0] * (size_t)s[0];
-    }
-    st[2] = st[1] * (size_t)s[1];
-    st[3] = st[2] * (size_t)s[2];
-    return st;
 }
 
 static inline bool is_cpy_kernel_supported(powerserve::DataType t) {
