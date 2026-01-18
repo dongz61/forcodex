@@ -4,6 +4,7 @@
 
 #include "core/logger.hpp"
 #include "ggml-quants.h"
+#include "ggml.h"
 
 #include <iostream>
 #include <CL/cl.h>
@@ -14,6 +15,7 @@
 #include <algorithm>
 #include <execinfo.h>
 #include <fmt/core.h>
+#include <mutex>
 
 #define CL_CHECK(call) \
     do { \
@@ -136,6 +138,18 @@ static inline powerserve::Stride ggml_compat_contig_stride_bytes(powerserve::Dat
     return st;
 }
 
+static void ensure_ggml_global_init_once() {
+    static std::once_flag once;
+    std::call_once(once, []() {
+        ggml_init_params p{};
+        p.mem_size   = 1024 * 1024; 
+        p.mem_buffer = NULL;
+        ggml_context* ctx = ggml_init(p);
+        ggml_free(ctx);
+    });
+}
+
+
 OpenCLBackend::OpenCLBackend(const ModelConfig::LLMConfig &llm,
                              const HyperParams &hparams)
     : m_llm(llm), m_hparams(hparams) {
@@ -184,6 +198,8 @@ bool OpenCLBackend::initialize() {
         return true;
     }
     
+    ensure_ggml_global_init_once(); 
+
     // 1. 创建OpenCL上下文
     context = std::make_shared<OpenCLContext>();
     if (!context->initialize(device_preference)) {
@@ -1064,11 +1080,6 @@ void OpenCLBackend::matmul_cpu_ggml_fallback(
     {
         const size_t a_bytes = ggml_compat_nbytes(a_host->m_dtype, a_host->m_shape);
         const size_t b_bytes = ggml_compat_nbytes(b_host->m_dtype, b_host->m_shape);
-
-        POWERSERVE_LOG_INFO(
-            "matmul_cpu_ggml_fallback nbytes(compat): A={} B={}",
-            a_bytes, b_bytes
-        );
     }
 
 
@@ -2186,6 +2197,7 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
             if (!memory_pool->copy_host_to_device(dev, host, src_bytes, 0)) {
                 POWERSERVE_LOG_ERROR("H2D: copy_host_to_device failed");
             }
+            clFinish(context->get_queue()); 
             return;
         }
 
@@ -2204,6 +2216,7 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
             if (!memory_pool->copy_host_to_device(dev, host_src, src_bytes, 0)) {
                 POWERSERVE_LOG_ERROR("H2D: copy_host_to_device failed");
             }
+            clFinish(context->get_queue()); 
             return;
         }
 

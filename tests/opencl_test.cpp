@@ -1,9 +1,9 @@
-// src/backend/opencl/opencl_smoke_test.cpp
 #include "backend/opencl/opencl_backend.hpp"
 #include "backend/ggml/ggml_wrapper.cpp"
 #include "backend/cpu_buffer.hpp"
 #include "core/logger.hpp"
 #include "core/tensor.hpp"
+#include "ggml.h"
 
 #include <algorithm>
 #include <cmath>
@@ -173,6 +173,7 @@ bool run_opencl_backend_matmul_quant_noncontigA_test() {
     B_q_stride[2] = B_q_stride[1] * B_shape[1];
     B_q_stride[3] = B_q_stride[2] * B_shape[2];
 
+
     Tensor B_q_cpu(DataType::GGML_Q8_0, B_shape);
     B_q_cpu.m_data = std::make_shared<powerserve::CPUBuffer>(B_q_stride, B_q_blocks.data());
 
@@ -195,6 +196,9 @@ bool run_opencl_backend_matmul_quant_noncontigA_test() {
 
         // 再把 block0 的 d / qs 打出来
         float d0 = ggml_fp16_to_fp32(row0[0].d);
+        uint16_t raw = *(const uint16_t *)&row0[0].d;
+        printf("[TEST] B_q block0 raw_d=0x%04x\n", raw);
+
         printf("[TEST] B_q block0 d0=%f qs0..7=", (double)d0);
         for (int i = 0; i < 8; ++i) printf("%d ", (int)row0[0].qs[i]);
         printf("\n");
@@ -282,6 +286,32 @@ bool run_opencl_backend_matmul_quant_noncontigA_test() {
     backend.copy(&C_cpu, &C_dev);
 
     // -------------------------
+    // GGML reference (quant Q8_0 * noncontig A):
+    // C_ggml = matmul(B_q_cpu, A_cpu_pad)  -> same path as OpenCL uses logically
+    // -------------------------
+    std::vector<float> C_ggml_storage;
+    Tensor C_ggml_cpu = make_cpu_tensor_f32(C_shape, C_ggml_storage);
+
+    {
+        powerserve::ggml::GGMLBackend ggml_be(cfg, hp);
+        ggml_be.setup_threadpool();
+        {
+            const ggml_type vec_dot = ggml_be.get_vec_dot_type(&A_cpu_pad); // x = activation
+            const ggml_type w_type  = powerserve::ggml::convert_datatype_to_ggml(B_q_cpu.m_dtype); // weight = B
+
+            size_t work = 0;
+            if (w_type != vec_dot) {
+                work = (size_t)ggml_row_size(vec_dot, (int64_t)B_q_cpu.n_elements());
+            }
+
+            work = std::max(work, (size_t)(1 << 20)); // 1MB
+
+            ggml_be.setup_work_data(work);
+        }
+        ggml_be.matmul(&C_ggml_cpu, &B_q_cpu, &A_cpu_pad);
+    }
+
+    // -------------------------
     // CPU reference (float): C[n,m] = sum_k A[k,m] * B[k,n]
     // where B is in ggml-friendly layout idx = k + K*n
     // -------------------------
@@ -299,45 +329,72 @@ bool run_opencl_backend_matmul_quant_noncontigA_test() {
     }
 
     // Compare
-    const float atol = 5e-3f;   // quant introduces error; keep reasonable
+    const float atol = 5e-3f;
     const float rtol = 5e-3f;
     size_t bad_i = 0;
     float bad_diff = 0.f;
 
-    bool ok = allclose(C_host_storage, C_ref, atol, rtol, &bad_i, &bad_diff);
-    if (!ok) {
-        POWERSERVE_LOG_ERROR("OpenCL matmul quant+noncontigA test: FAILED (mismatch)");
-        printf("bad_i=%zu ocl=%f ref=%f diff=%f\n",
+    // (1) OpenCL vs GGML (this is your alignment target)
+    bool ok_ocl_vs_ggml = allclose(C_host_storage, C_ggml_storage, atol, rtol, &bad_i, &bad_diff);
+    if (!ok_ocl_vs_ggml) {
+        POWERSERVE_LOG_ERROR("OpenCL vs GGML (Q8_0 x noncontig A) mismatch");
+        printf("bad_i=%zu ocl=%f ggml=%f diff=%f\n",
                bad_i,
                (double)C_host_storage[bad_i],
-               (double)C_ref[bad_i],
+               (double)C_ggml_storage[bad_i],
                (double)bad_diff);
+
+        printf("OCL head:  ");
+        for (size_t i = 0; i < std::min<size_t>(8, C_host_storage.size()); ++i) printf("%f ", (double)C_host_storage[i]);
+        printf("\nGGML head: ");
+        for (size_t i = 0; i < std::min<size_t>(8, C_ggml_storage.size()); ++i) printf("%f ", (double)C_ggml_storage[i]);
+        printf("\nREF head:  ");
+        for (size_t i = 0; i < std::min<size_t>(8, C_ref.size()); ++i) printf("%f ", (double)C_ref[i]);
+        printf("\n");
 
         // Debug: verify D2H pack for non-contig A
         std::vector<float> A_dev_host_storage;
         Tensor A_dev_host = make_cpu_tensor_f32(A_shape, A_dev_host_storage);
         backend.copy(&A_dev_host, &A_dev);
         printf("A_dev D2H head: ");
-        for (size_t i = 0; i < std::min<size_t>(8, A_dev_host_storage.size()); ++i) {
-            printf("%f ", (double)A_dev_host_storage[i]);
-        }
+        for (size_t i = 0; i < std::min<size_t>(8, A_dev_host_storage.size()); ++i) printf("%f ", (double)A_dev_host_storage[i]);
         printf("\nA_logical head: ");
-        for (size_t i = 0; i < std::min<size_t>(8, A_logical.size()); ++i) {
-            printf("%f ", (double)A_logical[i]);
-        }
+        for (size_t i = 0; i < std::min<size_t>(8, A_logical.size()); ++i) printf("%f ", (double)A_logical[i]);
         printf("\n");
 
-        printf("OCL head: ");
-        for (size_t i = 0; i < std::min<size_t>(8, C_host_storage.size()); ++i) {
-            printf("%f ", (double)C_host_storage[i]);
-        }
-        printf("\nREF head: ");
-        for (size_t i = 0; i < std::min<size_t>(8, C_ref.size()); ++i) {
-            printf("%f ", (double)C_ref[i]);
-        }
+        return false;
+    }
+
+    // (2) GGML vs CPU FP32 ref (quantization sanity)
+    bool ok_ggml_vs_ref = allclose(C_ggml_storage, C_ref, atol, rtol, &bad_i, &bad_diff);
+    if (!ok_ggml_vs_ref) {
+        POWERSERVE_LOG_ERROR("GGML(Q8_0 x noncontig A) vs CPU FP32 ref mismatch (quant error too large?)");
+        printf("bad_i=%zu ggml=%f ref=%f diff=%f\n",
+               bad_i,
+               (double)C_ggml_storage[bad_i],
+               (double)C_ref[bad_i],
+               (double)bad_diff);
+
+        printf("GGML head: ");
+        for (size_t i = 0; i < std::min<size_t>(8, C_ggml_storage.size()); ++i) printf("%f ", (double)C_ggml_storage[i]);
+        printf("\nREF head:  ");
+        for (size_t i = 0; i < std::min<size_t>(8, C_ref.size()); ++i) printf("%f ", (double)C_ref[i]);
         printf("\n");
         return false;
     }
+
+    // (3) OpenCL vs CPU FP32 ref (total error)
+    bool ok_ocl_vs_ref = allclose(C_host_storage, C_ref, atol, rtol, &bad_i, &bad_diff);
+    if (!ok_ocl_vs_ref) {
+        POWERSERVE_LOG_ERROR("OpenCL vs CPU FP32 ref mismatch (total error)");
+        printf("bad_i=%zu ocl=%f ref=%f diff=%f\n",
+               bad_i,
+               (double)C_host_storage[bad_i],
+               (double)C_ref[bad_i],
+               (double)bad_diff);
+        return false;
+    }
+
 
     POWERSERVE_LOG_INFO("OpenCL matmul quant(Q8_0) + non-contig A test: PASS");
     return true;

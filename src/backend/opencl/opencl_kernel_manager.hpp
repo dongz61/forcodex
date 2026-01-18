@@ -17,10 +17,10 @@ namespace powerserve::opencl {
 // 编译选项结构体
 struct OpenCLCompileOptions {
     std::string opencl_c_std = "CL3.0";  // OpenCL C版本
-    bool enable_mad = true;              // -cl-mad-enable
-    bool unsafe_math = true;             // -cl-unsafe-math-optimizations
-    bool finite_math = true;             // -cl-finite-math-only
-    bool fast_relaxed_math = true;       // -cl-fast-relaxed-math
+    bool enable_mad = false;              // -cl-mad-enable
+    bool unsafe_math = false;             // -cl-unsafe-math-optimizations
+    bool finite_math = false;             // -cl-finite-math-only
+    bool fast_relaxed_math = false;       // -cl-fast-relaxed-math
     std::string extra_options = "";      // 额外选项
     
     std::string to_string() const {
