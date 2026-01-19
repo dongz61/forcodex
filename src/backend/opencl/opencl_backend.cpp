@@ -216,10 +216,10 @@ bool OpenCLBackend::initialize() {
     // 4. 初始化内核管理器
     OpenCLCompileOptions options;
     options.opencl_c_std = "CL3.0";
-    options.enable_mad = true;
-    options.unsafe_math = true;
-    options.finite_math = true;
-    options.fast_relaxed_math = true;
+    options.enable_mad = false;
+    options.unsafe_math = false;
+    options.finite_math = false;
+    options.fast_relaxed_math = false;
     
     if (!kernel_manager->initialize(options)) {
         POWERSERVE_LOG_ERROR("Failed to initialize OpenCL kernel manager");
@@ -1143,8 +1143,6 @@ void OpenCLBackend::matmul_cpu_ggml_fallback(
     this->copy(dst, &host_c);
 }
 
-
-
 void OpenCLBackend::matmul_batched_cpu_f32_fallback(
     const Tensor *dst,
     const Tensor *src0,
@@ -1404,27 +1402,22 @@ void OpenCLBackend::matmul_minimal(Tensor * dst,
     }
 }
 
-
 void OpenCLBackend::rmsnorm(
     const Tensor *o,
     const Tensor *x,
     const Tensor *weight,
     float eps
 ) const {
-    if (!initialized) {
-        POWERSERVE_LOG_ERROR("OpenCL backend not initialized");
+    if (!initialized || !m_ggml_fallback) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::rmsnorm not ready");
         return;
     }
     if (!o || !x || !weight) {
         POWERSERVE_LOG_ERROR("OpenCLBackend::rmsnorm got null tensor");
         return;
     }
-
-    // ----------------------------
-    // Strict contract (Phase2 v0)
-    // ----------------------------
     if (o->m_dtype != DataType::FP32 || x->m_dtype != DataType::FP32 || weight->m_dtype != DataType::FP32) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::rmsnorm fallback only supports FP32");
+        POWERSERVE_LOG_ERROR("OpenCLBackend::rmsnorm strict only supports FP32");
         return;
     }
     if (o->m_shape != x->m_shape) {
@@ -1432,88 +1425,32 @@ void OpenCLBackend::rmsnorm(
         return;
     }
 
-    const int hidden = (int)x->m_shape[0];
-    if (hidden <= 0) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::rmsnorm hidden dim invalid: {}", hidden);
-        return;
-    }
-    // weight expected to be 1D-like with hidden in dim0
-    if ((int)weight->m_shape[0] != hidden) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::rmsnorm weight.shape[0] must equal hidden ({}), got {}",
-                             hidden, (int)weight->m_shape[0]);
-        return;
-    }
-
-    // x/o must be OpenCLBuffer-backed
-    OpenCLBuffer *x_cl = nullptr;
-    OpenCLBuffer *o_cl = nullptr;
-    powerserve::CPUBuffer *w_cpu = nullptr;
-
-    try {
-        x_cl = &const_cast<Tensor *>(x)->get<OpenCLBuffer>();
-        o_cl = &const_cast<Tensor *>(o)->get<OpenCLBuffer>();
-    } catch (const std::bad_cast &e) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::rmsnorm expects x/o backed by OpenCLBuffer: {}", e.what());
-        return;
-    }
-
-    try {
-        w_cpu = &const_cast<Tensor *>(weight)->get<powerserve::CPUBuffer>();
-    } catch (const std::bad_cast &e) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::rmsnorm expects weight backed by CPUBuffer: {}", e.what());
-        return;
-    }
-
-    if (!w_cpu->m_data) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::rmsnorm weight CPU data is null");
-        return;
-    }
-
-    // ----------------------------
-    // D2H: x -> host_x
-    // ----------------------------
+    // 1) D2H: x -> host_x
     Tensor host_x(DataType::FP32, x->m_shape);
     host_x.m_data = powerserve::CPUBuffer::create_buffer<float>(x->m_shape);
+    this->copy(&host_x, x);
 
-    this->copy(&host_x, x);  // D2H path already implemented
-
-    auto *x_host = static_cast<float *>(host_x.get<powerserve::CPUBuffer>().m_data);
-    auto *w_host = static_cast<float *>(w_cpu->m_data);
-
-    // ----------------------------
-    // CPU compute
-    // ----------------------------
-    Tensor host_y(DataType::FP32, o->m_shape);
-    host_y.m_data = powerserve::CPUBuffer::create_buffer<float>(o->m_shape);
-    auto *y_host = static_cast<float *>(host_y.get<powerserve::CPUBuffer>().m_data);
-
-    // treat as [hidden, rows, 1, 1]
-    const int rows = (int)(x->m_shape[1] * x->m_shape[2] * x->m_shape[3]);
-    const float inv_hidden = 1.0f / (float)hidden;
-
-    for (int r = 0; r < rows; ++r) {
-        const float *xr = x_host + (size_t)r * hidden;
-        float *yr = y_host + (size_t)r * hidden;
-
-        // mean square
-        double sumsq = 0.0;
-        for (int i = 0; i < hidden; ++i) {
-            const float v = xr[i];
-            sumsq += (double)v * (double)v;
-        }
-        const float mean = (float)(sumsq * inv_hidden);
-        const float scale = 1.0f / std::sqrt(mean + eps);
-
-        for (int i = 0; i < hidden; ++i) {
-            yr[i] = xr[i] * scale * w_host[i];
-        }
+    // 2) 确保 weight 在 CPU；如果不是，就 D2H 一份
+    const Tensor *host_w_ptr = weight;
+    Tensor host_w;
+    try {
+        (void)const_cast<Tensor*>(weight)->get<powerserve::CPUBuffer>();
+    } catch (const std::bad_cast &) {
+        host_w = Tensor(DataType::FP32, weight->m_shape);
+        host_w.m_data = powerserve::CPUBuffer::create_buffer<float>(weight->m_shape);
+        this->copy(&host_w, weight);
+        host_w_ptr = &host_w;
     }
 
-    // ----------------------------
-    // H2D: host_y -> o
-    // ----------------------------
+    // 3) GGML 计算
+    Tensor host_y(DataType::FP32, o->m_shape);
+    host_y.m_data = powerserve::CPUBuffer::create_buffer<float>(o->m_shape);
+    m_ggml_fallback->rmsnorm(&host_y, &host_x, host_w_ptr, eps);
+
+    // 4) H2D: host_y -> o
     this->copy(o, &host_y);
 }
+
 
 // for rope
 static inline float rope_yarn_ramp(const float low, const float high, const int i0) {
@@ -1586,14 +1523,18 @@ void OpenCLBackend::rope(
         POWERSERVE_LOG_ERROR("OpenCL backend not initialized");
         return;
     }
+    if (!m_ggml_fallback) {
+        POWERSERVE_LOG_ERROR("m_ggml_fallback is null (initialize() not called?)");
+        return;
+    }
     if (!out || !src) {
         POWERSERVE_LOG_ERROR("OpenCLBackend::rope got null tensor");
         return;
     }
 
-    // ---- strict dtype/shape ----
+    // strict：先只支持 FP32 + same shape（和你原来一致）
     if (out->m_dtype != DataType::FP32 || src->m_dtype != DataType::FP32) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::rope CPU fallback only supports FP32");
+        POWERSERVE_LOG_ERROR("OpenCLBackend::rope fallback only supports FP32");
         return;
     }
     if (out->m_shape != src->m_shape) {
@@ -1601,106 +1542,21 @@ void OpenCLBackend::rope(
         return;
     }
 
-    // minimal shape contract: {dim, batch, 1, 1}
-    const int dim   = (int)src->m_shape[0];
-    const int ne1   = (int)src->m_shape[1]; // heads
-    const int ne2   = (int)src->m_shape[2]; // tokens/time
-    const int ne3   = (int)src->m_shape[3]; // batch (bring-up：先限制 1)
-
-    if (ne3 != 1) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::rope fallback only supports shape[3]==1 for now, got {}", ne3);
-        return;
-    }
-
-    // 兼容旧测试：如果 shape[2]==1 且 pos.size()==shape[1]，就把 shape[1] 当 token 数
-    const bool legacy_axis1 = (ne2 == 1 && (int)pos.size() == ne1);
-
-    // H = head 数，T = token 数
-    const int H = legacy_axis1 ? 1   : ne1;
-    const int T = legacy_axis1 ? ne1 : ne2;
-
-    if (!legacy_axis1 && (int)pos.size() != T) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::rope pos.size() must equal n_tokens (shape[2]) = {}, got {}",
-                            T, (int)pos.size());
-        return;
-    }
-
-    const int n_dims = rope_cfg.n_dims;
-    if (n_dims <= 0 || (n_dims % 2) != 0 || n_dims > dim) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::rope invalid rope_cfg.n_dims");
-        return;
-    }
-
-    // rope_type: treat -1 as 0
-    const int rope_type = (rope_cfg.rope_type < 0) ? 0 : rope_cfg.rope_type;
-
-    // GGML_ROPE_TYPE_NEOX is commonly 2
-    const bool is_neox = (rope_type & GGML_ROPE_TYPE_NEOX) != 0;
-
-    // ---- D2H src -> host_x ----
+    // 1) D2H: src -> host_x (CPUBuffer)
     Tensor host_x(DataType::FP32, src->m_shape);
     host_x.m_data = powerserve::CPUBuffer::create_buffer<float>(src->m_shape);
     this->copy(&host_x, src);
-    float *x_host = static_cast<float *>(host_x.get<powerserve::CPUBuffer>().m_data);
 
-    // ---- CPU compute -> host_y ----
+    // 2) CPU: 用 GGML 同源实现算 rope
     Tensor host_y(DataType::FP32, out->m_shape);
     host_y.m_data = powerserve::CPUBuffer::create_buffer<float>(out->m_shape);
-    float *y_host = static_cast<float *>(host_y.get<powerserve::CPUBuffer>().m_data);
 
-    // prepare cache for cos/sin (size dim, interleaved cos/sin)
-    std::vector<float> cache((size_t)dim);
-    float corr_dims[2];
-    rope_yarn_corr_dims(n_dims, rope_cfg.n_ctx_orig, rope_cfg.freq_base, rope_cfg.beta_fast, rope_cfg.beta_slow, corr_dims);
+    m_ggml_fallback->rope(&host_y, &host_x, pos, rope_cfg);
 
-    const float theta_scale = std::pow(rope_cfg.freq_base, -2.0f / (float)n_dims);
-    const float sin_sign = 1.0f; // forward only
-
-    for (int t = 0; t < T; ++t) {
-        const float theta_base = (float)pos[t];
-
-        // 每个 token 初始化一次 cache
-        rope_cache_init(theta_base, rope_cfg.freq_scale, /*freq_factors*/nullptr,
-                        corr_dims, (int64_t)dim, rope_cfg.ext_factor, rope_cfg.attn_factor,
-                        cache.data(), sin_sign, theta_scale);
-
-        for (int h = 0; h < H; ++h) {
-            // contiguous layout: ((t * H + h) * dim)
-            const size_t row = ((size_t)t * (size_t)H + (size_t)h) * (size_t)dim;
-            float *x = x_host + row;
-            float *y = y_host + row;
-
-            std::memcpy(y, x, sizeof(float) * (size_t)dim);
-
-            if (!is_neox) {
-                // norm: rotate (i0, i0+1)
-                for (int i0 = 0; i0 < n_dims; i0 += 2) {
-                    const float cos_theta = cache[(size_t)i0 + 0];
-                    const float sin_theta = cache[(size_t)i0 + 1];
-                    const float x0 = x[i0 + 0];
-                    const float x1 = x[i0 + 1];
-                    y[i0 + 0] = x0 * cos_theta - x1 * sin_theta;
-                    y[i0 + 1] = x0 * sin_theta + x1 * cos_theta;
-                }
-            } else {
-                // neox: rotate (ic, ic + n_dims/2)
-                const int half = n_dims / 2;
-                for (int i0 = 0; i0 < n_dims; i0 += 2) {
-                    const int ic = i0 / 2;
-                    const float cos_theta = cache[(size_t)i0 + 0];
-                    const float sin_theta = cache[(size_t)i0 + 1];
-                    const float x0 = x[ic];
-                    const float x1 = x[ic + half];
-                    y[ic]        = x0 * cos_theta - x1 * sin_theta;
-                    y[ic + half] = x0 * sin_theta + x1 * cos_theta;
-                }
-            }
-        }
-    }
-
-    // ---- H2D host_y -> out ----
+    // 3) H2D: host_y -> out
     this->copy(out, &host_y);
 }
+
 
 
 void OpenCLBackend::softmax(const Tensor * /*out*/, const Tensor * /*x*/) const {

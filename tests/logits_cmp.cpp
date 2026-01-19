@@ -37,8 +37,8 @@ static const char *PROMPT      = "你好，请介绍你自己";
 static int N_THREADS     = 8;
 static size_t BATCH_SIZE = 1;
 
-static float ATOL = 1e-3f;
-static float RTOL = 1e-3f;
+static float ATOL = 1e-6f;
+static float RTOL = 1e-6f;
 static int TOPK   = 10;
 
 // ======================
