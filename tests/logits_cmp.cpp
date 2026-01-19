@@ -1,63 +1,40 @@
 // tests/logits_cmp.cpp
 #include "backend/platform.hpp"
 #include "core/logger.hpp"
-#include "core/timer.hpp"
 #include "model/model_loader.hpp"
-#include "tokenizer/tokenizer.hpp"
-#include "core/config.hpp"
 #include "model/module/norm_attention.hpp"
-#include "executor/executor.hpp"
+#include "tokenizer/tokenizer.hpp"
 #include "graph/op_type.hpp"
 #include "core/tensor.hpp"
 
+// IMPORTANT: set_op_after_exec_hook is declared somewhere in your project.
+// If you still see "not declared", grep for set_op_after_exec_hook and include the declaring header.
+// In your earlier build it was reachable via executor headers.
+#include "executor/executor.hpp"
+#include "core/timer.hpp"
+
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <span>
 #include <string>
-#include <vector>
 #include <unordered_map>
 #include <unordered_set>
-#include <span>
+#include <vector>
 
 using namespace powerserve;
 
-static const char *op_type_to_string(OpType t) {
-    switch (t) {
-    case OpType::GET_EMBEDDING: return "GET_EMBEDDING";
-    case OpType::ADD: return "ADD";
-    case OpType::MAT_MUL: return "MAT_MUL";
-    case OpType::RMS_NORM: return "RMS_NORM";
-    case OpType::SILU_HADAMARD: return "SILU_HADAMARD";
-    case OpType::ROPE: return "ROPE";
-    case OpType::SOFTMAX: return "SOFTMAX";
-    case OpType::COPY: return "COPY";
-    case OpType::ADD_CACHE: return "ADD_CACHE";
-    case OpType::PERMUTE: return "PERMUTE";
-    case OpType::CONT: return "CONT";
-    case OpType::VIEW: return "VIEW";
-    case OpType::SOFTMAX_EXT: return "SOFTMAX_EXT";
-    case OpType::GET_MASK: return "GET_MASK";
-    case OpType::TRANSPOSE: return "TRANSPOSE";
-    case OpType::PRINT: return "PRINT";
-#if defined(POWERSERVE_WITH_QNN)
-    case OpType::QNN_FORWARD: return "QNN_FORWARD";
-    case OpType::QNN_FORWARD_VL: return "QNN_FORWARD_VL";
-#endif
-    default: return "UNKNOWN";
-    }
-}
-
 // ======================
-// CONFIG (hard-coded)
+// CONFIG (adjust if needed)
 // ======================
 static const char *MODEL_DIR   = "/home/intern/ziqian/models/qwen2-0.5b-work/qwen2-0.5b-gguf";
 static const char *PROMPT      = "你好，请介绍你自己";
 
-static int MAX_STEPS  = 64;
-static int N_THREADS  = 8;
+static int N_THREADS     = 8;
 static size_t BATCH_SIZE = 1;
 
 static float ATOL = 1e-3f;
@@ -65,17 +42,44 @@ static float RTOL = 1e-3f;
 static int TOPK   = 10;
 
 // ======================
-// helper: allclose + topk
+// Small helpers
 // ======================
+static const char *op_type_to_string(OpType t) {
+    switch (t) {
+    case OpType::GET_EMBEDDING:   return "GET_EMBEDDING";
+    case OpType::ADD:             return "ADD";
+    case OpType::MAT_MUL:         return "MAT_MUL";
+    case OpType::RMS_NORM:        return "RMS_NORM";
+    case OpType::SILU_HADAMARD:   return "SILU_HADAMARD";
+    case OpType::ROPE:            return "ROPE";
+    case OpType::SOFTMAX:         return "SOFTMAX";
+    case OpType::COPY:            return "COPY";
+    case OpType::ADD_CACHE:       return "ADD_CACHE";
+    case OpType::PERMUTE:         return "PERMUTE";
+    case OpType::CONT:            return "CONT";
+    case OpType::VIEW:            return "VIEW";
+    case OpType::SOFTMAX_EXT:     return "SOFTMAX_EXT";
+    case OpType::GET_MASK:        return "GET_MASK";
+    case OpType::TRANSPOSE:       return "TRANSPOSE";
+    case OpType::PRINT:           return "PRINT";
+#if defined(POWERSERVE_WITH_QNN)
+    case OpType::QNN_FORWARD:     return "QNN_FORWARD";
+    case OpType::QNN_FORWARD_VL:  return "QNN_FORWARD_VL";
+#endif
+    default:                      return "UNKNOWN";
+    }
+}
+
 static inline bool allclose_span(std::span<const float> a, std::span<const float> b,
-                                float atol, float rtol, size_t *bad_i=nullptr, float *diff=nullptr) {
+                                float atol, float rtol,
+                                size_t *bad_i=nullptr, float *diff=nullptr) {
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); ++i) {
-        float d = std::fabs(a[i] - b[i]);
+        float d   = std::fabs(a[i] - b[i]);
         float tol = atol + rtol * std::fabs(b[i]);
         if (!(d <= tol)) {
             if (bad_i) *bad_i = i;
-            if (diff) *diff = d;
+            if (diff)  *diff  = d;
             return false;
         }
     }
@@ -85,38 +89,33 @@ static inline bool allclose_span(std::span<const float> a, std::span<const float
 static void dump_topk(std::span<const float> logits, int k, const char *tag) {
     std::vector<int> idx(logits.size());
     for (int i = 0; i < (int)logits.size(); ++i) idx[i] = i;
-    std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
+    std::partial_sort(idx.begin(), idx.begin() + std::min(k, (int)idx.size()), idx.end(),
                       [&](int a, int b) { return logits[a] > logits[b]; });
 
     fmt::print("[{} top{}] ", tag, k);
-    for (int i = 0; i < k; ++i) {
+    for (int i = 0; i < k && i < (int)idx.size(); ++i) {
         int id = idx[i];
         fmt::print("({} {:.6f}) ", id, logits[id]);
     }
     fmt::print("\n");
 }
 
-static int argmax_token(std::span<const float> logits) {
-    return (int)(std::max_element(logits.begin(), logits.end()) - logits.begin());
-}
-
 // ======================
-// f32 tensor dump helpers
+// Tensor -> FP32 vector
 // ======================
 static std::vector<float> tensor_to_f32_vec_cpu(const Tensor *t) {
     std::vector<float> out;
     if (!t || t->m_dtype != DataType::FP32) return out;
     if (!t->m_data) return out;
 
-    auto shape = t->m_shape;
-    size_t n = t->n_elements();
-    out.resize(n);
-
-    auto *base = t->m_data.get();
-    auto *cb = dynamic_cast<CPUBuffer*>(base);
+    auto *cb = dynamic_cast<CPUBuffer*>(t->m_data.get());
     if (!cb) return {};
 
+    auto shape  = t->m_shape;
     auto stride = cb->m_stride;
+
+    size_t n = t->n_elements();
+    out.resize(n);
 
     size_t idx = 0;
     for (size_t i3 = 0; i3 < shape[3]; ++i3) {
@@ -134,6 +133,7 @@ static std::vector<float> tensor_to_f32_vec_cpu(const Tensor *t) {
     return out;
 }
 
+#if defined(POWERSERVE_WITH_OPENCL)
 static std::vector<float> tensor_to_f32_vec_opencl(const Tensor *t, powerserve::opencl::OpenCLBackend *cl_backend) {
     std::vector<float> out;
     if (!t || t->m_dtype != DataType::FP32) return out;
@@ -145,6 +145,7 @@ static std::vector<float> tensor_to_f32_vec_opencl(const Tensor *t, powerserve::
     cl_backend->copy(&tmp_cpu, t);
     return tensor_to_f32_vec_cpu(&tmp_cpu);
 }
+#endif
 
 static std::vector<float> tensor_to_f32_vec_any(const Tensor *t,
                                                 powerserve::opencl::OpenCLBackend *cl_backend) {
@@ -163,7 +164,7 @@ static std::vector<float> tensor_to_f32_vec_any(const Tensor *t,
 }
 
 // ======================
-// NEW: raw bytes signature (for quant weights etc.)
+// Raw bytes signature (for A/B bytes exact compare)
 // ======================
 static inline uint64_t fnv1a64(const void *data, size_t n) {
     const uint8_t *p = (const uint8_t*)data;
@@ -175,32 +176,28 @@ static inline uint64_t fnv1a64(const void *data, size_t n) {
     return h;
 }
 
-// Flatten CPU tensor into contiguous bytes following tensor stride.
-// (We cannot assume contiguous layout.)
 static bool tensor_to_bytes_cpu(const Tensor *t, std::vector<uint8_t> &out_bytes) {
     out_bytes.clear();
     if (!t || !t->m_data) return false;
-    if (!dynamic_cast<CPUBuffer*>(t->m_data.get())) return false;
+    auto *cb = dynamic_cast<CPUBuffer*>(t->m_data.get());
+    if (!cb) return false;
 
     size_t elem_size = powerserve::get_type_size(t->m_dtype);
     if (elem_size == 0) return false;
 
-    auto shape = t->m_shape;
-    size_t n = t->n_elements();
-    size_t nbytes = n * elem_size;
+    size_t nbytes = t->n_elements() * elem_size;
     if (nbytes == 0) return false;
-
     out_bytes.resize(nbytes);
 
-    auto &cb = const_cast<Tensor*>(t)->get<CPUBuffer>();
-    auto stride = cb.m_stride;
+    auto shape  = t->m_shape;
+    auto stride = cb->m_stride;
 
     size_t idx = 0;
     for (size_t i3 = 0; i3 < shape[3]; ++i3) {
         for (size_t i2 = 0; i2 < shape[2]; ++i2) {
             for (size_t i1 = 0; i1 < shape[1]; ++i1) {
                 for (size_t i0 = 0; i0 < shape[0]; ++i0) {
-                    uint8_t *ptr = (uint8_t *)((char *)cb.m_data +
+                    uint8_t *ptr = (uint8_t *)((char *)cb->m_data +
                                                i3 * stride[3] + i2 * stride[2] +
                                                i1 * stride[1] + i0 * stride[0]);
                     std::memcpy(out_bytes.data() + idx, ptr, elem_size);
@@ -209,12 +206,9 @@ static bool tensor_to_bytes_cpu(const Tensor *t, std::vector<uint8_t> &out_bytes
             }
         }
     }
-    POWERSERVE_ASSERT(idx == nbytes);
-    return true;
+    return idx == nbytes;
 }
 
-// Compute signature for ANY tensor (CPU or OpenCL) without modifying backend.
-// For OpenCL tensor: D2H copy into a CPU tensor (same dtype/shape), then flatten bytes by strides.
 static bool tensor_bytes_sig_any(const Tensor *t,
                                 powerserve::opencl::OpenCLBackend *cl_backend,
                                 uint64_t *out_hash4096,
@@ -225,9 +219,6 @@ static bool tensor_bytes_sig_any(const Tensor *t,
     size_t elem_size = powerserve::get_type_size(t->m_dtype);
     if (elem_size == 0) return false;
 
-    size_t nbytes = t->n_elements() * elem_size;
-    if (nbytes == 0) return false;
-
     std::vector<uint8_t> bytes;
 
 #if defined(POWERSERVE_WITH_OPENCL)
@@ -235,7 +226,6 @@ static bool tensor_bytes_sig_any(const Tensor *t,
         POWERSERVE_ASSERT(cl_backend);
 
         Tensor tmp_cpu(t->m_dtype, t->m_shape);
-
         if (elem_size == 4) {
             tmp_cpu.m_data = powerserve::CPUBuffer::create_buffer<uint32_t>(t->m_shape);
         } else if (elem_size == 2) {
@@ -244,9 +234,6 @@ static bool tensor_bytes_sig_any(const Tensor *t,
             tmp_cpu.m_data = powerserve::CPUBuffer::create_buffer<uint8_t>(t->m_shape);
         } else if (elem_size == 8) {
             tmp_cpu.m_data = powerserve::CPUBuffer::create_buffer<uint64_t>(t->m_shape);
-        } else if (elem_size == 16) {
-            struct u128 { uint64_t a,b; };
-            tmp_cpu.m_data = powerserve::CPUBuffer::create_buffer<u128>(t->m_shape);
         } else {
             return false;
         }
@@ -264,13 +251,13 @@ static bool tensor_bytes_sig_any(const Tensor *t,
     size_t hsz = std::min(bytes.size(), (size_t)4096);
     uint64_t h4096 = fnv1a64(bytes.data(), hsz);
     *out_hash4096 = h4096;
-    *out_nbytes = bytes.size();
+    *out_nbytes   = bytes.size();
     if (out_hash_full) *out_hash_full = fnv1a64(bytes.data(), bytes.size());
     return true;
 }
 
 // ======================
-// meta printing
+// Meta printing
 // ======================
 static bool is_opencl_tensor(const Tensor *t) {
 #if defined(POWERSERVE_WITH_OPENCL)
@@ -313,11 +300,6 @@ static void print_tensor_meta(const Tensor *t, const char *tag) {
                tag, (int)t->m_dtype, shape[0], shape[1], shape[2], shape[3]);
 }
 
-static inline uint64_t op_out_key(int op_idx, int out_idx) {
-    return (uint64_t(uint32_t(op_idx)) << 32) | uint32_t(out_idx);
-}
-
-// producer_map 打印版本：额外输出 ptr / is_view / has_data / producer_op
 static void print_tensor_meta2(const Tensor *t, const char *tag,
                                const std::unordered_map<const Tensor*, int> &producer) {
     if (!t) {
@@ -330,12 +312,11 @@ static void print_tensor_meta2(const Tensor *t, const char *tag,
     auto it = producer.find(t);
     int p = (it == producer.end()) ? -1 : it->second;
 
-    bool is_view = (t->m_data == nullptr);
-    bool is_cl = is_opencl_tensor(t);
-
     fmt::print("    ptr={} producer_op={} is_view={} has_data={} {}\n",
-               (const void*)t, p, is_view, (t->m_data != nullptr),
-               is_cl ? "[CL]" : "[CPU]");
+               (const void*)t, p,
+               (t->m_data == nullptr),
+               (t->m_data != nullptr),
+               is_opencl_tensor(t) ? "[CL]" : "[CPU]");
 }
 
 static void dump_f32_sample(const std::vector<float> &v, const char *tag, int n = 8) {
@@ -347,16 +328,21 @@ static void dump_f32_sample(const std::vector<float> &v, const char *tag, int n 
     fmt::print("\n");
 }
 
+static inline uint64_t op_out_key(int op_idx, int out_idx) {
+    return (uint64_t(uint32_t(op_idx)) << 32) | uint32_t(out_idx);
+}
+
+// ======================
+// ULP helpers (strict compare)
+// ======================
 static inline uint32_t f32_to_bits(float x) {
     uint32_t u;
-    memcpy(&u, &x, sizeof(u));
+    std::memcpy(&u, &x, sizeof(u));
     return u;
 }
 
-// Treat floats as signed-magnitude ordered ints for ULP distance
 static inline int32_t f32_to_ordered_int(float x) {
     uint32_t u = f32_to_bits(x);
-    // flip sign bit to make ordering monotonic
     if (u & 0x80000000u) u = 0xFFFFFFFFu - u;
     else u = u + 0x80000000u;
     return (int32_t)u;
@@ -369,7 +355,28 @@ static inline int32_t ulp_dist(float a, float b) {
     return d < 0 ? -d : d;
 }
 
-void dump_vec_diff_stats(const std::vector<float>& gg, const std::vector<float>& oc) {
+static inline bool allclose_ulp_span(std::span<const float> a, std::span<const float> b,
+                                     int32_t max_ulp,
+                                     size_t *bad_i=nullptr,
+                                     float *bad_abs=nullptr,
+                                     int32_t *bad_ulp=nullptr) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        int32_t u = ulp_dist(a[i], b[i]);
+        if (u > max_ulp) {
+            if (bad_i)   *bad_i   = i;
+            if (bad_abs) *bad_abs = std::fabs(a[i] - b[i]);
+            if (bad_ulp) *bad_ulp = u;
+            return false;
+        }
+    }
+    return true;
+}
+
+// ======================
+// Diff stats (for B)
+// ======================
+static void dump_vec_diff_stats(const std::vector<float>& gg, const std::vector<float>& oc) {
     size_t n = std::min(gg.size(), oc.size());
     size_t first_bad = (size_t)-1;
     size_t max_i = 0;
@@ -403,7 +410,6 @@ void dump_vec_diff_stats(const std::vector<float>& gg, const std::vector<float>&
     fmt::print("  [B-diff] max_abs={} at i={} (ggml={} ocl={}) max_ulp={}\n",
                max_abs, max_i, gg[max_i], oc[max_i], max_ulp);
 
-    // optional: print top few largest diffs (simple O(n*k) selection for small k)
     const int K = 8;
     std::array<size_t, K> top_i{};
     std::array<float, K> top_d{};
@@ -412,7 +418,6 @@ void dump_vec_diff_stats(const std::vector<float>& gg, const std::vector<float>&
 
     for (size_t i = 0; i < n; i++) {
         float d = std::fabs(gg[i] - oc[i]);
-        // insert into top-K if bigger
         for (int k = 0; k < K; k++) {
             if (d > top_d[k]) {
                 for (int t = K - 1; t > k; t--) {
@@ -433,11 +438,10 @@ void dump_vec_diff_stats(const std::vector<float>& gg, const std::vector<float>&
     }
 }
 
-
 int main() {
-    POWERSERVE_LOG_INFO("==== Qwen2 logits compare test (ggml vs opencl) [CMP2 + A-sig + B-compare] ====");
+    POWERSERVE_LOG_INFO("==== Qwen2 logits compare test (ggml vs opencl) [offline backtrace ULP=0] ====");
     POWERSERVE_LOG_INFO("PROMPT={}", PROMPT);
-    POWERSERVE_LOG_INFO("MAX_STEPS={}, THREADS={}, BATCH_SIZE={}", MAX_STEPS, N_THREADS, BATCH_SIZE);
+    POWERSERVE_LOG_INFO("THREADS={}, BATCH_SIZE={}", N_THREADS, BATCH_SIZE);
 
 #if !defined(POWERSERVE_WITH_OPENCL)
     POWERSERVE_LOG_ERROR("POWERSERVE_WITH_OPENCL not enabled in compile.");
@@ -445,7 +449,7 @@ int main() {
 #endif
 
     HyperParams hparams;
-    hparams.n_threads = N_THREADS;
+    hparams.n_threads  = N_THREADS;
     hparams.batch_size = BATCH_SIZE;
 
     auto model_ggml = load_model(MODEL_DIR);
@@ -496,31 +500,27 @@ int main() {
     {
         auto mask = CausalAttentionMask(tokens.size());
 
-        // GGML caches:
+        // GGML cached outs (FP32 only)
         std::unordered_map<uint64_t, std::vector<float>> ggml_op_outs;
 
-        // For B compare: cache MAT_MUL input[1] activation (fp32 vector)
-        std::unordered_map<int, std::vector<float>> ggml_matmul_B_vec;
-
-        // For A compare: cache MAT_MUL input[0] signature (raw bytes)
+        // Cache MAT_MUL input[1] activation in GGML (fp32 vector) + signatures
         struct SigRec { uint64_t h4096=0, hfull=0; size_t nbytes=0; bool ok=false; };
+        std::unordered_map<int, std::vector<float>> ggml_matmul_B_vec;
         std::unordered_map<int, SigRec> ggml_matmul_A_sig;
         std::unordered_map<int, SigRec> ggml_matmul_B_sig;
 
         // ---- GGML pass hook ----
         set_op_after_exec_hook([&](int op_idx, const OpNode *op) {
-            // cache all FP32 outs
+            // cache all FP32 outs (useful for backtrace)
             for (int oi = 0; oi < (int)op->next.size(); ++oi) {
                 Tensor *out = op->next[oi]->tensor();
-                if (!out) continue;
-                if (!out->m_data) continue;
+                if (!out || !out->m_data) continue;
                 if (out->m_dtype != DataType::FP32) continue;
                 ggml_op_outs[op_out_key(op_idx, oi)] = tensor_to_f32_vec_cpu(out);
             }
 
-            // cache MAT_MUL inputs
+            // cache MAT_MUL inputs: A/B sig + B vec
             if (op->op == OpType::MAT_MUL) {
-                // A signature
                 if ((int)op->prev.size() > 0) {
                     Tensor *A = op->prev[0]->tensor();
                     SigRec r;
@@ -529,7 +529,6 @@ int main() {
                         ggml_matmul_A_sig[op_idx] = r;
                     }
                 }
-                // B signature
                 if ((int)op->prev.size() > 1) {
                     Tensor *B = op->prev[1]->tensor();
                     SigRec r;
@@ -537,10 +536,6 @@ int main() {
                         r.ok = true;
                         ggml_matmul_B_sig[op_idx] = r;
                     }
-                }
-                // B vector
-                if ((int)op->prev.size() > 1) {
-                    Tensor *B = op->prev[1]->tensor();
                     if (B && B->m_data && B->m_dtype == DataType::FP32) {
                         ggml_matmul_B_vec[op_idx] = tensor_to_f32_vec_cpu(B);
                     }
@@ -556,202 +551,308 @@ int main() {
             platform->get_backend(model_ocl->m_config->model_id));
         POWERSERVE_ASSERT(cl_backend && "OpenCLBackend is null");
 
+        auto &id_g = model_ggml->m_config->model_id;
+        auto *gg_backend = platform->ggml_backends[id_g].get();
+        POWERSERVE_ASSERT(gg_backend && "GGML backend null");
+
+        // Cache OpenCL FP32 outputs for offline backtrace
+        std::unordered_map<uint64_t, std::vector<float>> ocl_op_outs;
+        std::unordered_map<int, const OpNode*> ocl_op_nodes;
+
+        // producer map: Tensor* -> op_idx
         std::unordered_map<const Tensor*, int> producer;
 
-        struct MismatchRecord {
-            int op_idx;
-            int out_idx;
-            size_t bad_i;
-            float ggml_v;
-            float ocl_v;
-            float diff;
-        };
+        // Pick a backtrace input tensor: choose first prev tensor whose producer_op >= 0
+        auto pick_backtrace_input =
+            [&](const OpNode* op, int* out_prod_op_idx, int* out_prev_i) -> const Tensor* {
+                if (out_prod_op_idx) *out_prod_op_idx = -1;
+                if (out_prev_i) *out_prev_i = -1;
+                if (!op) return nullptr;
 
-        std::vector<MismatchRecord> mismatch_chain;
-        std::unordered_set<int> want_check_ops;
-        std::unordered_set<int> visited_backtrace;
-        bool first_mismatch_seen = false;
+                for (int i = 0; i < (int)op->prev.size(); ++i) {
+                    const Tensor* t = op->prev[i] ? op->prev[i]->tensor() : nullptr;
+                    if (!t) continue;
 
-        auto dump_mismatch_detail = [&](int op_idx, const OpNode *op, int out_idx,
-                                        const Tensor *out,
-                                        const std::vector<float> &gg_vec,
-                                        const std::vector<float> &ocl_vec,
-                                        size_t bad_i, float diff) {
-            fmt::print("\n[MISMATCH] op#{} type={} out#{}\n", op_idx, op_type_to_string(op->op), out_idx);
-            fmt::print("  bad_i={} ggml={} ocl={} diff={}\n", bad_i, gg_vec[bad_i], ocl_vec[bad_i], diff);
-
-            print_tensor_meta2(out, "out", producer);
-
-            // print inputs meta
-            for (int pi = 0; pi < (int)op->prev.size(); ++pi) {
-                Tensor *in = op->prev[pi]->tensor();
-                char name[64];
-                std::snprintf(name, sizeof(name), "in[%d]", pi);
-                print_tensor_meta2(in, name, producer);
-
-                if (pi == 1 && in && in->m_dtype == DataType::FP32 && in->m_data) {
-                    // 1) OCL side signature
-                    uint64_t h4096_ocl=0, hfull_ocl=0;
-                    size_t nbytes_ocl=0;
-                    bool ok_ocl = tensor_bytes_sig_any(in, cl_backend, &h4096_ocl, &nbytes_ocl, &hfull_ocl);
-
-                    // 2) GGML cached signature
-                    auto itBsig = ggml_matmul_B_sig.find(op_idx);
-                    bool ok_gg = (itBsig != ggml_matmul_B_sig.end()) && itBsig->second.ok;
-
-                    fmt::print("  [B-sig][OCL ] ok={} nbytes={} hash4096=0x{:016x} hash_full=0x{:016x}\n",
-                            ok_ocl, nbytes_ocl, h4096_ocl, hfull_ocl);
-
-                    if (ok_gg) {
-                        auto &r = itBsig->second;
-                        fmt::print("  [B-sig][GGML] ok={} nbytes={} hash4096=0x{:016x} hash_full=0x{:016x}\n",
-                                r.ok, r.nbytes, r.h4096, r.hfull);
-                        fmt::print("  [B-sig] match={}\n",
-                                (ok_ocl && r.nbytes==nbytes_ocl && r.h4096==h4096_ocl && r.hfull==hfull_ocl));
-                    } else {
-                        fmt::print("  [B-sig][GGML] <missing>\n");
+                    auto it = producer.find(t);
+                    int p = (it == producer.end()) ? -1 : it->second;
+                    if (p >= 0) {
+                        if (out_prod_op_idx) *out_prod_op_idx = p;
+                        if (out_prev_i) *out_prev_i = i;
+                        return t;
                     }
+                }
+                return nullptr;
+            };
 
-                    // 3) (optional) keep your old vector compare, but别用 atol=0/rtol=0 当“是否一致”的结论
-                    auto v_ocl = tensor_to_f32_vec_any(in, cl_backend);
-                    dump_f32_sample(v_ocl, "in[1](activation)", 8);
+        // Detailed mismatch dumper
+        auto dump_mismatch_detail =
+            [&](int op_idx, const OpNode *op, int out_idx,
+                const Tensor *out,
+                const std::vector<float> &gg_vec,
+                const std::vector<float> &ocl_vec,
+                size_t bad_i, float diff) {
 
-                    // ---- B compare (STRICT) ----
-                    auto itB = ggml_matmul_B_vec.find(op_idx);
-                    if (itB != ggml_matmul_B_vec.end()) {
-                        auto &v_gg = itB->second;
-                        size_t badB = 0;
-                        float diffB = 0.f;
-                        bool okB = (v_ocl.size() == v_gg.size()) &&
-                                   allclose_span(v_ocl, v_gg, /*atol*/0.f, /*rtol*/0.f, &badB, &diffB);
-                        fmt::print("  [B-compare] size_ocl={} size_ggml={} match={}\n",
-                                   v_ocl.size(), v_gg.size(), okB);
-                        dump_vec_diff_stats(v_gg, v_ocl);
-                        if (!okB && !v_ocl.empty() && badB < v_ocl.size()) {
-                            fmt::print("    bad_i={} ggml={} ocl={} diff={}\n",
-                                       badB, v_gg[badB], v_ocl[badB], std::fabs(v_gg[badB]-v_ocl[badB]));
+                fmt::print("\n[MISMATCH] op#{} type={} out#{}\n", op_idx, op_type_to_string(op->op), out_idx);
+                fmt::print("  bad_i={} ggml={} ocl={} diff={}\n", bad_i, gg_vec[bad_i], ocl_vec[bad_i], diff);
+                print_tensor_meta2(out, "out", producer);
+
+                // print inputs
+                for (int pi = 0; pi < (int)op->prev.size(); ++pi) {
+                    Tensor *in = op->prev[pi]->tensor();
+                    char name[64];
+                    std::snprintf(name, sizeof(name), "in[%d]", pi);
+                    print_tensor_meta2(in, name, producer);
+                }
+
+                // print chosen trace input (for understanding backtrace path)
+                {
+                    int p = -1, prev_i = -1;
+                    pick_backtrace_input(op, &p, &prev_i);
+                    fmt::print("  ==> trace_input = in[{}], producer_op = {}\n", prev_i, p);
+                }
+
+                // only do the heavy B/A diagnostics for MAT_MUL (avoid noise in backtrace)
+                if (op->op == OpType::MAT_MUL && (int)op->prev.size() > 1) {
+                    Tensor *B_in = op->prev[1]->tensor();
+                    if (B_in && B_in->m_dtype == DataType::FP32 && B_in->m_data) {
+                        // B signature compare (bytes)
+                        uint64_t h4096_ocl=0, hfull_ocl=0;
+                        size_t nbytes_ocl=0;
+                        bool ok_ocl_sig = tensor_bytes_sig_any(B_in, cl_backend, &h4096_ocl, &nbytes_ocl, &hfull_ocl);
+
+                        auto itBsig = ggml_matmul_B_sig.find(op_idx);
+                        bool ok_gg_sig = (itBsig != ggml_matmul_B_sig.end()) && itBsig->second.ok;
+
+                        fmt::print("  [B-sig][OCL ] ok={} nbytes={} hash4096=0x{:016x} hash_full=0x{:016x}\n",
+                                   ok_ocl_sig, nbytes_ocl, h4096_ocl, hfull_ocl);
+                        if (ok_gg_sig) {
+                            auto &r = itBsig->second;
+                            fmt::print("  [B-sig][GGML] ok={} nbytes={} hash4096=0x{:016x} hash_full=0x{:016x}\n",
+                                       r.ok, r.nbytes, r.h4096, r.hfull);
+                            fmt::print("  [B-sig] match={}\n",
+                                       (ok_ocl_sig && r.nbytes==nbytes_ocl && r.h4096==h4096_ocl && r.hfull==hfull_ocl));
+                        } else {
+                            fmt::print("  [B-sig][GGML] <missing>\n");
                         }
+
+                        // B value compare (vector)
+                        auto v_ocl = tensor_to_f32_vec_any(B_in, cl_backend);
+                        dump_f32_sample(v_ocl, "in[1](activation)", 8);
+
+                        auto itB = ggml_matmul_B_vec.find(op_idx);
+                        if (itB != ggml_matmul_B_vec.end()) {
+                            auto &v_gg = itB->second;
+                            size_t badB = 0;
+                            float diffB = 0.f;
+                            bool okB = (v_ocl.size() == v_gg.size()) &&
+                                       allclose_span(v_ocl, v_gg, /*atol*/0.f, /*rtol*/0.f, &badB, &diffB);
+
+                            fmt::print("  [B-compare] size_ocl={} size_ggml={} match={}\n",
+                                       v_ocl.size(), v_gg.size(), okB);
+                            dump_vec_diff_stats(v_gg, v_ocl);
+
+                            // column-specific stats for the output's bad column (out is [K,N])
+                            if (out && out->m_shape[0] > 0 && out->m_shape[1] > 0) {
+                                size_t K = out->m_shape[0];
+                                size_t N = out->m_shape[1];
+                                size_t col = bad_i / K;
+                                if (col < N && v_gg.size() == v_ocl.size() && v_gg.size() == K * N) {
+                                    float max_abs_col = 0.f;
+                                    size_t max_k = 0;
+                                    size_t cnt_nz_col = 0;
+                                    for (size_t k = 0; k < K; k++) {
+                                        size_t idx = k + col * K;
+                                        float dcol = std::fabs(v_gg[idx] - v_ocl[idx]);
+                                        if (dcol != 0.f) cnt_nz_col++;
+                                        if (dcol > max_abs_col) { max_abs_col = dcol; max_k = k; }
+                                    }
+                                    fmt::print("  [B-col] col={} cnt_nonzero={} max_abs={} at k={} (ggml={} ocl={})\n",
+                                               col, cnt_nz_col, max_abs_col, max_k,
+                                               v_gg[max_k + col * K], v_ocl[max_k + col * K]);
+                                }
+                            }
+
+                            if (!okB && !v_ocl.empty() && badB < v_ocl.size()) {
+                                fmt::print("    bad_i={} ggml={} ocl={} diff={}\n",
+                                           badB, v_gg[badB], v_ocl[badB], std::fabs(v_gg[badB]-v_ocl[badB]));
+                            }
+                        } else {
+                            fmt::print("  [B-compare] <missing ggml cached B>\n");
+                        }
+                    }
+
+                    // A signature compare
+                    Tensor *A_in = op->prev[0]->tensor();
+                    uint64_t h4096_A=0, hfull_A=0;
+                    size_t nbytes_A=0;
+                    bool okA = tensor_bytes_sig_any(A_in, cl_backend, &h4096_A, &nbytes_A, &hfull_A);
+                    fmt::print("  [A-sig][OCL ] ok={} nbytes={} hash4096=0x{:016x} hash_full=0x{:016x}\n",
+                               okA, nbytes_A, h4096_A, hfull_A);
+
+                    auto itAsig = ggml_matmul_A_sig.find(op_idx);
+                    if (itAsig != ggml_matmul_A_sig.end() && itAsig->second.ok) {
+                        auto &r = itAsig->second;
+                        fmt::print("  [A-sig][GGML] nbytes={} hash4096=0x{:016x} hash_full=0x{:016x}\n",
+                                   r.nbytes, r.h4096, r.hfull);
+                        bool matchA = okA && (r.nbytes == nbytes_A) && (r.h4096 == h4096_A) && (r.hfull == hfull_A);
+                        fmt::print("  [A-sig] match={}\n", matchA);
                     } else {
-                        fmt::print("  [B-compare] <missing ggml cached B>\n");
+                        fmt::print("  [A-sig][GGML] <missing>\n");
+                    }
+
+                    // EXP1: recompute GGML matmul using B read back from OpenCL
+                    Tensor *A_in2 = op->prev[0]->tensor();
+                    Tensor *B_in2 = op->prev[1]->tensor();
+                    if (out && out->m_dtype == DataType::FP32 && A_in2 && B_in2 &&
+                        A_in2->m_data && B_in2->m_data && B_in2->m_dtype == DataType::FP32) {
+
+                        Tensor B_cpu(DataType::FP32, B_in2->m_shape);
+                        B_cpu.m_data = powerserve::CPUBuffer::create_buffer<float>(B_in2->m_shape);
+                        cl_backend->copy(&B_cpu, B_in2);
+
+                        Tensor C_cpu(DataType::FP32, out->m_shape);
+                        C_cpu.m_data = powerserve::CPUBuffer::create_buffer<float>(out->m_shape);
+
+                        gg_backend->matmul(&C_cpu, A_in2, &B_cpu);
+
+                        auto gg_re = tensor_to_f32_vec_cpu(&C_cpu);
+                        if (!gg_re.empty() && gg_re.size() == ocl_vec.size()) {
+                            size_t bad2 = 0;
+                            float diff2 = 0.f;
+                            bool ok2 = allclose_span(gg_re, ocl_vec, /*atol*/0.f, /*rtol*/0.f, &bad2, &diff2);
+                            fmt::print("  [MATMUL-RE] ggml(A, B_ocl) vs ocl_out match={} bad_i={} ggml_re={} ocl={} diff={}\n",
+                                       ok2, bad2, gg_re[bad2], ocl_vec[bad2], diff2);
+                        } else {
+                            fmt::print("  [MATMUL-RE] skip (size gg_re={} ocl_vec={})\n", gg_re.size(), ocl_vec.size());
+                        }
                     }
                 }
-            }
+            };
 
-            // activation producer
-            if ((int)op->prev.size() > 1) {
-                Tensor *act = op->prev[1]->tensor();
-                if (act) {
-                    auto itp = producer.find(act);
-                    int p = (itp == producer.end()) ? -1 : itp->second;
-                    fmt::print("  ==> activation producer_op = {}\n", p);
+        // Offline strict backtrace along chosen producer chain using cached outputs (ULP=0)
+        auto backtrace_chain = [&](int start_op_idx) {
+            fmt::print("\n========== Strict Divergence Backtrace (ULP=0) ==========\n");
+
+            int cur = start_op_idx;
+            std::unordered_set<int> seen;
+
+            while (true) {
+                if (seen.count(cur)) break;
+                seen.insert(cur);
+
+                auto itop = ocl_op_nodes.find(cur);
+                const OpNode *cur_op = (itop == ocl_op_nodes.end()) ? nullptr : itop->second;
+                if (!cur_op) {
+                    fmt::print("  [BT] op#{}: missing op node, stop.\n", cur);
+                    break;
                 }
-            }
 
-            // ---- A signature compare (quant weight) ----
-            if (op->op == OpType::MAT_MUL && (int)op->prev.size() > 0) {
-                Tensor *A_ocl = op->prev[0]->tensor();
-                uint64_t h4096_ocl = 0, hfull_ocl = 0;
-                size_t nbytes_ocl = 0;
-                bool ok_ocl = tensor_bytes_sig_any(A_ocl, cl_backend, &h4096_ocl, &nbytes_ocl, &hfull_ocl);
-
-                fmt::print("  [A-sig][OCL ] ok={} nbytes={} hash4096=0x{:016x} hash_full=0x{:016x}\n",
-                           ok_ocl, nbytes_ocl, h4096_ocl, hfull_ocl);
-
-                auto itg = ggml_matmul_A_sig.find(op_idx);
-                if (itg != ggml_matmul_A_sig.end() && itg->second.ok) {
-                    auto &r = itg->second;
-                    fmt::print("  [A-sig][GGML] nbytes={} hash4096=0x{:016x} hash_full=0x{:016x}\n",
-                               r.nbytes, r.h4096, r.hfull);
-                    bool match = ok_ocl && (r.nbytes == nbytes_ocl) && (r.h4096 == h4096_ocl) && (r.hfull == hfull_ocl);
-                    fmt::print("  [A-sig] match={}\n", match);
-                } else {
-                    fmt::print("  [A-sig][GGML] <missing>\n");
+                int p = -1, prev_i = -1;
+                const Tensor* t_trace = pick_backtrace_input(cur_op, &p, &prev_i);
+                if (!t_trace || p < 0) {
+                    fmt::print("  [BT] op#{} type={} no traceable input (all producers <0), stop.\n",
+                               cur, op_type_to_string(cur_op->op));
+                    break;
                 }
+
+                auto itg = ggml_op_outs.find(op_out_key(p, 0));
+                auto ito = ocl_op_outs.find(op_out_key(p, 0));
+                auto itpnode = ocl_op_nodes.find(p);
+                const OpNode *pnode = (itpnode == ocl_op_nodes.end()) ? nullptr : itpnode->second;
+
+                if (itg == ggml_op_outs.end() || ito == ocl_op_outs.end() || !pnode) {
+                    fmt::print("  [BT] producer op#{} missing cached out0/opnode (ggml:{} ocl:{} node:{}), stop.\n",
+                               p,
+                               itg != ggml_op_outs.end(),
+                               ito != ocl_op_outs.end(),
+                               pnode != nullptr);
+                    break;
+                }
+
+                size_t bad_i = 0;
+                float bad_abs = 0.f;
+                int32_t bad_ulp = 0;
+
+                bool ok = allclose_ulp_span(ito->second, itg->second, /*max_ulp*/0, &bad_i, &bad_abs, &bad_ulp);
+                if (ok) {
+                    fmt::print("  [BT] producer op#{} type={} via prev[{}] out0 matches exactly (ULP=0). stop.\n",
+                               p, op_type_to_string(pnode->op), prev_i);
+                    break;
+                }
+
+                fmt::print("  [BT] MISMATCH at producer op#{} type={} via prev[{}] bad_i={} ocl={} ggml={} abs={} ulp={}\n",
+                           p, op_type_to_string(pnode->op), prev_i,
+                           bad_i, ito->second[bad_i], itg->second[bad_i], bad_abs, bad_ulp);
+
+                Tensor *p_out = nullptr;
+                if ((int)pnode->next.size() > 0) p_out = pnode->next[0]->tensor();
+                if (p_out) {
+                    dump_mismatch_detail(p, pnode, 0, p_out, itg->second, ito->second, bad_i, bad_abs);
+                }
+
+                cur = p;
             }
+
+            fmt::print("========================================================\n");
         };
 
-        auto schedule_activation_producer = [&](int op_idx, const OpNode *op) {
-            if ((int)op->prev.size() <= 1) return;
-            Tensor *act = op->prev[1]->tensor();
-            if (!act) return;
-
-            auto itp = producer.find(act);
-            int p = (itp == producer.end()) ? -1 : itp->second;
-            if (p < 0) return;
-            if (p == op_idx) return;
-
-            if (visited_backtrace.count(p)) return;
-            visited_backtrace.insert(p);
-            want_check_ops.insert(p);
-        };
-
+        // compare current op out0 against GGML cached out0 using ATOL/RTOL (fast trigger)
         auto compare_out0 = [&](int op_idx, const OpNode *op) -> bool {
             if ((int)op->next.size() <= 0) return true;
             Tensor *out = op->next[0]->tensor();
-            if (!out) return true;
-            if (!out->m_data) return true;
+            if (!out || !out->m_data) return true;
             if (out->m_dtype != DataType::FP32) return true;
 
-            auto it = ggml_op_outs.find(op_out_key(op_idx, 0));
-            if (it == ggml_op_outs.end()) return true;
+            auto itg = ggml_op_outs.find(op_out_key(op_idx, 0));
+            if (itg == ggml_op_outs.end()) return true;
 
             auto ocl_vec = tensor_to_f32_vec_any(out, cl_backend);
-            auto &gg_vec = it->second;
+            auto &gg_vec = itg->second;
 
             if (ocl_vec.size() != gg_vec.size()) {
                 fmt::print("\n[MISMATCH] op#{} type={} out#0 size mismatch ocl={} ggml={}\n",
                            op_idx, op_type_to_string(op->op), ocl_vec.size(), gg_vec.size());
                 print_tensor_meta2(out, "out", producer);
-                return false;
+                backtrace_chain(op_idx);
+                std::exit(1);
             }
 
             size_t bad_i = 0;
             float diff = 0.f;
             if (!allclose_span(ocl_vec, gg_vec, ATOL, RTOL, &bad_i, &diff)) {
-                mismatch_chain.push_back({op_idx, 0, bad_i, gg_vec[bad_i], ocl_vec[bad_i], diff});
                 dump_mismatch_detail(op_idx, op, 0, out, gg_vec, ocl_vec, bad_i, diff);
-                schedule_activation_producer(op_idx, op);
-                return false;
+                backtrace_chain(op_idx);
+                std::exit(1);
             }
             return true;
         };
 
+        // ---- OpenCL pass hook ----
         set_op_after_exec_hook([&](int op_idx, const OpNode *op) {
+            ocl_op_nodes[op_idx] = op;
+
             // build producer mapping
             for (int oi2 = 0; oi2 < (int)op->next.size(); ++oi2) {
                 Tensor *o2 = op->next[oi2]->tensor();
                 if (o2 && producer.find(o2) == producer.end()) producer[o2] = op_idx;
             }
 
-            if (!first_mismatch_seen) {
-                bool ok = compare_out0(op_idx, op);
-                if (!ok) {
-                    first_mismatch_seen = true;
-                    visited_backtrace.insert(op_idx);
-                }
-            } else {
-                if (want_check_ops.count(op_idx)) {
-                    want_check_ops.erase(op_idx);
-                    compare_out0(op_idx, op);
-                }
+            // cache all FP32 outputs for offline backtrace
+            for (int oi = 0; oi < (int)op->next.size(); ++oi) {
+                Tensor *out = op->next[oi]->tensor();
+                if (!out || !out->m_data) continue;
+                if (out->m_dtype != DataType::FP32) continue;
+                ocl_op_outs[op_out_key(op_idx, oi)] = tensor_to_f32_vec_any(out, cl_backend);
             }
 
-            if (first_mismatch_seen && want_check_ops.empty()) {
-                fmt::print("\n========== Divergence Backtrace Summary ==========\n");
-                for (size_t i = 0; i < mismatch_chain.size(); ++i) {
-                    auto &r = mismatch_chain[i];
-                    fmt::print("  [{}] op#{} out#{} bad_i={} ggml={} ocl={} diff={}\n",
-                               i, r.op_idx, r.out_idx, r.bad_i, r.ggml_v, r.ocl_v, r.diff);
-                }
-                fmt::print("=================================================\n");
-                std::exit(1);
-            }
+            // live compare (fast trigger)
+            compare_out0(op_idx, op);
         });
 
         auto ret_o = model_ocl->forward(tokens, pos, mask, true);
         set_op_after_exec_hook(nullptr);
 
-        // end-to-end logits compare (optional)
+        // end-to-end logits compare
         auto lg = ret_g.logits_vector.back();
         auto lo = ret_o.logits_vector.back();
         size_t bad_i = 0;
@@ -766,41 +867,6 @@ int main() {
 
         POWERSERVE_LOG_INFO("Prefill per-op compare PASS");
     }
-
-    // =========================
-    // DECODE loop compare
-    // =========================
-    // for (int step = 0; step < MAX_STEPS; ++step) {
-    //     std::vector<Token> one_tok = { tokens.back() };
-    //     std::vector<int> one_pos   = { (int)(tokens.size() - 1) };
-    //     auto mask = CausalAttentionMask(tokens.size());
-
-    //     auto ret_g = model_ggml->forward(one_tok, one_pos, mask, true);
-    //     auto ret_o = model_ocl->forward(one_tok, one_pos, mask, true);
-
-    //     auto lg = ret_g.logits_vector.back();
-    //     auto lo = ret_o.logits_vector.back();
-
-    //     size_t bad_i = 0;
-    //     float diff = 0;
-    //     if (!allclose_span(lo, lg, ATOL, RTOL, &bad_i, &diff)) {
-    //         fmt::print("STEP {} logits mismatch: bad_i={}, ocl={}, ggml={}, diff={}\n",
-    //                    step, bad_i, lo[bad_i], lg[bad_i], diff);
-    //         dump_topk(lg, TOPK, "ggml");
-    //         dump_topk(lo, TOPK, "opencl");
-    //         return 1;
-    //     }
-
-    //     int next = argmax_token(lg);
-    //     tokens.push_back(next);
-
-    //     if (next == tokenizer.bos_token() || tokenizer.should_stop(next)) {
-    //         POWERSERVE_LOG_INFO("Stop at step {} (token={})", step, next);
-    //         break;
-    //     }
-    // }
-
-    // POWERSERVE_LOG_INFO("All steps PASS: logits match within atol={} rtol={}", ATOL, RTOL);
 
     platform->ggml_backends[model_ggml->m_config->model_id]->reset_threadpool();
     platform->ggml_backends[model_ocl->m_config->model_id]->reset_threadpool();
