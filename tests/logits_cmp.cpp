@@ -347,6 +347,93 @@ static void dump_f32_sample(const std::vector<float> &v, const char *tag, int n 
     fmt::print("\n");
 }
 
+static inline uint32_t f32_to_bits(float x) {
+    uint32_t u;
+    memcpy(&u, &x, sizeof(u));
+    return u;
+}
+
+// Treat floats as signed-magnitude ordered ints for ULP distance
+static inline int32_t f32_to_ordered_int(float x) {
+    uint32_t u = f32_to_bits(x);
+    // flip sign bit to make ordering monotonic
+    if (u & 0x80000000u) u = 0xFFFFFFFFu - u;
+    else u = u + 0x80000000u;
+    return (int32_t)u;
+}
+
+static inline int32_t ulp_dist(float a, float b) {
+    int32_t ia = f32_to_ordered_int(a);
+    int32_t ib = f32_to_ordered_int(b);
+    int32_t d = ia - ib;
+    return d < 0 ? -d : d;
+}
+
+void dump_vec_diff_stats(const std::vector<float>& gg, const std::vector<float>& oc) {
+    size_t n = std::min(gg.size(), oc.size());
+    size_t first_bad = (size_t)-1;
+    size_t max_i = 0;
+    float max_abs = 0.f;
+    int32_t max_ulp = 0;
+    size_t cnt_nonzero = 0;
+    size_t cnt_gt_1e7 = 0; // >1e-7
+    size_t cnt_gt_1e6 = 0; // >1e-6
+    size_t cnt_gt_1e5 = 0; // >1e-5
+
+    for (size_t i = 0; i < n; i++) {
+        float d = std::fabs(gg[i] - oc[i]);
+        if (d != 0.f) {
+            if (first_bad == (size_t)-1) first_bad = i;
+            cnt_nonzero++;
+            if (d > 1e-7f) cnt_gt_1e7++;
+            if (d > 1e-6f) cnt_gt_1e6++;
+            if (d > 1e-5f) cnt_gt_1e5++;
+        }
+        if (d > max_abs) {
+            max_abs = d;
+            max_i = i;
+        }
+        int32_t u = ulp_dist(gg[i], oc[i]);
+        if (u > max_ulp) max_ulp = u;
+    }
+
+    fmt::print("  [B-diff] n={} first_bad={} cnt_nonzero={} >1e-7:{} >1e-6:{} >1e-5:{}\n",
+               n, first_bad == (size_t)-1 ? 0 : first_bad, cnt_nonzero,
+               cnt_gt_1e7, cnt_gt_1e6, cnt_gt_1e5);
+    fmt::print("  [B-diff] max_abs={} at i={} (ggml={} ocl={}) max_ulp={}\n",
+               max_abs, max_i, gg[max_i], oc[max_i], max_ulp);
+
+    // optional: print top few largest diffs (simple O(n*k) selection for small k)
+    const int K = 8;
+    std::array<size_t, K> top_i{};
+    std::array<float, K> top_d{};
+    top_d.fill(-1.f);
+    top_i.fill(0);
+
+    for (size_t i = 0; i < n; i++) {
+        float d = std::fabs(gg[i] - oc[i]);
+        // insert into top-K if bigger
+        for (int k = 0; k < K; k++) {
+            if (d > top_d[k]) {
+                for (int t = K - 1; t > k; t--) {
+                    top_d[t] = top_d[t - 1];
+                    top_i[t] = top_i[t - 1];
+                }
+                top_d[k] = d;
+                top_i[k] = i;
+                break;
+            }
+        }
+    }
+    fmt::print("  [B-diff] top{}:\n", K);
+    for (int k = 0; k < K; k++) {
+        size_t i = top_i[k];
+        fmt::print("    i={} diff={} ggml={} ocl={} ulp={}\n",
+                   i, top_d[k], gg[i], oc[i], ulp_dist(gg[i], oc[i]));
+    }
+}
+
+
 int main() {
     POWERSERVE_LOG_INFO("==== Qwen2 logits compare test (ggml vs opencl) [CMP2 + A-sig + B-compare] ====");
     POWERSERVE_LOG_INFO("PROMPT={}", PROMPT);
@@ -418,6 +505,7 @@ int main() {
         // For A compare: cache MAT_MUL input[0] signature (raw bytes)
         struct SigRec { uint64_t h4096=0, hfull=0; size_t nbytes=0; bool ok=false; };
         std::unordered_map<int, SigRec> ggml_matmul_A_sig;
+        std::unordered_map<int, SigRec> ggml_matmul_B_sig;
 
         // ---- GGML pass hook ----
         set_op_after_exec_hook([&](int op_idx, const OpNode *op) {
@@ -439,6 +527,15 @@ int main() {
                     if (tensor_bytes_sig_any(A, /*cl_backend*/nullptr, &r.h4096, &r.nbytes, &r.hfull)) {
                         r.ok = true;
                         ggml_matmul_A_sig[op_idx] = r;
+                    }
+                }
+                // B signature
+                if ((int)op->prev.size() > 1) {
+                    Tensor *B = op->prev[1]->tensor();
+                    SigRec r;
+                    if (tensor_bytes_sig_any(B, /*cl_backend*/nullptr, &r.h4096, &r.nbytes, &r.hfull)) {
+                        r.ok = true;
+                        ggml_matmul_B_sig[op_idx] = r;
                     }
                 }
                 // B vector
@@ -493,6 +590,29 @@ int main() {
                 print_tensor_meta2(in, name, producer);
 
                 if (pi == 1 && in && in->m_dtype == DataType::FP32 && in->m_data) {
+                    // 1) OCL side signature
+                    uint64_t h4096_ocl=0, hfull_ocl=0;
+                    size_t nbytes_ocl=0;
+                    bool ok_ocl = tensor_bytes_sig_any(in, cl_backend, &h4096_ocl, &nbytes_ocl, &hfull_ocl);
+
+                    // 2) GGML cached signature
+                    auto itBsig = ggml_matmul_B_sig.find(op_idx);
+                    bool ok_gg = (itBsig != ggml_matmul_B_sig.end()) && itBsig->second.ok;
+
+                    fmt::print("  [B-sig][OCL ] ok={} nbytes={} hash4096=0x{:016x} hash_full=0x{:016x}\n",
+                            ok_ocl, nbytes_ocl, h4096_ocl, hfull_ocl);
+
+                    if (ok_gg) {
+                        auto &r = itBsig->second;
+                        fmt::print("  [B-sig][GGML] ok={} nbytes={} hash4096=0x{:016x} hash_full=0x{:016x}\n",
+                                r.ok, r.nbytes, r.h4096, r.hfull);
+                        fmt::print("  [B-sig] match={}\n",
+                                (ok_ocl && r.nbytes==nbytes_ocl && r.h4096==h4096_ocl && r.hfull==hfull_ocl));
+                    } else {
+                        fmt::print("  [B-sig][GGML] <missing>\n");
+                    }
+
+                    // 3) (optional) keep your old vector compare, but别用 atol=0/rtol=0 当“是否一致”的结论
                     auto v_ocl = tensor_to_f32_vec_any(in, cl_backend);
                     dump_f32_sample(v_ocl, "in[1](activation)", 8);
 
@@ -506,6 +626,7 @@ int main() {
                                    allclose_span(v_ocl, v_gg, /*atol*/0.f, /*rtol*/0.f, &badB, &diffB);
                         fmt::print("  [B-compare] size_ocl={} size_ggml={} match={}\n",
                                    v_ocl.size(), v_gg.size(), okB);
+                        dump_vec_diff_stats(v_gg, v_ocl);
                         if (!okB && !v_ocl.empty() && badB < v_ocl.size()) {
                             fmt::print("    bad_i={} ggml={} ocl={} diff={}\n",
                                        badB, v_gg[badB], v_ocl[badB], std::fabs(v_gg[badB]-v_ocl[badB]));
