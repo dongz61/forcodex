@@ -1700,69 +1700,63 @@ void OpenCLBackend::silu_hadamard(const Tensor * out,
                                  const Tensor * hb,
                                  const Tensor * hb2) const {
     if (!initialized) {
-        POWERSERVE_LOG_ERROR("OpenCL backend not initialized");
-        return;
+        POWERSERVE_ABORT("OpenCL backend not initialized");
     }
-
     if (!out || !hb || !hb2) {
-        POWERSERVE_LOG_ERROR("silu_hadamard got null tensor");
-        return;
+        POWERSERVE_ABORT("silu_hadamard got null tensor");
     }
 
-    // minimal: FP32 + same-shape + contiguous-only by convention
+    // dtype hard constraint (minimal kernel)
     if (out->m_dtype != DataType::FP32 ||
         hb->m_dtype  != DataType::FP32 ||
         hb2->m_dtype != DataType::FP32) {
-        POWERSERVE_LOG_ERROR("silu_hadamard minimal only supports FP32");
-        return;
+        POWERSERVE_ABORT("silu_hadamard only supports FP32");
     }
 
+    // shape hard constraint
     if (out->m_shape != hb->m_shape || out->m_shape != hb2->m_shape) {
-        POWERSERVE_LOG_ERROR("silu_hadamard requires same shape");
-        return;
+        POWERSERVE_ABORT("silu_hadamard requires same shape");
     }
+
+    // ---- NEW: layout hard constraints (match GGML preconditions) ----
+    // 1) contiguous
+    POWERSERVE_ASSERT(is_contiguous(out, 0));
+    POWERSERVE_ASSERT(is_contiguous(hb, 0));
+    POWERSERVE_ASSERT(is_contiguous(hb2, 0));
 
     const size_t n = out->n_elements();
     if (n == 0) return;
 
-    cl_mem a = nullptr;   // hb
-    cl_mem b = nullptr;   // hb2
-    cl_mem o = nullptr;   // out
+    cl_mem a = nullptr;
+    cl_mem b = nullptr;
+    cl_mem o = nullptr;
     try {
         a = hb ->get<OpenCLBuffer>().get_device_buffer();
         b = hb2->get<OpenCLBuffer>().get_device_buffer();
         o = out->get<OpenCLBuffer>().get_device_buffer();
     } catch (const std::bad_cast & e) {
-        POWERSERVE_LOG_ERROR("silu_hadamard expects OpenCLBuffer: {}", e.what());
-        return;
+        POWERSERVE_ABORT("silu_hadamard expects OpenCLBuffer: {}", e.what());
     }
 
     if (!a || !b || !o) {
-        POWERSERVE_LOG_ERROR("silu_hadamard invalid cl_mem");
-        return;
+        POWERSERVE_ABORT("silu_hadamard invalid cl_mem");
     }
 
     cl_kernel kernel = kernel_manager->get_kernel("kernel_silu_hadamard_contig_f32");
     if (!kernel) {
-        POWERSERVE_LOG_ERROR("kernel not found: kernel_silu_hadamard_contig_f32");
-        return;
+        POWERSERVE_ABORT("kernel not found: kernel_silu_hadamard_contig_f32");
     }
 
     cl_int err = CL_SUCCESS;
     cl_uint idx = 0;
-    const int n_i = static_cast<int>(n);
 
-    err = clSetKernelArg(kernel, idx++, sizeof(cl_mem), &a);
-    if (err != CL_SUCCESS) { POWERSERVE_LOG_ERROR("set arg hb failed"); return; }
+    // also consider uint to avoid int overflow long term
+    const cl_uint n_u = (cl_uint)n;
 
-    err = clSetKernelArg(kernel, idx++, sizeof(cl_mem), &b);
-    if (err != CL_SUCCESS) { POWERSERVE_LOG_ERROR("set arg hb2 failed"); return; }
-
-    err = clSetKernelArg(kernel, idx++, sizeof(cl_mem), &o);
-    if (err != CL_SUCCESS) { POWERSERVE_LOG_ERROR("set arg out failed"); return; }
-
-    err = clSetKernelArg(kernel, idx++, sizeof(int), &n_i);
-    if (err != CL_SUCCESS) { POWERSERVE_LOG_ERROR("set arg n failed"); return; }
+    err = clSetKernelArg(kernel, idx++, sizeof(cl_mem), &a); if (err != CL_SUCCESS) POWERSERVE_ABORT("set arg hb failed");
+    err = clSetKernelArg(kernel, idx++, sizeof(cl_mem), &b); if (err != CL_SUCCESS) POWERSERVE_ABORT("set arg hb2 failed");
+    err = clSetKernelArg(kernel, idx++, sizeof(cl_mem), &o); if (err != CL_SUCCESS) POWERSERVE_ABORT("set arg out failed");
+    err = clSetKernelArg(kernel, idx++, sizeof(cl_uint), &n_u); if (err != CL_SUCCESS) POWERSERVE_ABORT("set arg n failed");
 
     const size_t local = 256;
     const size_t global = round_up(n, local);
@@ -1770,13 +1764,12 @@ void OpenCLBackend::silu_hadamard(const Tensor * out,
     cl_command_queue q = context->get_queue();
     err = clEnqueueNDRangeKernel(q, kernel, 1, nullptr, &global, &local, 0, nullptr, nullptr);
     if (err != CL_SUCCESS) {
-        POWERSERVE_LOG_ERROR("clEnqueueNDRangeKernel failed: {}", context->get_error_string(err));
-        return;
+        POWERSERVE_ABORT("clEnqueueNDRangeKernel failed: {}", context->get_error_string(err));
     }
 
     err = clFinish(q);
     if (err != CL_SUCCESS) {
-        POWERSERVE_LOG_WARN("clFinish failed: {}", context->get_error_string(err));
+        POWERSERVE_ABORT("clFinish failed: {}", context->get_error_string(err));
     }
 }
 

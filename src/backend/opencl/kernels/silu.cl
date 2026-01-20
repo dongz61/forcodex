@@ -30,19 +30,27 @@ kernel void kernel_silu_4(
 }
 
 inline float sigmoid_f32(float x) {
-    return 1.0f / (1.0f + exp(-x));
+    // numerically stable sigmoid
+    if (x >= 0.0f) {
+        float z = exp(-x);
+        return 1.0f / (1.0f + z);
+    } else {
+        float z = exp(x);
+        return z / (1.0f + z);
+    }
 }
 
-kernel void kernel_silu_hadamard_contig_f32(
-    __global const float * hb,
-    __global const float * hb2,
-    __global float * out,
+__kernel void kernel_silu_hadamard_contig_f32(
+    __global const float *hb,
+    __global const float *hb2,
+    __global float *out,
     int n
 ) {
-    int gid = get_global_id(0);
+    int gid = (int)get_global_id(0);
     if (gid < n) {
         float x = hb[gid];
-        out[gid] = x * sigmoid_f32(x) * hb2[gid];
+        float s = sigmoid_f32(x);
+        out[gid] = (x * s) * hb2[gid];
     }
 }
 

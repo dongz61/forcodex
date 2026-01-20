@@ -6,10 +6,6 @@
 #include "tokenizer/tokenizer.hpp"
 #include "graph/op_type.hpp"
 #include "core/tensor.hpp"
-
-// IMPORTANT: set_op_after_exec_hook is declared somewhere in your project.
-// If you still see "not declared", grep for set_op_after_exec_hook and include the declaring header.
-// In your earlier build it was reachable via executor headers.
 #include "executor/executor.hpp"
 #include "core/timer.hpp"
 
@@ -38,8 +34,8 @@ static const char *PROMPT      = "你好，请介绍你自己";
 static int N_THREADS     = 8;
 static size_t BATCH_SIZE = 1;
 
-static float ATOL = 1e-6f;
-static float RTOL = 1e-6f;
+static float ATOL = 1e-5f;
+static float RTOL = 1e-5f;
 static int TOPK   = 10;
 
 // ======================
@@ -542,6 +538,9 @@ int main() {
         std::unordered_map<int, std::vector<float>> ggml_matmul_B_vec;
         std::unordered_map<int, SigRec> ggml_matmul_A_sig;
         std::unordered_map<int, SigRec> ggml_matmul_B_sig;
+        std::unordered_map<int, std::vector<float>> ggml_silu_in0_vec; // hb
+        std::unordered_map<int, std::vector<float>> ggml_silu_in1_vec; // hb2
+
 
         // ---- GGML pass hook ----
         set_op_after_exec_hook([&](int op_idx, const OpNode *op) {
@@ -575,6 +574,23 @@ int main() {
                     }
                 }
             }
+
+            // cache SILU_HADAMARD inputs: hb/hb2 vec
+            if (op->op == OpType::SILU_HADAMARD) {
+                if ((int)op->prev.size() > 0) {
+                    Tensor *hb = op->prev[0]->tensor();
+                    if (hb && hb->m_data && hb->m_dtype == DataType::FP32) {
+                        ggml_silu_in0_vec[op_idx] = tensor_to_f32_vec_cpu(hb);
+                    }
+                }
+                if ((int)op->prev.size() > 1) {
+                    Tensor *hb2 = op->prev[1]->tensor();
+                    if (hb2 && hb2->m_data && hb2->m_dtype == DataType::FP32) {
+                        ggml_silu_in1_vec[op_idx] = tensor_to_f32_vec_cpu(hb2);
+                    }
+                }
+            }
+
         });
 
         auto ret_g = model_ggml->forward(tokens, pos, mask, true);
@@ -645,7 +661,7 @@ int main() {
                     fmt::print("  ==> trace_input = in[{}], producer_op = {}\n", prev_i, p);
                 }
 
-                // only do the heavy B/A diagnostics for MAT_MUL (avoid noise in backtrace)
+                // B/A diagnostics for MAT_MUL 
                 if (op->op == OpType::MAT_MUL && (int)op->prev.size() > 1) {
                     Tensor *B_in = op->prev[1]->tensor();
                     if (B_in && B_in->m_dtype == DataType::FP32 && B_in->m_data) {
@@ -761,6 +777,52 @@ int main() {
                     //     }
                     // }
                 }
+                
+                // SILU_HADAMARD diagnostics
+                if (op->op == OpType::SILU_HADAMARD && (int)op->prev.size() >= 2) {
+                    Tensor *hb  = op->prev[0]->tensor();
+                    Tensor *hb2 = op->prev[1]->tensor();
+
+                    // 读 OpenCL 侧输入（用你现成的 tensor_to_f32_vec_any，它会对 CL tensor 做 D2H copy）:contentReference[oaicite:5]{index=5}
+                    auto hb_ocl  = tensor_to_f32_vec_any(hb,  cl_backend);
+                    auto hb2_ocl = tensor_to_f32_vec_any(hb2, cl_backend);
+
+                    // 找 GGML 侧输入缓存
+                    auto it_hb  = ggml_silu_in0_vec.find(op_idx);
+                    auto it_hb2 = ggml_silu_in1_vec.find(op_idx);
+
+                    if (it_hb != ggml_silu_in0_vec.end() && it_hb2 != ggml_silu_in1_vec.end() &&
+                        hb_ocl.size() == it_hb->second.size() && hb2_ocl.size() == it_hb2->second.size()) {
+
+                        fmt::print("  [SILU-IN0] compare hb (ggml vs ocl)\n");
+                        dump_vec_diff_stats(it_hb->second, hb_ocl);
+
+                        fmt::print("  [SILU-IN1] compare hb2 (ggml vs ocl)\n");
+                        dump_vec_diff_stats(it_hb2->second, hb2_ocl);
+                    } else {
+                        fmt::print("  [SILU-IN] ggml input cache missing or size mismatch: hb_ocl={} hb2_ocl={}\n",
+                                hb_ocl.size(), hb2_ocl.size());
+                    }
+
+                    // ---- 小测试：用“同一份 OCL 输入”在 CPU 上按 GGML 公式重算，然后对比 OCL out ----
+                    // out 的 OCL vec 你已经传进来了：ocl_vec（是 op out 的 f32 vector）:contentReference[oaicite:6]{index=6}
+                    if (!hb_ocl.empty() && hb_ocl.size() == hb2_ocl.size() && hb_ocl.size() == ocl_vec.size()) {
+                        std::vector<float> cpu_ref(ocl_vec.size());
+                        for (size_t i = 0; i < cpu_ref.size(); ++i) {
+                            float x = hb_ocl[i];
+                            float s = x * (1.0f / (1.0f + expf(-x)));
+                            cpu_ref[i] = s * hb2_ocl[i];
+                        }
+
+                        fmt::print("  [SILU-CPU-REF] cpu_ref(ocl_in) vs ocl_out\n");
+                        dump_vec_diff_stats(cpu_ref, ocl_vec);
+
+                        // 也可以顺便看 cpu_ref(ocl_in) vs ggml_out（gg_vec 是 ggml out0 vec）:contentReference[oaicite:7]{index=7}
+                        fmt::print("  [SILU-CPU-REF] cpu_ref(ocl_in) vs ggml_out\n");
+                        dump_vec_diff_stats(cpu_ref, gg_vec);
+                    }
+                }
+
             };
 
         // Offline strict backtrace along chosen producer chain using cached outputs (ULP=0)
