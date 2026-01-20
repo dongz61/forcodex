@@ -346,9 +346,13 @@ static inline void cpy_tensor_cl(const OpenCLBackend* self,
 
     // Same logical shape required
     if (src->m_shape != dst->m_shape) {
-        POWERSERVE_LOG_ERROR("cpy_tensor_cl: shape mismatch");
-        return;
+        POWERSERVE_ABORT(
+            "cpy_tensor_cl: shape mismatch src=[{},{},{},{}] dst=[{},{},{},{}]",
+            src->m_shape[0], src->m_shape[1], src->m_shape[2], src->m_shape[3],
+            dst->m_shape[0], dst->m_shape[1], dst->m_shape[2], dst->m_shape[3]
+        );
     }
+
 
     // Kernel dispatch by dtype pair
     cl_kernel k = self->kernel_manager->get_cpy_kernel(src->m_dtype, dst->m_dtype);
@@ -1544,65 +1548,6 @@ void OpenCLBackend::permute(const Tensor *out, const Tensor *x, Shape axes) cons
     obuf.m_stride = new_stride;
 }
 
-void OpenCLBackend::cont(const Tensor *out, const Tensor *x) const {
-    if (!initialized) POWERSERVE_ABORT("OpenCL backend not initialized");
-    if (!out || !x)   POWERSERVE_ABORT("cont got null tensor");
-
-    // If already contiguous, a plain copy is fine
-    if (is_contiguous(x, 4)) {
-        this->copy(out, x);
-        return;
-    }
-
-    const size_t elem = powerserve::get_type_size(x->m_dtype);
-
-    // D2H: read raw physical buffer bytes into host_in (contiguous physical)
-    Tensor host_in(x->m_dtype, x->m_shape);
-    Tensor host_out(x->m_dtype, x->m_shape);
-
-    // allocate CPU buffers with correct element type size
-    switch (x->m_dtype) {
-    case DataType::FP32:
-        host_in.m_data  = powerserve::CPUBuffer::create_buffer<float>(x->m_shape);
-        host_out.m_data = powerserve::CPUBuffer::create_buffer<float>(x->m_shape);
-        break;
-    case DataType::FP16:
-        host_in.m_data  = powerserve::CPUBuffer::create_buffer<uint16_t>(x->m_shape);
-        host_out.m_data = powerserve::CPUBuffer::create_buffer<uint16_t>(x->m_shape);
-        break;
-    case DataType::INT32:
-        host_in.m_data  = powerserve::CPUBuffer::create_buffer<int32_t>(x->m_shape);
-        host_out.m_data = powerserve::CPUBuffer::create_buffer<int32_t>(x->m_shape);
-        break;
-    default:
-        POWERSERVE_ABORT("cont: unsupported dtype={}", (int)x->m_dtype);
-    }
-
-    this->copy(&host_in, x);
-
-    // Reorder: logical -> contiguous
-    const auto &shape  = x->m_shape;
-    const auto &stride = const_cast<Tensor*>(x)->get<OpenCLBuffer>().m_stride; // bytes
-
-    const char *src = reinterpret_cast<const char*>(host_in.get<powerserve::CPUBuffer>().m_data);
-    char *dst       = reinterpret_cast<char*>(host_out.get<powerserve::CPUBuffer>().m_data);
-
-    size_t idx = 0;
-    for (size_t i3 = 0; i3 < shape[3]; ++i3) {
-        for (size_t i2 = 0; i2 < shape[2]; ++i2) {
-            for (size_t i1 = 0; i1 < shape[1]; ++i1) {
-                for (size_t i0 = 0; i0 < shape[0]; ++i0, ++idx) {
-                    const size_t off = i0 * stride[0] + i1 * stride[1] + i2 * stride[2] + i3 * stride[3];
-                    std::memcpy(dst + idx * elem, src + off, elem);
-                }
-            }
-        }
-    }
-
-    // H2D
-    this->copy(out, &host_out);
-}
-
 static inline uint32_t floor_log2_u32(uint32_t x) {
     // x>0
     uint32_t r = 0;
@@ -2167,6 +2112,66 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
     }
 
     POWERSERVE_LOG_ERROR("copy: unsupported src/dst buffer types");
+}
+
+void OpenCLBackend::cont(const Tensor *out, const Tensor *x) const {
+    if (!initialized) POWERSERVE_ABORT("OpenCL backend not initialized");
+    if (!out || !x)   POWERSERVE_ABORT("cont got null tensor");
+
+    POWERSERVE_ASSERT(is_contiguous(out, 4));
+
+    const size_t x_bytes   = ggml_compat_nbytes(x->m_dtype, x->m_shape);
+    const size_t out_bytes = ggml_compat_nbytes(out->m_dtype, out->m_shape);
+    if (x_bytes == 0 || out_bytes == 0 || x_bytes != out_bytes) {
+        POWERSERVE_ABORT("cont: nbytes mismatch x_bytes={} out_bytes={}", x_bytes, out_bytes);
+    }
+
+    // 如果 x 已经 contiguous，copy 就够了（copy 支持 shape 不同但 nbytes 相同）
+    if (is_contiguous(x, 4)) {
+        this->copy(out, x);
+        return;
+    }
+
+    // --- Step 1: 先把 x(strided) pack 成 contiguous 的 tmp（shape 必须与 x 相同） ---
+    Tensor tmp = make_contig_dev_tensor(const_cast<OpenCLBackend*>(this),
+                                        x->m_dtype,
+                                        x->m_shape);   // contiguous + same shape as x
+    cpy_tensor_cl(this, x, &tmp); 
+
+    // --- Step 2: 把 tmp 的连续字节搬到 out（shape 可以不同，只要 nbytes 相同） ---
+    // 获取 OpenCLBuffer
+    auto *tmp_cl = dynamic_cast<OpenCLBuffer*>(&tmp.get<BaseBuffer>());
+    auto *out_cl = dynamic_cast<OpenCLBuffer*>(&const_cast<Tensor*>(out)->get<BaseBuffer>());
+    if (!tmp_cl || !out_cl) {
+        POWERSERVE_ABORT("cont: expected OpenCLBuffer for tmp/out");
+    }
+
+    cl_mem src_dev = tmp_cl->get_device_buffer();
+    cl_mem dst_dev = out_cl->get_device_buffer();
+    if (!src_dev || !dst_dev) {
+        POWERSERVE_ABORT("cont: invalid cl_mem src_dev/dst_dev");
+    }
+
+    const size_t src_off = tmp_cl->get_base_offset(); 
+    const size_t dst_off = out_cl->get_base_offset(); 
+
+    // 快路径：两边 offset 都是 0 → 直接 D2D memcpy
+    if (src_off == 0 && dst_off == 0) {
+        if (!memory_pool->copy_device_to_device(dst_dev, src_dev, x_bytes)) {
+            POWERSERVE_ABORT("cont: copy_device_to_device failed");
+        }
+        return;
+    }
+
+    // 慢路径但正确：D2H + H2D（支持 offset）
+    std::vector<uint8_t> host(x_bytes);
+    if (!memory_pool->copy_device_to_host(host.data(), src_dev, x_bytes, src_off)) {
+        POWERSERVE_ABORT("cont: copy_device_to_host failed");
+    }
+    if (!memory_pool->copy_host_to_device(dst_dev, host.data(), x_bytes, dst_off)) {
+        POWERSERVE_ABORT("cont: copy_host_to_device failed");
+    }
+    clFinish(context->get_queue());
 }
 
 void OpenCLBackend::print(const Tensor* x, size_t size) const {
