@@ -25,6 +25,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <limits>
 
 using namespace powerserve;
 
@@ -71,20 +72,46 @@ static const char *op_type_to_string(OpType t) {
 }
 
 static inline bool allclose_span(std::span<const float> a, std::span<const float> b,
-                                float atol, float rtol,
-                                size_t *bad_i=nullptr, float *diff=nullptr) {
+                                 float atol, float rtol,
+                                 size_t *bad_i=nullptr, float *diff=nullptr) {
     if (a.size() != b.size()) return false;
+
     for (size_t i = 0; i < a.size(); ++i) {
-        float d   = std::fabs(a[i] - b[i]);
-        float tol = atol + rtol * std::fabs(b[i]);
+        float ai = a[i];
+        float bi = b[i];
+
+        // 1) 先处理精确相等：包含 +inf==+inf、-inf==-inf、+0==-0，直接认为相等
+        if (ai == bi) {
+            continue;
+        }
+
+        // 2) 只要出现 NaN：直接判 mismatch（并避免 NaN 污染比较逻辑）
+        if (std::isnan(ai) || std::isnan(bi)) {
+            if (bad_i) *bad_i = i;
+            if (diff)  *diff  = std::numeric_limits<float>::quiet_NaN();
+            return false;
+        }
+
+        // 3) 只要出现 Inf（但又不相等）：一定 mismatch
+        if (std::isinf(ai) || std::isinf(bi)) {
+            if (bad_i) *bad_i = i;
+            if (diff)  *diff  = std::numeric_limits<float>::infinity();
+            return false;
+        }
+
+        // 4) 正常有限数走原来的 atol/rtol 比较
+        float d   = std::fabs(ai - bi);
+        float tol = atol + rtol * std::fabs(bi);
         if (!(d <= tol)) {
             if (bad_i) *bad_i = i;
             if (diff)  *diff  = d;
             return false;
         }
     }
+
     return true;
 }
+
 
 static void dump_topk(std::span<const float> logits, int k, const char *tag) {
     std::vector<int> idx(logits.size());
@@ -364,8 +391,15 @@ static inline bool allclose_ulp_span(std::span<const float> a, std::span<const f
     for (size_t i = 0; i < a.size(); ++i) {
         int32_t u = ulp_dist(a[i], b[i]);
         if (u > max_ulp) {
-            if (bad_i)   *bad_i   = i;
-            if (bad_abs) *bad_abs = std::fabs(a[i] - b[i]);
+            if (bad_i) *bad_i = i;
+
+            if (bad_abs) {
+                float ai = a[i], bi = b[i];
+                *bad_abs = (std::isfinite(ai) && std::isfinite(bi))
+                        ? std::fabs(ai - bi)
+                        : std::numeric_limits<float>::infinity();
+            }
+
             if (bad_ulp) *bad_ulp = u;
             return false;
         }
@@ -701,31 +735,31 @@ int main() {
                     }
 
                     // EXP1: recompute GGML matmul using B read back from OpenCL
-                    Tensor *A_in2 = op->prev[0]->tensor();
-                    Tensor *B_in2 = op->prev[1]->tensor();
-                    if (out && out->m_dtype == DataType::FP32 && A_in2 && B_in2 &&
-                        A_in2->m_data && B_in2->m_data && B_in2->m_dtype == DataType::FP32) {
+                    // Tensor *A_in2 = op->prev[0]->tensor();
+                    // Tensor *B_in2 = op->prev[1]->tensor();
+                    // if (out && out->m_dtype == DataType::FP32 && A_in2 && B_in2 &&
+                    //     A_in2->m_data && B_in2->m_data && B_in2->m_dtype == DataType::FP32) {
 
-                        Tensor B_cpu(DataType::FP32, B_in2->m_shape);
-                        B_cpu.m_data = powerserve::CPUBuffer::create_buffer<float>(B_in2->m_shape);
-                        cl_backend->copy(&B_cpu, B_in2);
+                    //     Tensor B_cpu(DataType::FP32, B_in2->m_shape);
+                    //     B_cpu.m_data = powerserve::CPUBuffer::create_buffer<float>(B_in2->m_shape);
+                    //     cl_backend->copy(&B_cpu, B_in2);
 
-                        Tensor C_cpu(DataType::FP32, out->m_shape);
-                        C_cpu.m_data = powerserve::CPUBuffer::create_buffer<float>(out->m_shape);
+                    //     Tensor C_cpu(DataType::FP32, out->m_shape);
+                    //     C_cpu.m_data = powerserve::CPUBuffer::create_buffer<float>(out->m_shape);
 
-                        gg_backend->matmul(&C_cpu, A_in2, &B_cpu);
+                    //     gg_backend->matmul(&C_cpu, A_in2, &B_cpu);
 
-                        auto gg_re = tensor_to_f32_vec_cpu(&C_cpu);
-                        if (!gg_re.empty() && gg_re.size() == ocl_vec.size()) {
-                            size_t bad2 = 0;
-                            float diff2 = 0.f;
-                            bool ok2 = allclose_span(gg_re, ocl_vec, /*atol*/0.f, /*rtol*/0.f, &bad2, &diff2);
-                            fmt::print("  [MATMUL-RE] ggml(A, B_ocl) vs ocl_out match={} bad_i={} ggml_re={} ocl={} diff={}\n",
-                                       ok2, bad2, gg_re[bad2], ocl_vec[bad2], diff2);
-                        } else {
-                            fmt::print("  [MATMUL-RE] skip (size gg_re={} ocl_vec={})\n", gg_re.size(), ocl_vec.size());
-                        }
-                    }
+                    //     auto gg_re = tensor_to_f32_vec_cpu(&C_cpu);
+                    //     if (!gg_re.empty() && gg_re.size() == ocl_vec.size()) {
+                    //         size_t bad2 = 0;
+                    //         float diff2 = 0.f;
+                    //         bool ok2 = allclose_span(gg_re, ocl_vec, /*atol*/0.f, /*rtol*/0.f, &bad2, &diff2);
+                    //         fmt::print("  [MATMUL-RE] ggml(A, B_ocl) vs ocl_out match={} bad_i={} ggml_re={} ocl={} diff={}\n",
+                    //                    ok2, bad2, gg_re[bad2], ocl_vec[bad2], diff2);
+                    //     } else {
+                    //         fmt::print("  [MATMUL-RE] skip (size gg_re={} ocl_vec={})\n", gg_re.size(), ocl_vec.size());
+                    //     }
+                    // }
                 }
             };
 

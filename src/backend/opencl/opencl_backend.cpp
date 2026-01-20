@@ -390,10 +390,9 @@ static inline void cpy_tensor_cl(const OpenCLBackend* self,
     const cl_ulong nb3 = (cl_ulong)dstst[3];
 
     // Offsets:
-    // In this backend, views are represented via OpenCL sub-buffer,
-    // so base offset is already encoded in cl_mem and we can pass 0.
-    const cl_ulong off0 = 0;
-    const cl_ulong offd = 0;
+    // Scheme-B: views are NOT sub-buffers, so we must pass base offsets explicitly.
+    const cl_ulong off0 = (cl_ulong)src_cl->get_base_offset();
+    const cl_ulong offd = (cl_ulong)dst_cl->get_base_offset();
 
     cl_uint arg = 0;
     CL_CHECK(clSetKernelArg(k, arg++, sizeof(cl_mem),   &src_mem));
@@ -687,10 +686,10 @@ void OpenCLBackend::add_broadcast(Tensor *dst, const Tensor *src0, const Tensor 
         cl_int err;
         cl_uint arg_index = 0;
         
-        // 所有版本的通用偏移（目前都设为0）
-        cl_ulong offset0 = 0;
-        cl_ulong offset1 = 0;
-        cl_ulong offsetd = 0;
+        cl_ulong offset0 = (cl_ulong)src0_buffer.get_base_offset();
+        cl_ulong offset1 = (cl_ulong)src1_buffer.get_base_offset();
+        cl_ulong offsetd = (cl_ulong)dst_buffer.get_base_offset();
+
         
         if (bcast_row) {
             // 行广播版本（7个参数）
@@ -1029,60 +1028,6 @@ void OpenCLBackend::matmul_cpu_ggml_fallback(
     Tensor host_c(dst->m_dtype, dst->m_shape);
     host_c.m_data = create_cpu_buffer_for_dtype(dst->m_dtype, dst->m_shape);
 
-    // ---- Debug: log first row of inputs once (helps diagnose quant/stride issues) ----
-    static bool s_logged_inputs = false;
-    if (!s_logged_inputs) {
-        s_logged_inputs = true;
-        const auto &a_stride = a_host->get<powerserve::CPUBuffer>().m_stride;
-        const auto &b_stride = b_host->get<powerserve::CPUBuffer>().m_stride;
-        POWERSERVE_LOG_INFO(
-            "matmul_cpu_ggml_fallback inputs: A(dtype={}, shape=[{}, {}, {}, {}], stride=[{}, {}, {}, {}]) "
-            "B(dtype={}, shape=[{}, {}, {}, {}], stride=[{}, {}, {}, {}])",
-            (int)a_host->m_dtype,
-            a_host->m_shape[0], a_host->m_shape[1], a_host->m_shape[2], a_host->m_shape[3],
-            a_stride[0], a_stride[1], a_stride[2], a_stride[3],
-            (int)b_host->m_dtype,
-            b_host->m_shape[0], b_host->m_shape[1], b_host->m_shape[2], b_host->m_shape[3],
-            b_stride[0], b_stride[1], b_stride[2], b_stride[3]
-        );
-
-        // Dump head of A (weight) and B (activation)
-        if (a_host->m_dtype == DataType::GGML_Q8_0) {
-            const size_t K = a_host->m_shape[0];
-            const char *a_base = static_cast<const char *>(a_host->get<powerserve::CPUBuffer>().m_data);
-            std::vector<float> a_deq(K, 0.f);
-            dequantize_row_q8_0(reinterpret_cast<const block_q8_0 *>(a_base), a_deq.data(), (int)K);
-            std::string head;
-            for (size_t i = 0; i < std::min<size_t>(8, a_deq.size()); ++i) {
-                head += fmt::format("{:.6f} ", a_deq[i]);
-            }
-            POWERSERVE_LOG_INFO("A(Q8_0) dequant head: {}", head);
-        } else if (a_host->m_dtype == DataType::FP32) {
-            const float *a_f = static_cast<const float *>(a_host->get<powerserve::CPUBuffer>().m_data);
-            std::string head;
-            for (size_t i = 0; i < std::min<size_t>(8, a_host->n_elements()); ++i) {
-                head += fmt::format("{:.6f} ", a_f[i]);
-            }
-            POWERSERVE_LOG_INFO("A(FP32) head: {}", head);
-        }
-
-        if (b_host->m_dtype == DataType::FP32) {
-            const float *b_f = static_cast<const float *>(b_host->get<powerserve::CPUBuffer>().m_data);
-            std::string head;
-            for (size_t i = 0; i < std::min<size_t>(8, b_host->n_elements()); ++i) {
-                head += fmt::format("{:.6f} ", b_f[i]);
-            }
-            POWERSERVE_LOG_INFO("B(FP32) head: {}", head);
-        }
-    }
-
-    // ---- Debug: bytes check for quant layouts ----
-    {
-        const size_t a_bytes = ggml_compat_nbytes(a_host->m_dtype, a_host->m_shape);
-        const size_t b_bytes = ggml_compat_nbytes(b_host->m_dtype, b_host->m_shape);
-    }
-
-
     // ---- 3) ggml mul_mat (reusable GGMLBackend, correct params/workspace/threadpool) ----
     POWERSERVE_ASSERT(m_ggml_fallback && "m_ggml_fallback must be initialized in OpenCLBackend::initialize()");
 
@@ -1138,10 +1083,10 @@ void OpenCLBackend::matmul_cpu_ggml_fallback(
     // run ggml matmul (KEEP ORDER: weight first, activation second)
     m_ggml_fallback->matmul(&host_c, w_host, x_host);
 
-
     // ---- 4) H2D: host_c -> dst ----
     this->copy(dst, &host_c);
 }
+
 
 void OpenCLBackend::matmul_batched_cpu_f32_fallback(
     const Tensor *dst,

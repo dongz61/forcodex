@@ -16,26 +16,19 @@ OpenCLBuffer::OpenCLBuffer(Stride stride,
                            std::shared_ptr<OpenCLMemoryPool> pool,
                            bool owns_buffer,
                            bool is_pooled,
-                           bool is_subbuffer) :
+                           bool is_subbuffer,
+                           size_t base_offset) :
     m_stride(stride),
     m_device_buffer(device_buffer),
     m_size(size),
+    m_base_offset(base_offset),
     memory_pool(std::move(pool)),
     m_owns_buffer(owns_buffer),
     m_is_pooled(is_pooled),
     m_is_subbuffer(is_subbuffer) {
-    // POWERSERVE_LOG_DEBUG(
-    //     "OpenCLBuffer created: size={} bytes, pooled={}, owns={}, subbuffer={}",
-    //     m_size, m_is_pooled, m_owns_buffer, m_is_subbuffer
-    // );
 }
 
 OpenCLBuffer::~OpenCLBuffer() {
-    // POWERSERVE_LOG_DEBUG(
-    //     "OpenCLBuffer destroying: size={} bytes, pooled={}, owns={}, subbuffer={}",
-    //     m_size, m_is_pooled, m_owns_buffer, m_is_subbuffer
-    // );
-
     if (!m_owns_buffer || !m_device_buffer) {
         return;
     }
@@ -62,6 +55,7 @@ OpenCLBuffer::OpenCLBuffer(OpenCLBuffer&& other) noexcept :
     m_stride(other.m_stride),
     m_device_buffer(other.m_device_buffer),
     m_size(other.m_size),
+    m_base_offset(other.m_base_offset),
     memory_pool(std::move(other.memory_pool)),
     m_owns_buffer(other.m_owns_buffer),
     m_is_pooled(other.m_is_pooled),
@@ -69,6 +63,7 @@ OpenCLBuffer::OpenCLBuffer(OpenCLBuffer&& other) noexcept :
     other.m_device_buffer = nullptr;
     other.m_owns_buffer   = false;
     other.m_is_subbuffer  = false;
+    other.m_base_offset   = 0;
 }
 
 OpenCLBuffer& OpenCLBuffer::operator=(OpenCLBuffer&& other) noexcept {
@@ -97,10 +92,12 @@ OpenCLBuffer& OpenCLBuffer::operator=(OpenCLBuffer&& other) noexcept {
     m_owns_buffer   = other.m_owns_buffer;
     m_is_pooled     = other.m_is_pooled;
     m_is_subbuffer  = other.m_is_subbuffer;
+    m_base_offset   = other.m_base_offset;
 
     other.m_device_buffer = nullptr;
     other.m_owns_buffer   = false;
     other.m_is_subbuffer  = false;
+    other.m_base_offset   = 0;
 
     POWERSERVE_LOG_DEBUG("OpenCLBuffer move-assigned");
     return *this;
@@ -115,7 +112,7 @@ bool OpenCLBuffer::copy_to_device(const void* host_data, size_t size) {
         POWERSERVE_LOG_ERROR("Copy size {} exceeds buffer size {}", size, m_size);
         return false;
     }
-    return memory_pool->copy_host_to_device(m_device_buffer, host_data, size);
+    return memory_pool->copy_host_to_device(m_device_buffer, host_data, size, m_base_offset);
 }
 
 bool OpenCLBuffer::copy_to_host(void* host_data, size_t size) {
@@ -127,7 +124,7 @@ bool OpenCLBuffer::copy_to_host(void* host_data, size_t size) {
         POWERSERVE_LOG_ERROR("Copy size {} exceeds buffer size {}", size, m_size);
         return false;
     }
-    return memory_pool->copy_device_to_host(host_data, m_device_buffer, size);
+    return memory_pool->copy_device_to_host(host_data, m_device_buffer, size, m_base_offset);
 }
 
 bool OpenCLBuffer::copy_to_device_async(const void* host_data, size_t size, cl_event* event) {
@@ -139,7 +136,7 @@ bool OpenCLBuffer::copy_to_device_async(const void* host_data, size_t size, cl_e
         POWERSERVE_LOG_ERROR("Copy size {} exceeds buffer size {}", size, m_size);
         return false;
     }
-    return memory_pool->copy_host_to_device_async(m_device_buffer, host_data, size, event);
+    return memory_pool->copy_host_to_device_async(m_device_buffer, host_data, size, event, m_base_offset);
 }
 
 bool OpenCLBuffer::copy_to_host_async(void* host_data, size_t size, cl_event* event) {
@@ -151,7 +148,7 @@ bool OpenCLBuffer::copy_to_host_async(void* host_data, size_t size, cl_event* ev
         POWERSERVE_LOG_ERROR("Copy size {} exceeds buffer size {}", size, m_size);
         return false;
     }
-    return memory_pool->copy_device_to_host_async(host_data, m_device_buffer, size, event);
+    return memory_pool->copy_device_to_host_async(host_data, m_device_buffer, size, event, m_base_offset);
 }
 
 void* OpenCLBuffer::map(cl_map_flags flags, size_t offset, size_t size) {
@@ -170,7 +167,7 @@ void* OpenCLBuffer::map(cl_map_flags flags, size_t offset, size_t size) {
         POWERSERVE_LOG_ERROR("Map range [{}, {}] exceeds buffer size {}", offset, offset + size, m_size);
         return nullptr;
     }
-    return memory_pool->map_memory(m_device_buffer, offset, size, flags);
+    return memory_pool->map_memory(m_device_buffer, m_base_offset + offset, size, flags);
 }
 
 bool OpenCLBuffer::unmap(void* mapped_ptr) {
