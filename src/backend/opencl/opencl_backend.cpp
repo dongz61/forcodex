@@ -552,14 +552,28 @@ void OpenCLBackend::add_minimal(Tensor * dst, const Tensor * src0, const Tensor 
     cl_uint idx = 0;
     const int n_i = static_cast<int>(n);
 
+    // Scheme-B: pass base offsets explicitly (bytes)
+    const cl_ulong off0 = (cl_ulong)src0->get<OpenCLBuffer>().get_base_offset();
+    const cl_ulong off1 = (cl_ulong)src1->get<OpenCLBuffer>().get_base_offset();
+    const cl_ulong offd = (cl_ulong)dst ->get<OpenCLBuffer>().get_base_offset();
+
     err = clSetKernelArg(kernel, idx++, sizeof(cl_mem), &a);
     if (err != CL_SUCCESS) { POWERSERVE_LOG_ERROR("set arg a failed"); return; }
+
+    err = clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off0);
+    if (err != CL_SUCCESS) { POWERSERVE_LOG_ERROR("set arg off0 failed"); return; }
 
     err = clSetKernelArg(kernel, idx++, sizeof(cl_mem), &b);
     if (err != CL_SUCCESS) { POWERSERVE_LOG_ERROR("set arg b failed"); return; }
 
+    err = clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &off1);
+    if (err != CL_SUCCESS) { POWERSERVE_LOG_ERROR("set arg off1 failed"); return; }
+
     err = clSetKernelArg(kernel, idx++, sizeof(cl_mem), &o);
     if (err != CL_SUCCESS) { POWERSERVE_LOG_ERROR("set arg out failed"); return; }
+
+    err = clSetKernelArg(kernel, idx++, sizeof(cl_ulong), &offd);
+    if (err != CL_SUCCESS) { POWERSERVE_LOG_ERROR("set arg offd failed"); return; }
 
     err = clSetKernelArg(kernel, idx++, sizeof(int), &n_i);
     if (err != CL_SUCCESS) { POWERSERVE_LOG_ERROR("set arg n failed"); return; }
@@ -1995,12 +2009,14 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
 
         // Fast-path: contiguous dst -> linear write
         if (src_contig && dst_contig) {
-            if (!memory_pool->copy_host_to_device(dev, host, src_bytes, 0)) {
+            const size_t dst_off = dst_cl->get_base_offset();  // bytes
+            if (!memory_pool->copy_host_to_device(dev, host, src_bytes, dst_off)) {
                 POWERSERVE_LOG_ERROR("H2D: copy_host_to_device failed");
             }
-            clFinish(context->get_queue()); 
+            clFinish(context->get_queue());
             return;
         }
+
 
         std::vector<uint8_t> host_contig;
         const void* host_src = host;
@@ -2014,10 +2030,11 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
         }
 
         if (dst_contig) {
-            if (!memory_pool->copy_host_to_device(dev, host_src, src_bytes, 0)) {
+            const size_t dst_off = dst_cl->get_base_offset();  // bytes
+            if (!memory_pool->copy_host_to_device(dev, host_src, src_bytes, dst_off)) {
                 POWERSERVE_LOG_ERROR("H2D: copy_host_to_device failed");
             }
-            clFinish(context->get_queue()); 
+            clFinish(context->get_queue());
             return;
         }
 
@@ -2035,7 +2052,8 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
         // 1) write host -> staging (staging contiguous so raw write ok)
         auto &staging_buf = staging.get<OpenCLBuffer>();
         cl_mem staging_mem = staging_buf.get_device_buffer();
-        if (!memory_pool->copy_host_to_device(staging_mem, host_src, src_bytes, 0)) {
+        const size_t st_off = staging_buf.get_base_offset();
+        if (!memory_pool->copy_host_to_device(staging_mem, host_src, src_bytes, st_off)) {
             POWERSERVE_LOG_ERROR("H2D: staging copy_host_to_device failed");
             dump_backtrace();
             std::abort();
@@ -2092,17 +2110,21 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
         cl_mem read_mem = read_cl->get_device_buffer();
 
         if (dst_contig) {
-            if (!memory_pool->copy_device_to_host(host, read_mem, src_bytes, 0)) {
+            const size_t src_off = read_cl->get_base_offset();  // bytes
+            if (!memory_pool->copy_device_to_host(host, read_mem, src_bytes, src_off)) {
                 POWERSERVE_LOG_ERROR("D2H: copy_device_to_host failed");
             }
             return;
         }
 
+
         std::vector<uint8_t> host_contig(src_bytes);
-        if (!memory_pool->copy_device_to_host(host_contig.data(), read_mem, src_bytes, 0)) {
+        const size_t src_off = read_cl->get_base_offset();  // bytes
+        if (!memory_pool->copy_device_to_host(host_contig.data(), read_mem, src_bytes, src_off)) {
             POWERSERVE_LOG_ERROR("D2H: staging copy_device_to_host failed");
             return;
         }
+
         if (!unpack_contig_to_cpu_strided(host_contig.data(), dst)) {
             POWERSERVE_LOG_ERROR("D2H: failed to unpack to CPU strided tensor");
         }
@@ -2111,10 +2133,23 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
 
     // D2D
     if (src_cl && dst_cl) {
+        
+        const size_t src_off = src_cl->get_base_offset();  // bytes
+        const size_t dst_off = dst_cl->get_base_offset();  // bytes
+
         cl_mem src_dev = src_cl->get_device_buffer();
         cl_mem dst_dev = dst_cl->get_device_buffer();
         if (!src_dev || !dst_dev) {
             POWERSERVE_LOG_ERROR("D2D: invalid cl_mem");
+            return;
+        }
+        if (src_off != 0 || dst_off != 0 || !is_contiguous(src, 4) || !is_contiguous(dst, 4)) {
+            if (!is_cpy_kernel_supported(src->m_dtype) || !is_cpy_kernel_supported(dst->m_dtype)) {
+                POWERSERVE_LOG_ERROR("D2D: non-trivial copy requires cpy kernel, unsupported dtype src={} dst={}",
+                                    (int)src->m_dtype, (int)dst->m_dtype);
+                return;
+            }
+            cpy_tensor_cl(this, src, dst);
             return;
         }
         if (!memory_pool->copy_device_to_device(dst_dev, src_dev, src_bytes)) {

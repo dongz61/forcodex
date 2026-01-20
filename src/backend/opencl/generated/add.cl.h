@@ -207,15 +207,23 @@ kernel void kernel_add_row_f16(
     dst[gid] = v0 + v1;
 }
 
-// 最轻量化版本
+// 最轻量化版本（支持 Scheme-B base_offset）
 __kernel void kernel_add_contig_f32(
     __global const float * a,
+    ulong offset0,
     __global const float * b,
+    ulong offset1,
     __global float * out,
+    ulong offsetd,
     int n
 ) {
+    // offset 的单位是 bytes
+    __global const float *a_ptr = (__global const float *)((__global const char *)a + offset0);
+    __global const float *b_ptr = (__global const float *)((__global const char *)b + offset1);
+    __global float *out_ptr     = (__global float *)((__global char *)out + offsetd);
+
     int gid = get_global_id(0);
-    if (gid < n) out[gid] = a[gid] + b[gid];
+    if (gid < n) out_ptr[gid] = a_ptr[gid] + b_ptr[gid];
 }
 
 
