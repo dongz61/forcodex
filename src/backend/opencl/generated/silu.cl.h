@@ -7,6 +7,7 @@ namespace powerserve::opencl::embedded {
 
 const std::string silu_cl_source = R"CLC(
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#pragma OPENCL FP_CONTRACT OFF
 
 //------------------------------------------------------------------------------
 // silu

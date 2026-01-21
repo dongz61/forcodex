@@ -221,6 +221,8 @@ bool OpenCLBackend::initialize() {
     options.finite_math = false;
     options.fast_relaxed_math = false;
     
+    POWERSERVE_LOG_INFO("[OpenCL] global compile_options: {}", options.to_string());
+
     if (!kernel_manager->initialize(options)) {
         POWERSERVE_LOG_ERROR("Failed to initialize OpenCL kernel manager");
         return false;
@@ -1726,6 +1728,46 @@ void OpenCLBackend::silu_hadamard(const Tensor * out,
 
     const size_t n = out->n_elements();
     if (n == 0) return;
+
+    // DEBUG: force CPU fallback for SILU_HADAMARD
+    // ============================
+    {
+        // 1) Prepare CPU tensors (contiguous FP32)
+        Tensor hb_cpu(DataType::FP32, hb->m_shape);
+        hb_cpu.m_data = powerserve::CPUBuffer::create_buffer<float>(hb->m_shape);
+
+        Tensor hb2_cpu(DataType::FP32, hb2->m_shape);
+        hb2_cpu.m_data = powerserve::CPUBuffer::create_buffer<float>(hb2->m_shape);
+
+        Tensor out_cpu(DataType::FP32, out->m_shape);
+        out_cpu.m_data = powerserve::CPUBuffer::create_buffer<float>(out->m_shape);
+
+        // 2) D2H: copy OpenCL -> CPU
+        // (OpenCLBackend::copy already supports CPU<->OpenCL in this repo’s flow)
+        this->copy(&hb_cpu, hb);
+        this->copy(&hb2_cpu, hb2);
+
+        // 3) Compute on CPU using GGML ref implementation if available
+        if (m_ggml_fallback) {
+            m_ggml_fallback->silu_hadamard(&out_cpu, &hb_cpu, &hb2_cpu);
+        } else {
+            // Fallback to the same formula as GGMLBackend::silu_hadamard
+            float *out_data = static_cast<float *>(out_cpu.get<CPUBuffer>().m_data);
+            float *hb_data  = static_cast<float *>(hb_cpu.get<CPUBuffer>().m_data);
+            float *hb2_data = static_cast<float *>(hb2_cpu.get<CPUBuffer>().m_data);
+            for (size_t j = 0; j < hb_cpu.n_elements(); ++j) {
+                float val = hb_data[j];
+                val *= (1.0f / (1.0f + expf(-val)));
+                val *= hb2_data[j];
+                out_data[j] = val;
+            }
+        }
+
+        // 4) H2D: copy CPU -> OpenCL output
+        this->copy(out, &out_cpu);
+        return;
+    }
+
 
     cl_mem a = nullptr;
     cl_mem b = nullptr;
