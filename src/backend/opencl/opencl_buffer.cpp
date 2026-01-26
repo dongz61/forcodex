@@ -16,7 +16,6 @@ OpenCLBuffer::OpenCLBuffer(Stride stride,
                            std::shared_ptr<OpenCLMemoryPool> pool,
                            bool owns_buffer,
                            bool is_pooled,
-                           bool is_subbuffer,
                            size_t base_offset) :
     m_stride(stride),
     m_device_buffer(device_buffer),
@@ -24,29 +23,19 @@ OpenCLBuffer::OpenCLBuffer(Stride stride,
     m_base_offset(base_offset),
     memory_pool(std::move(pool)),
     m_owns_buffer(owns_buffer),
-    m_is_pooled(is_pooled),
-    m_is_subbuffer(is_subbuffer) {
+    m_is_pooled(is_pooled) {
 }
 
 OpenCLBuffer::~OpenCLBuffer() {
-    if (!m_owns_buffer || !m_device_buffer) {
-        return;
-    }
+    if (!m_owns_buffer || !m_device_buffer) return;
 
-    // Sub-buffer must be released via OpenCL API, not memory pool.
-    if (m_is_subbuffer) {
-        clReleaseMemObject(m_device_buffer);
-        m_device_buffer = nullptr;
-        return;
-    }
-
-    // Normal pooled/non-pooled buffers are managed by memory pool.
     if (memory_pool) {
-        if (m_is_pooled) {
-            memory_pool->free_pooled(m_device_buffer);
-        } else {
-            memory_pool->free(m_device_buffer);
-        }
+        if (m_is_pooled) memory_pool->free_pooled(m_device_buffer);
+        else             memory_pool->free(m_device_buffer);
+        m_device_buffer = nullptr;
+    } else {
+        // 兜底：没有 pool 时避免泄漏
+        clReleaseMemObject(m_device_buffer);
         m_device_buffer = nullptr;
     }
 }
@@ -58,11 +47,9 @@ OpenCLBuffer::OpenCLBuffer(OpenCLBuffer&& other) noexcept :
     m_base_offset(other.m_base_offset),
     memory_pool(std::move(other.memory_pool)),
     m_owns_buffer(other.m_owns_buffer),
-    m_is_pooled(other.m_is_pooled),
-    m_is_subbuffer(other.m_is_subbuffer) {
+    m_is_pooled(other.m_is_pooled) {
     other.m_device_buffer = nullptr;
     other.m_owns_buffer   = false;
-    other.m_is_subbuffer  = false;
     other.m_base_offset   = 0;
 }
 
@@ -72,11 +59,8 @@ OpenCLBuffer& OpenCLBuffer::operator=(OpenCLBuffer&& other) noexcept {
     }
 
     if (m_owns_buffer && m_device_buffer) {
-        if (m_is_subbuffer) {
-            clReleaseMemObject(m_device_buffer);
-        } else if (memory_pool) {
-            if (m_is_pooled) memory_pool->free_pooled(m_device_buffer);
-            else             memory_pool->free(m_device_buffer);
+        if (m_is_pooled) {
+            memory_pool->free_pooled(m_device_buffer);
         } else {
             // 兜底：没有 pool 时避免泄漏
             clReleaseMemObject(m_device_buffer);
@@ -91,12 +75,10 @@ OpenCLBuffer& OpenCLBuffer::operator=(OpenCLBuffer&& other) noexcept {
     memory_pool     = std::move(other.memory_pool);
     m_owns_buffer   = other.m_owns_buffer;
     m_is_pooled     = other.m_is_pooled;
-    m_is_subbuffer  = other.m_is_subbuffer;
     m_base_offset   = other.m_base_offset;
 
     other.m_device_buffer = nullptr;
     other.m_owns_buffer   = false;
-    other.m_is_subbuffer  = false;
     other.m_base_offset   = 0;
 
     POWERSERVE_LOG_DEBUG("OpenCLBuffer move-assigned");

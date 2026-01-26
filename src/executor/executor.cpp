@@ -141,34 +141,7 @@ void Executor::allocate_buffers() {
         auto tensor = node->tensor();
         if (!tensor) continue;
 
-        // ------------------------------------------------------------
-        // Special handling for views: OpenCL must allocate sub-buffers
-        // ------------------------------------------------------------
-        if (use_opencl && node->type == NodeType::TENSOR_VIEW) {
-            // If already OpenCLBuffer-backed, nothing to do.
-            if (tensor->m_data) {
-                auto &base = tensor->get<BaseBuffer>();
-                if (dynamic_cast<powerserve::opencl::OpenCLBuffer*>(&base)) {
-                    continue;
-                }
-            }
-
-            // Views should always be allocated as OpenCL sub-buffers from parent OpenCLBuffer.
-            // If parent hasn't been migrated yet, it will be migrated in its own iteration.
-            // After parent becomes OpenCLBuffer, this allocation will succeed.
-            switch (tensor->m_dtype) {
-            case DataType::FP32:
-                create_opencl_buffer<float>(node);
-                break;
-            case DataType::FP16:
-                create_opencl_buffer<uint16_t>(node);
-                break;
-            case DataType::INT32:
-                create_opencl_buffer<int32_t>(node);
-                break;
-            default:
-                POWERSERVE_ABORT("allocate_buffers(view): unsupported dtype");
-            }
+        if (node->type == NodeType::TENSOR_VIEW) {
             continue;
         }
 

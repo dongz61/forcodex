@@ -24,7 +24,6 @@ public:
                 std::shared_ptr<OpenCLMemoryPool> pool,
                 bool owns_buffer = true,
                 bool is_pooled = true,
-                bool is_subbuffer = false,
                 size_t base_offset = 0);
 
 
@@ -47,7 +46,6 @@ public:
     bool is_valid() const { return m_device_buffer != nullptr; }
     bool owns_buffer() const { return m_owns_buffer; }
     bool is_pooled() const { return m_is_pooled; }
-    bool is_subbuffer() const { return m_is_subbuffer; }
 
     // ---- Data movement ----
     bool copy_to_device(const void* host_data, size_t size);
@@ -76,7 +74,6 @@ public:
 
     bool m_owns_buffer;  // whether this object should free/release m_device_buffer
     bool m_is_pooled;    // whether underlying allocation is from pool
-    bool m_is_subbuffer; // whether m_device_buffer is a clCreateSubBuffer result
 
 public:
     template <typename T>
@@ -187,7 +184,6 @@ public:
             parent.memory_pool, // keep for copy/map helpers
             /*owns_buffer=*/false,
             /*is_pooled=*/false,
-            /*is_subbuffer=*/false,
             /*base_offset=*/parent.m_base_offset + offset
         );
         return buf;

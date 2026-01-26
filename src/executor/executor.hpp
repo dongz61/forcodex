@@ -52,11 +52,6 @@ private:
     void create_opencl_buffer_for_tensor(Tensor* tensor) {
         POWERSERVE_ASSERT(tensor != nullptr);
 
-        // If this tensor is a view, allocate as a sub-buffer view.
-        // NOTE: In the graph codepath, view tensor allocation uses TensorNode metadata (parent pointer & shape).
-        // For raw Tensor*, we cannot reliably reconstruct the parent relationship.
-        // So we only support non-view tensors here.
-
         // base buffer must be created by OpenCLBackend (it owns memory_pool)
         auto* backend = m_platform.get_backend(m_graph.m_model_id);
         auto* ocl = dynamic_cast<opencl::OpenCLBackend*>(backend);
@@ -70,14 +65,9 @@ private:
 
     template <typename T>
     void create_opencl_buffer(std::shared_ptr<TensorNode> tensor) {
-        if (tensor->type == NodeType::TENSOR_VIEW) {
-            tensor->m_data =
-                opencl::OpenCLBuffer::create_buffer_view<T>(
-                    tensor->tensor_view()->parent->get<opencl::OpenCLBuffer>(),
-                    tensor->m_shape);
-        } else {
-            create_opencl_buffer_for_tensor<T>(tensor.get());
-        }
+        // Views are materialized in OpType::VIEW at runtime (scheme-B).
+        POWERSERVE_ASSERT(tensor->type != NodeType::TENSOR_VIEW);
+        create_opencl_buffer_for_tensor<T>(tensor.get());
     }
     // ziqian：end
 };
