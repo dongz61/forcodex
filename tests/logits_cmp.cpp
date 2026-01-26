@@ -307,8 +307,12 @@ static bool tensor_bytes_sig_any(const Tensor *t,
     std::vector<uint8_t> bytes;
 
 #if defined(POWERSERVE_WITH_OPENCL)
-    if (dynamic_cast<powerserve::opencl::OpenCLBuffer*>(t->m_data.get())) {
-        POWERSERVE_ASSERT(cl_backend);
+        if (dynamic_cast<powerserve::opencl::OpenCLBuffer*>(t->m_data.get())) {
+            BaseBuffer &base = const_cast<Tensor*>(t)->get<BaseBuffer>();
+        auto *clb = dynamic_cast<powerserve::opencl::OpenCLBuffer*>(&base);
+        if (clb) {
+            POWERSERVE_ASSERT(cl_backend && "tensor_bytes_sig_any: OpenCL tensor requires cl_backend");
+        }
 
         Tensor tmp_cpu(t->m_dtype, t->m_shape);
         if (elem_size == 4) {
@@ -780,6 +784,53 @@ int main() {
 
                             fmt::print("  [SILU-IN1] compare hb2 (ggml vs ocl)\n");
                             dump_vec_diff_stats(it_hb2->second, hb2_ocl);
+                        }
+                    }
+
+                    if (op->op == OpType::VIEW) {
+                        Tensor *out = op->next[0]->tensor();
+                        Tensor *in0 = op->prev.size() > 0 ? op->prev[0]->tensor() : nullptr;
+
+                        auto dump_cl_buf = [&](const char *tag, Tensor *t) {
+                            if (!t || !t->m_data) {
+                                fprintf(stderr, "  [VIEW_DBG] %s: null tensor/data\n", tag);
+                                return;
+                            }
+                            auto *cl = dynamic_cast<powerserve::opencl::OpenCLBuffer*>(&t->get<BaseBuffer>());
+                            if (!cl) {
+                                fprintf(stderr, "  [VIEW_DBG] %s: not OpenCLBuffer\n", tag);
+                                return;
+                            }
+                            fprintf(stderr,
+                                "  [VIEW_DBG] %s: dev=%p base_off=%zu size=%zu dtype=%d shape=[%d,%d,%d,%d] strideB=[%zu,%zu,%zu,%zu]\n",
+                                tag,
+                                (void*)cl->get_device_buffer(),
+                                (size_t)cl->get_base_offset(),
+                                (size_t)cl->m_size,   // 用字段，避免 get_size() 不存在导致编译失败
+                                (int)t->m_dtype,
+                                (int)t->m_shape[0], (int)t->m_shape[1], (int)t->m_shape[2], (int)t->m_shape[3],
+                                (size_t)cl->m_stride[0], (size_t)cl->m_stride[1], (size_t)cl->m_stride[2], (size_t)cl->m_stride[3]
+                            );
+
+                        };
+
+                        fprintf(stderr, "  [VIEW_DBG] ---- VIEW mismatch extra dump ----\n");
+                        dump_cl_buf("in0(parent)", in0);
+                        dump_cl_buf("out(view)", out);
+                        fprintf(stderr, "  [VIEW_DBG] --------------------------------\n");
+                    }
+                    // ---- Extra: VIEW parent leaf sanity (only on mismatch) ----
+                    if (op->op == OpType::VIEW && (int)op->prev.size() > 0) {
+                        Tensor *parent = op->prev[0]->tensor();
+                        if (parent) {
+                           uint64_t h4096_o=0, hfull_o=0;
+                            size_t nb_o=0;
+                            bool ok_o = tensor_bytes_sig_any(parent, cl_backend, &h4096_o, &nb_o, &hfull_o);
+                            fmt::print("  [VIEW-parent-sig][OCL ] ok={} nbytes={} hash4096=0x{:016x} hash_full=0x{:016x}\n",
+                                    ok_o, nb_o, h4096_o, hfull_o);
+
+                            auto v_o = tensor_to_f32_vec_any(parent, cl_backend);
+                            dump_f32_sample(v_o, "VIEW-parent ocl", 8);
                         }
                     }
                 };

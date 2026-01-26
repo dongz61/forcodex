@@ -166,13 +166,24 @@ public:
         }
 
         // Visible size: remaining bytes from base offset to end.
-        const size_t visible_size = parent.m_size - offset;
+        // Size required by *this view* (bytes)
+        const size_t view_bytes = stride.back() * shape.back();
+
+        // Bounds check: offset + view_bytes must be within parent's visible window
+        if (offset + view_bytes > parent.m_size) {
+            POWERSERVE_LOG_ERROR(
+                "View range [offset={}, bytes={}] exceeds parent buffer size {}",
+                offset, view_bytes, parent.m_size
+            );
+            return nullptr;
+        }
 
         // Alias: same cl_mem, NOT owning it, NOT pooled, NOT subbuffer.
+        // IMPORTANT: m_size should be the view's logical size, not "remaining bytes".
         auto buf = std::make_shared<OpenCLBuffer>(
             stride,
             parent.m_device_buffer,
-            visible_size,
+            view_bytes,
             parent.memory_pool, // keep for copy/map helpers
             /*owns_buffer=*/false,
             /*is_pooled=*/false,
