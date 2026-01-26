@@ -137,11 +137,60 @@ void Executor::allocate_buffers() {
         }
     }
 
+    std::unordered_set<Tensor*> view_op_outputs;
+    if (use_opencl) {
+        for (auto &op : m_graph.ops) {
+            if (op && op->op == OpType::VIEW) {
+                Tensor* out = op->output();
+                if (out) view_op_outputs.insert(out);
+            }
+        }
+    }
+
     for (auto &node : m_graph.tensors) {
         auto tensor = node->tensor();
         if (!tensor) continue;
 
-        if (node->type == NodeType::TENSOR_VIEW) {
+        if (use_opencl && node->type == NodeType::TENSOR_VIEW) {
+            // 1) VIEW op 的输出：run() 里会按 (stride, offset) 物化 OpenCL view（避免重复）
+            if (view_op_outputs.count(tensor) > 0) {
+                continue;
+            }
+
+            // 2) 其他 view（比如 transpose/permute 产生的 TensorViewNode）：
+            if (tensor->m_data) {
+                auto &base = tensor->get<BaseBuffer>();
+                if (dynamic_cast<powerserve::opencl::OpenCLBuffer*>(&base)) {
+                    continue;
+                }
+                // 如果这里不是 OpenCLBuffer，说明 view 在 OpenCL 模式下混入了 CPUBuffer（通常是你还没处理的迁移路径）
+                POWERSERVE_ABORT("allocate_buffers(view): view tensor has non-OpenCL buffer under use_opencl");
+            }
+
+            auto *view_node = node->tensor_view();
+            POWERSERVE_ASSERT(view_node && "allocate_buffers(view): tensor_view() is null");
+            POWERSERVE_ASSERT(view_node->parent && "allocate_buffers(view): parent is null");
+            POWERSERVE_ASSERT(view_node->parent->m_data && "allocate_buffers(view): parent has no buffer");
+
+            auto &parent_cl = view_node->parent->get<powerserve::opencl::OpenCLBuffer>();
+
+            std::shared_ptr<powerserve::opencl::OpenCLBuffer> view_buf;
+            switch (tensor->m_dtype) {
+            case DataType::FP32:
+                view_buf = powerserve::opencl::OpenCLBuffer::create_buffer_view<float>(parent_cl, tensor->m_shape, /*offset=*/0);
+                break;
+            case DataType::FP16:
+                view_buf = powerserve::opencl::OpenCLBuffer::create_buffer_view<uint16_t>(parent_cl, tensor->m_shape, /*offset=*/0);
+                break;
+            case DataType::INT32:
+                view_buf = powerserve::opencl::OpenCLBuffer::create_buffer_view<int32_t>(parent_cl, tensor->m_shape, /*offset=*/0);
+                break;
+            default:
+                POWERSERVE_ABORT("allocate_buffers(view): unsupported dtype");
+            }
+
+            POWERSERVE_ASSERT(view_buf && "allocate_buffers(view): failed to create OpenCL view buffer");
+            tensor->m_data = std::static_pointer_cast<BaseBuffer>(view_buf);
             continue;
         }
 

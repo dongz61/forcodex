@@ -66,9 +66,14 @@ public:
         
         auto *p = dynamic_cast<Buffer *>(m_data.get());
         if (!p) {
-            fprintf(stderr, "[Tensor::get] bad cast: want=%s, actual=%s\n",
-                    typeid(Buffer).name(), typeid(*m_data).name());
-            abort(); // 或 throw runtime_error
+            const char *actual = "(null)";
+            if (m_data) {
+                // 注意：这里用 m_data.get()，并且只有在非空时才做 typeid(*ptr)
+                actual = typeid(*m_data.get()).name();
+            }
+            fprintf(stderr, "[Tensor::get] bad cast or null buffer: want=%s, actual=%s\n",
+                    typeid(Buffer).name(), actual);
+            abort(); // 或 throw std::runtime_error(...)
         }
         return *p;
     }
