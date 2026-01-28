@@ -83,12 +83,24 @@ auto Qwen2Model::forward(
 #endif
     {
         if (!lazy_load) {
-            m_platform->ggml_backends[m_config->model_id]->reset_kv_batch_size(batch_size);
+            const bool use_opencl = m_platform->using_opencl(m_config->model_id);
+            if (use_opencl) {
+                m_platform->opencl_backends[m_config->model_id]->reset_kv_batch_size(batch_size);
+            } else {
+                m_platform->ggml_backends[m_config->model_id]->reset_kv_batch_size(batch_size);
+            }
             for (size_t L = 0; L < llm_config.n_layers; L++) {
-                auto [k_cache, v_cache] = m_platform->ggml_backends[m_config->model_id]->m_kv->get_cache(L);
-                auto att_o = m_attn->build(g, x, L, g.add_tensor(k_cache), g.add_tensor(v_cache), pos, mask, true);
-                auto ffn_o = m_ffn->build(g, att_o, L);
-                x          = ffn_o;
+                if (use_opencl) {
+                    auto [k_cache, v_cache] = m_platform->opencl_backends[m_config->model_id]->get_cache_tensors(L);
+                    auto att_o = m_attn->build(g, x, L, g.add_tensor(k_cache), g.add_tensor(v_cache), pos, mask, true);
+                    auto ffn_o = m_ffn->build(g, att_o, L);
+                    x          = ffn_o;
+                } else {
+                    auto [k_cache, v_cache] = m_platform->ggml_backends[m_config->model_id]->m_kv->get_cache(L);
+                    auto att_o = m_attn->build(g, x, L, g.add_tensor(k_cache), g.add_tensor(v_cache), pos, mask, true);
+                    auto ffn_o = m_ffn->build(g, att_o, L);
+                    x          = ffn_o;
+                }
             }
             // TODO: cpu and qnn reuse
             if (lm_head) {

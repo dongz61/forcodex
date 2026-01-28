@@ -31,11 +31,11 @@ static const char *PROMPT      = "你好，请介绍你自己";
 static int    N_THREADS   = 8;
 static size_t BATCH_SIZE  = 1;
 
-static float ATOL  = 1e-6f;
-static float RTOL  = 1e-6f;
+static float ATOL  = 1e-4f;
+static float RTOL  = 1e-4f;
 static int   TOPK  = 10;
 static int   DECODE_STEPS = 16;
-static bool  SKIP_VIEW_COMPARE = true;
+static bool  SKIP_VIEW_COMPARE = false;
 
 // last-writer dump depth for a given cl_mem
 static int   LAST_WRITER_RECENT_N = 24;

@@ -43,6 +43,19 @@ std::shared_ptr<OpenCLBuffer> OpenCLBackend::debug_get_v_cache(size_t L) const {
     return m_kv->value[L];
 }
 
+std::pair<Tensor, Tensor> OpenCLBackend::get_cache_tensors(size_t L) const {
+    POWERSERVE_ASSERT(m_kv && m_kv->allocated());
+    POWERSERVE_ASSERT(L < m_kv->key.size());
+
+    Shape shape{m_kv->kv_dim, m_kv->max_seq_len, 1, 1};
+    Tensor k_cache(DataType::FP32, shape);
+    Tensor v_cache(DataType::FP32, shape);
+    k_cache.m_data = m_kv->key[L];
+    v_cache.m_data = m_kv->value[L];
+
+    return {k_cache, v_cache};
+}
+
 static inline const char* dtype_name(DataType t) {
     switch (t) {
         case DataType::FP32: return "FP32";
@@ -2402,17 +2415,6 @@ void OpenCLBackend::add_cache(const Tensor *k,
             return;
         }
 
-        POWERSERVE_LOG_INFO(
-                "[KV][ADD_CACHE] L={} slot={} kv_dim={} token_bytes={} offset={} | "
-                "Kparent(dev={}, base_off={}, size={}) -> Kview(base_off={}, size={}) | "
-                "Vparent(dev={}, base_off={}, size={}) -> Vview(base_off={}, size={})",
-                L, slot, kv_dim, token_bytes, offset,
-                (void*)k_parent.get_device_buffer(), k_parent.get_base_offset(), k_parent.get_size(),
-                k_view->get_base_offset(), k_view->get_size(),
-                (void*)v_parent.get_device_buffer(), v_parent.get_base_offset(), v_parent.get_size(),
-                v_view->get_base_offset(), v_view->get_size()
-            );
-
         Tensor t_dst_k(DataType::FP32, sTok);
         Tensor t_dst_v(DataType::FP32, sTok);
         t_dst_k.m_data = k_view;
@@ -2448,7 +2450,6 @@ void OpenCLBackend::add_cache(const Tensor *k,
     // v0 语义是 decode append 1 token（OpenCLKV::position）:contentReference[oaicite:5]{index=5}
     m_kv->position = slot + 1;
 }
-
 
 void OpenCLBackend::transpose(const Tensor *out, const Tensor *x) const {
     POWERSERVE_ASSERT(out && x);

@@ -138,6 +138,9 @@ public:
     std::shared_ptr<OpenCLBuffer> debug_get_k_cache(size_t L) const;
     std::shared_ptr<OpenCLBuffer> debug_get_v_cache(size_t L) const;
     
+    // Lightweight cache tensor wrappers for graph construction.
+    std::pair<Tensor, Tensor> get_cache_tensors(size_t L) const;
+
     // 张量属性检查 / 并行任务估算（如果还需要）
     bool is_contiguous(const Tensor *tensor, int n) const;
     int  get_n_tasks(std::shared_ptr<OpNode> op);
