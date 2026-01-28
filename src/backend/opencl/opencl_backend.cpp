@@ -16,6 +16,8 @@
 #include <execinfo.h>
 #include <fmt/core.h>
 #include <mutex>
+#include <cstdlib>   // getenv, atoi
+
 
 #define CL_CHECK(call) \
     do { \
@@ -48,6 +50,14 @@ static inline const char* dtype_name(DataType t) {
         case DataType::INT32: return "INT32";
         default: return "OTHER";
     }
+}
+
+static inline bool kv_dbg_enabled() {
+    static int on = []() -> int {
+        const char* e = std::getenv("POWERSERVE_KV_DBG");
+        return e ? std::atoi(e) : 0;
+    }();
+    return on != 0;
 }
 
 static inline void log_tensor_meta(OpenCLBackend *self, const char *tag, const Tensor *t, int n = 4) {
@@ -2232,74 +2242,130 @@ void OpenCLBackend::add_cache(const Tensor *k,
                               const std::vector<int> &pos,
                               size_t head_id) {
     (void)head_id;
+    POWERSERVE_LOG_INFO("add_cache");
 
     if (!m_kv) { POWERSERVE_LOG_ERROR("add_cache: KVCache not allocated"); return; }
     if (!k || !v) { POWERSERVE_LOG_ERROR("add_cache: null tensor"); return; }
+
     if (m_kv->batch_size != 1 || pos.size() != 1) {
         POWERSERVE_LOG_ERROR("add_cache v0 expects batch=1 and pos.size()==1");
         return;
     }
+
+    // ---- slot：必须跟模型的 token position 对齐；不要只用 m_kv->position ----
+    if (pos[0] < 0) {
+        POWERSERVE_LOG_ERROR("add_cache: invalid pos[0]={}", pos[0]);
+        return;
+    }
+    const size_t slot = (size_t)pos[0];
+
     if (L >= m_kv->key.size()) {
         POWERSERVE_LOG_ERROR("add_cache: invalid layer {}", L);
         return;
     }
-    if (m_kv->position >= m_kv->max_seq_len) {
-        POWERSERVE_LOG_ERROR("KVCache overflow: position {} max_seq_len {}", m_kv->position, m_kv->max_seq_len);
+    if (slot >= m_kv->max_seq_len) {
+        POWERSERVE_LOG_ERROR("KVCache overflow: slot {} max_seq_len {}", slot, m_kv->max_seq_len);
         return;
     }
+
     if (k->m_dtype != DataType::FP32 || v->m_dtype != DataType::FP32) {
         POWERSERVE_LOG_ERROR("add_cache v0 only supports FP32");
         return;
     }
 
     const size_t kv_dim = m_kv->kv_dim;
+
     // Expect token shape {kv_dim, 1, 1, 1}
     if (k->m_shape[0] != kv_dim || k->m_shape[1] != 1 || k->m_shape[2] != 1 || k->m_shape[3] != 1 ||
         v->m_shape[0] != kv_dim || v->m_shape[1] != 1 || v->m_shape[2] != 1 || v->m_shape[3] != 1) {
-        POWERSERVE_LOG_ERROR("add_cache shape mismatch: expect {{kv_dim,1,1,1}}");
+        POWERSERVE_LOG_ERROR("add_cache shape mismatch: expect {{kv_dim,1,1,1}} (kv_dim={})", kv_dim);
         return;
     }
 
-    const size_t cur = m_kv->position;
+    // ---- offset：bytes；create_buffer_view 会把 offset 加到 parent.base_offset 上（Scheme-B） ----
+    const size_t token_bytes = kv_dim * sizeof(float);
+    const size_t offset      = slot * token_bytes;
 
-    // Layout: cache is {kv_dim, max_seq_len} row-major (cols=kv_dim).
-    // Writing row=cur => offset in elements = cur * kv_dim
-    // !!! IMPORTANT: offset unit depends on create_buffer_view contract.
-    // If offset is in BYTES, use: cur*kv_dim*sizeof(float).
-    // If offset is in ELEMENTS, use: cur*kv_dim.
-    //
-    // From your earlier system rule ("offset encoded into cl_mem"), it is almost certainly BYTES.
-    const size_t offset = cur * kv_dim * sizeof(float);
-
-    // Create destination views (one token slice)
     Shape sTok{kv_dim, 1, 1, 1};
 
     try {
         auto &k_parent = *m_kv->key[L];
         auto &v_parent = *m_kv->value[L];
 
+        // ---- 关键一致性检查：pos vs position（不一致就很可能“写错行、读到全0”）----
+        if (slot != m_kv->position) {
+            // 不直接 abort：先把现场打出来，让你确认是不是这里导致错位
+            POWERSERVE_LOG_WARN("[KV][ADD_CACHE] position mismatch: slot(pos[0])={} m_kv->position={} (L={}, kv_dim={}, max_seq_len={})",
+                                    slot, m_kv->position, L, kv_dim, m_kv->max_seq_len);
+        }
+
+        // ---- 边界（双保险；create_buffer_view 内部也会检查）----
+        if (offset + token_bytes > k_parent.get_size()) {
+            POWERSERVE_LOG_ERROR("[KV][ADD_CACHE] K view out of range: L={} slot={} offset={} token_bytes={} parent_size={}",
+                                 L, slot, offset, token_bytes, k_parent.get_size());
+            return;
+        }
+        if (offset + token_bytes > v_parent.get_size()) {
+            POWERSERVE_LOG_ERROR("[KV][ADD_CACHE] V view out of range: L={} slot={} offset={} token_bytes={} parent_size={}",
+                                 L, slot, offset, token_bytes, v_parent.get_size());
+            return;
+        }
+
         auto k_view = powerserve::opencl::OpenCLBuffer::create_buffer_view<float>(k_parent, sTok, offset);
         auto v_view = powerserve::opencl::OpenCLBuffer::create_buffer_view<float>(v_parent, sTok, offset);
 
         if (!k_view || !v_view) {
-            POWERSERVE_LOG_ERROR("add_cache: create_buffer_view failed");
+            POWERSERVE_LOG_ERROR("add_cache: create_buffer_view failed (L={}, slot={}, offset={})", L, slot, offset);
             return;
         }
+
+        POWERSERVE_LOG_INFO(
+                "[KV][ADD_CACHE] L={} slot={} kv_dim={} token_bytes={} offset={} | "
+                "Kparent(dev={}, base_off={}, size={}) -> Kview(base_off={}, size={}) | "
+                "Vparent(dev={}, base_off={}, size={}) -> Vview(base_off={}, size={})",
+                L, slot, kv_dim, token_bytes, offset,
+                (void*)k_parent.get_device_buffer(), k_parent.get_base_offset(), k_parent.get_size(),
+                k_view->get_base_offset(), k_view->get_size(),
+                (void*)v_parent.get_device_buffer(), v_parent.get_base_offset(), v_parent.get_size(),
+                v_view->get_base_offset(), v_view->get_size()
+            );
 
         Tensor t_dst_k(DataType::FP32, sTok);
         Tensor t_dst_v(DataType::FP32, sTok);
         t_dst_k.m_data = k_view;
         t_dst_v.m_data = v_view;
 
-        this->copy(&t_dst_k, k); // D2D
-        this->copy(&t_dst_v, v); // D2D
+        // D2D 写入 cache 的这个 slot
+        this->copy(&t_dst_k, k);
+        this->copy(&t_dst_v, v);
+
+        // ---- 可选：写完立刻抽样读回 8 个 float，确认“这一行真的被写了” ----
+        // copy() 的 CL kernel 会显式传 base_offset（Scheme-B）:contentReference[oaicite:4]{index=4}，所以这个抽样能验证 offset 是否生效。
+        Tensor host_k(DataType::FP32, Shape{8,1,1,1});
+            host_k.m_data = powerserve::CPUBuffer::create_buffer<float>(Shape{8,1,1,1});
+
+            Tensor k_first8(DataType::FP32, Shape{8,1,1,1});
+            // 从 t_dst_k 再切一个 view：offset=0（在 token 内部取前8）
+            auto k_first8_view = powerserve::opencl::OpenCLBuffer::create_buffer_view<float>(*k_view, Shape{8,1,1,1}, /*offset=*/0);
+            k_first8.m_data = k_first8_view;
+
+            this->copy(&host_k, &k_first8);
+
+            auto &hb = host_k.get<powerserve::CPUBuffer>();
+            float *p = (float*)hb.m_data;
+            POWERSERVE_LOG_INFO("[KV][ADD_CACHE] L={} slot={} K_first8: {:.6f} {:.6f} {:.6f} {:.6f} {:.6f} {:.6f} {:.6f} {:.6f}",
+                                L, slot, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+
     } catch (const std::bad_cast &e) {
         POWERSERVE_LOG_ERROR("add_cache expects OpenCLBuffer in KVCache: {}", e.what());
         return;
     }
 
-    m_kv->position += 1;
+    // ---- 更新 position：以 slot 为准，避免悄悄漂移 ----
+    // v0 语义是 decode append 1 token（OpenCLKV::position）:contentReference[oaicite:5]{index=5}
+    m_kv->position = slot + 1;
 }
+
 
 void OpenCLBackend::transpose(const Tensor *out, const Tensor *x) const {
     POWERSERVE_ASSERT(out && x);

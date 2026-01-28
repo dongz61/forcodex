@@ -101,6 +101,10 @@ public:
             return nullptr;
         }
 
+        // POWERSERVE_LOG_INFO("[CL-ALLOC] create_buffer bytes={} dev={} pooled=1",
+        //             size,
+        //             (void*)device_buffer);
+
         return std::make_shared<OpenCLBuffer>(stride, device_buffer, size, pool, true, true, false);
     }
 

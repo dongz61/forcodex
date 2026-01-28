@@ -22,6 +22,10 @@
 #include <array>
 #include <string>
 #include <fmt/core.h>
+#include <cmath>
+#include <algorithm>
+#include <cstdio>
+#include <mutex>
 
 
 namespace powerserve {
@@ -100,6 +104,216 @@ static uint64_t hash_ops_signature(const std::vector<std::shared_ptr<powerserve:
     }
 
     return h;
+}
+
+static constexpr uintptr_t kTraceDev = (uintptr_t)0x5790aeb3f7a0;
+
+// 打印 CPU tensor 前 N 个 FP32（按 stride0 取）
+static inline void dump_cpu_f32_head(const Tensor *t, int n, const char *tag) {
+    if (!t || !t->m_data || t->m_dtype != DataType::FP32) return;
+    auto *cb = dynamic_cast<powerserve::CPUBuffer*>(t->m_data.get());
+    if (!cb || !cb->m_data) return;
+
+    size_t count = std::min<size_t>((size_t)n, (size_t)t->m_shape[0]);
+    size_t s0 = (size_t)cb->m_stride[0];
+
+    float mn = 0.f, mx = 0.f;
+    bool first = true;
+
+    fmt::print("  [{}] ", tag);
+    for (size_t i = 0; i < count; ++i) {
+        float v = *(float*)((char*)cb->m_data + i * s0);
+        if (first) { mn = mx = v; first = false; }
+        else { mn = std::min(mn, v); mx = std::max(mx, v); }
+        if (i < 8) fmt::print("{:.6f} ", v);
+    }
+    fmt::print("(min={:.6f} max={:.6f} n={})\n", mn, mx, count);
+}
+
+// 对 OpenCL tensor 回读前 N 个 FP32（通过一个“缩小 shape 的 view”回读）
+static inline void dump_opencl_f32_head(
+    powerserve::opencl::OpenCLBackend *cl_backend,
+    const Tensor *t_cl,
+    int n,
+    const char *tag)
+{
+    if (!cl_backend || !t_cl || !t_cl->m_data || t_cl->m_dtype != DataType::FP32) return;
+
+    size_t count = std::min<size_t>((size_t)n, (size_t)t_cl->m_shape[0]);
+
+    Tensor cl_view = *const_cast<Tensor*>(t_cl);
+    cl_view.m_shape = Shape{count, 1, 1, 1};
+
+    Tensor cpu_out(DataType::FP32, Shape{count, 1, 1, 1});
+    cpu_out.m_data = powerserve::CPUBuffer::create_buffer<float>(cpu_out.m_shape);
+
+    cl_backend->copy(&cpu_out, &cl_view);
+    dump_cpu_f32_head(&cpu_out, (int)count, tag);
+}
+
+// 对比 CPU 源 vs CL 回读 head（max_abs + nz）
+static inline void compare_cpu_vs_opencl_head(
+    powerserve::opencl::OpenCLBackend *cl_backend,
+    const Tensor *cpu_src,
+    const Tensor *cl_dst,
+    int n)
+{
+    if (!cl_backend || !cpu_src || !cl_dst) return;
+    if (!cpu_src->m_data || !cl_dst->m_data) return;
+    if (cpu_src->m_dtype != DataType::FP32 || cl_dst->m_dtype != DataType::FP32) return;
+
+    auto *src = dynamic_cast<powerserve::CPUBuffer*>(cpu_src->m_data.get());
+    if (!src || !src->m_data) return;
+
+    size_t count = std::min<size_t>((size_t)n, (size_t)cpu_src->m_shape[0]);
+    size_t s0 = (size_t)src->m_stride[0];
+
+    Tensor cl_view = *const_cast<Tensor*>(cl_dst);
+    cl_view.m_shape = Shape{count, 1, 1, 1};
+
+    Tensor cpu_out(DataType::FP32, Shape{count, 1, 1, 1});
+    cpu_out.m_data = powerserve::CPUBuffer::create_buffer<float>(cpu_out.m_shape);
+
+    cl_backend->copy(&cpu_out, &cl_view);
+    auto *dst = dynamic_cast<powerserve::CPUBuffer*>(cpu_out.m_data.get());
+    if (!dst || !dst->m_data) return;
+
+    float max_abs = 0.f;
+    size_t max_i = 0;
+    size_t nz = 0;
+
+    for (size_t i = 0; i < count; ++i) {
+        float a = *(float*)((char*)src->m_data + i * s0);
+        float b = *(float*)((char*)dst->m_data + i * (size_t)dst->m_stride[0]);
+        float d = std::fabs(a - b);
+        if (d != 0.f) nz++;
+        if (d > max_abs) { max_abs = d; max_i = i; }
+    }
+
+    fmt::print("  [H2D-head-compare] n={} nz={} max_abs={:.6f} at i={}\n",
+               count, nz, max_abs, max_i);
+}
+
+// ziqian: end
+
+// ziqian: add logger
+static FILE* g_cl_upload_fp = nullptr;
+static std::once_flag g_cl_upload_once;
+
+static inline FILE* cl_upload_fp() {
+    std::call_once(g_cl_upload_once, []() {
+        // ⚠️ fopen 不支持 "~" 展开，必须用绝对路径
+        const char* path = "/home/intern/ziqian/PowerServe-opencl/HybridRAG/powerserve_cl_upload.log";
+
+        g_cl_upload_fp = std::fopen(path, "w");
+        if (!g_cl_upload_fp) {
+            // 打印失败原因，然后直接 abort
+            std::fprintf(stderr,
+                         "[FATAL] failed to open log file: %s, errno=%d (%s)\n",
+                         path, errno, std::strerror(errno));
+            std::fflush(stderr);
+            std::abort();
+        }
+
+        std::setvbuf(g_cl_upload_fp, nullptr, _IOLBF, 0); // 行缓冲
+    });
+    return g_cl_upload_fp;
+}
+
+template <typename... Args>
+static inline void CL_UPLOAD_FLOG(const char* fmt_str, Args&&... args) {
+    if (FILE* fp = cl_upload_fp()) {
+        fmt::print(fp, "[INFO ] ");
+        fmt::print(fp, fmt::runtime(fmt_str), std::forward<Args>(args)...);
+        fmt::print(fp, "\n");
+        std::fflush(fp);
+    }
+}
+
+// 让 dump_* 也写进同一个文件：加一个 FILE* 参数版本
+static inline void dump_cpu_f32_head_fp(FILE* fp, const Tensor *t, int n, const char *tag) {
+    if (!fp || !t || !t->m_data || t->m_dtype != DataType::FP32) return;
+    auto *cb = dynamic_cast<powerserve::CPUBuffer*>(t->m_data.get());
+    if (!cb || !cb->m_data) return;
+
+    size_t count = std::min<size_t>((size_t)n, (size_t)t->m_shape[0]);
+    size_t s0 = (size_t)cb->m_stride[0];
+
+    float mn = 0.f, mx = 0.f;
+    bool first = true;
+
+    fmt::print(fp, "  [{}] ", tag);
+    for (size_t i = 0; i < count; ++i) {
+        float v = *(float*)((char*)cb->m_data + i * s0);
+        if (first) { mn = mx = v; first = false; }
+        else { mn = std::min(mn, v); mx = std::max(mx, v); }
+        if (i < 8) fmt::print(fp, "{:.6f} ", v);
+    }
+    fmt::print(fp, "(min={:.6f} max={:.6f} n={})\n", mn, mx, count);
+}
+
+static inline void dump_opencl_f32_head_fp(
+    FILE* fp,
+    powerserve::opencl::OpenCLBackend *cl_backend,
+    const Tensor *t_cl,
+    int n,
+    const char *tag)
+{
+    if (!fp || !cl_backend || !t_cl || !t_cl->m_data || t_cl->m_dtype != DataType::FP32) return;
+
+    size_t count = std::min<size_t>((size_t)n, (size_t)t_cl->m_shape[0]);
+
+    Tensor cl_view = *const_cast<Tensor*>(t_cl);
+    cl_view.m_shape = Shape{count, 1, 1, 1};
+
+    Tensor cpu_out(DataType::FP32, Shape{count, 1, 1, 1});
+    cpu_out.m_data = powerserve::CPUBuffer::create_buffer<float>(cpu_out.m_shape);
+
+    cl_backend->copy(&cpu_out, &cl_view);
+    dump_cpu_f32_head_fp(fp, &cpu_out, (int)count, tag);
+}
+
+static inline void compare_cpu_vs_opencl_head_fp(
+    FILE* fp,
+    powerserve::opencl::OpenCLBackend *cl_backend,
+    const Tensor *cpu_src,
+    const Tensor *cl_dst,
+    int n)
+{
+    if (!fp || !cl_backend || !cpu_src || !cl_dst) return;
+    if (!cpu_src->m_data || !cl_dst->m_data) return;
+    if (cpu_src->m_dtype != DataType::FP32 || cl_dst->m_dtype != DataType::FP32) return;
+
+    auto *src = dynamic_cast<powerserve::CPUBuffer*>(cpu_src->m_data.get());
+    if (!src || !src->m_data) return;
+
+    size_t count = std::min<size_t>((size_t)n, (size_t)cpu_src->m_shape[0]);
+    size_t s0 = (size_t)src->m_stride[0];
+
+    Tensor cl_view = *const_cast<Tensor*>(cl_dst);
+    cl_view.m_shape = Shape{count, 1, 1, 1};
+
+    Tensor cpu_out(DataType::FP32, Shape{count, 1, 1, 1});
+    cpu_out.m_data = powerserve::CPUBuffer::create_buffer<float>(cpu_out.m_shape);
+
+    cl_backend->copy(&cpu_out, &cl_view);
+    auto *dst = dynamic_cast<powerserve::CPUBuffer*>(cpu_out.m_data.get());
+    if (!dst || !dst->m_data) return;
+
+    float max_abs = 0.f;
+    size_t max_i = 0;
+    size_t nz = 0;
+
+    for (size_t i = 0; i < count; ++i) {
+        float a = *(float*)((char*)src->m_data + i * s0);
+        float b = *(float*)((char*)dst->m_data + i * (size_t)dst->m_stride[0]);
+        float d = std::fabs(a - b);
+        if (d != 0.f) nz++;
+        if (d > max_abs) { max_abs = d; max_i = i; }
+    }
+
+    fmt::print(fp, "  [H2D-head-compare] n={} nz={} max_abs={:.6f} at i={}\n",
+               count, nz, max_abs, max_i);
 }
 // ziqian: end
 
@@ -251,9 +465,50 @@ void Executor::allocate_buffers() {
                                      tensor->m_shape[0], tensor->m_shape[1], tensor->m_shape[2], tensor->m_shape[3]);
                 }
 
-                // 3) H2D copy
-                cl_backend->copy(&tmp, tensor);
+                {
+                    auto *dst_cl = dynamic_cast<powerserve::opencl::OpenCLBuffer*>(&tmp.get<BaseBuffer>());
+                    void *dst_dev = dst_cl ? (void*)dst_cl->get_device_buffer() : nullptr;
+                    const size_t dst_size = dst_cl ? (size_t)dst_cl->m_size : 0;
+                    const bool hit = (dst_size == 67108864);
 
+                    if (hit) {
+                        auto *src_cpu = dynamic_cast<powerserve::CPUBuffer*>(&tensor->get<BaseBuffer>());
+                        auto *fp = cl_upload_fp();
+
+                        CL_UPLOAD_FLOG(
+                            "[CL-UPLOAD][BEFORE][TRACE_DEV] tensor_ptr={} dtype={} shape=[{}, {}, {}, {}] src_cpu={} "
+                            "dst_dev={} dst_base_off={} dst_size={}",
+                            (void*)tensor,
+                            (int)tensor->m_dtype,
+                            tensor->m_shape[0], tensor->m_shape[1], tensor->m_shape[2], tensor->m_shape[3],
+                            (void*)(src_cpu ? src_cpu->m_data : nullptr),
+                            dst_dev,
+                            (size_t)(dst_cl ? dst_cl->get_base_offset() : 0),
+                            (size_t)(dst_cl ? dst_cl->m_size : 0)
+                        );
+
+                        if (fp) dump_cpu_f32_head_fp(fp, tensor, 16, "H2D-src-head");
+                    }
+
+                    cl_backend->copy(&tmp, tensor);
+
+                    if (hit) {
+                        auto *fp = cl_upload_fp();
+
+                        CL_UPLOAD_FLOG(
+                            "[CL-UPLOAD][AFTER ][TRACE_DEV] tensor_ptr={} dst_dev={} dst_base_off={} dst_size={}",
+                            (void*)tensor,
+                            dst_dev,
+                            (size_t)(dst_cl ? dst_cl->get_base_offset() : 0),
+                            (size_t)(dst_cl ? dst_cl->m_size : 0)
+                        );
+
+                        if (fp) {
+                            dump_opencl_f32_head_fp(fp, cl_backend, &tmp, 16, "H2D-dst-readback-head");
+                            compare_cpu_vs_opencl_head_fp(fp, cl_backend, tensor, &tmp, 16);
+                        }
+                    }
+                }
                 // 4) replace original CPU buffer
                 tensor->m_data = std::move(tmp.m_data);
 
