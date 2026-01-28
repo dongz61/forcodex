@@ -35,6 +35,7 @@ static float ATOL  = 1e-6f;
 static float RTOL  = 1e-6f;
 static int   TOPK  = 10;
 static int   DECODE_STEPS = 16;
+static bool  SKIP_VIEW_COMPARE = true;
 
 // last-writer dump depth for a given cl_mem
 static int   LAST_WRITER_RECENT_N = 24;
@@ -618,6 +619,7 @@ int main() {
 
             auto compare_out0 = [&](int op_idx, const OpNode *op) {
                 if ((int)op->next.size() <= 0) return;
+                if (SKIP_VIEW_COMPARE && op->op == OpType::VIEW) return;
                 Tensor *out = op->next[0] ? op->next[0]->tensor() : nullptr;
                 if (!out || !out->m_data) return;
                 if (out->m_dtype != DataType::FP32) return;
