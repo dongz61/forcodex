@@ -252,7 +252,7 @@ bool OpenCLBackend::initialize() {
     }
 
     // 5. 初始化kv cache
-    ensure_kv_cache_allocated_v0();
+    ensure_kv_cache_allocated_v0(1);
 
     // ---- setup reusable GGML fallback backend ----
     if (!m_ggml_fallback) {
@@ -2324,12 +2324,12 @@ void OpenCLBackend::reset_kv_batch_size(const size_t batch_size) const {
         POWERSERVE_LOG_ERROR("reset_kv_batch_size called but KVCache not allocated");
         return;
     }
-    if (batch_size != 1) {
-        POWERSERVE_LOG_ERROR("KVCache v0 only supports batch_size=1, got {}", batch_size);
+    if (batch_size == 0) {
+        POWERSERVE_LOG_ERROR("KVCache v0 expects batch_size > 0");
         return;
     }
-    m_kv->batch_size = 1;
-    m_kv->position = 0;
+    m_kv->batch_size = batch_size;
+    m_kv->reset();
 }
 
 void OpenCLBackend::add_cache(const Tensor *k,
@@ -2338,29 +2338,23 @@ void OpenCLBackend::add_cache(const Tensor *k,
                               const std::vector<int> &pos,
                               size_t head_id) {
     (void)head_id;
-    POWERSERVE_LOG_INFO("add_cache");
 
     if (!m_kv) { POWERSERVE_LOG_ERROR("add_cache: KVCache not allocated"); return; }
     if (!k || !v) { POWERSERVE_LOG_ERROR("add_cache: null tensor"); return; }
 
-    if (m_kv->batch_size != 1 || pos.size() != 1) {
-        POWERSERVE_LOG_ERROR("add_cache v0 expects batch=1 and pos.size()==1");
+    if (pos.empty()) {
+        POWERSERVE_LOG_ERROR("add_cache v0 expects non-empty pos");
         return;
     }
 
-    // ---- slot：必须跟模型的 token position 对齐；不要只用 m_kv->position ----
-    if (pos[0] < 0) {
-        POWERSERVE_LOG_ERROR("add_cache: invalid pos[0]={}", pos[0]);
+    if (pos.size() != m_kv->batch_size) {
+        POWERSERVE_LOG_ERROR("add_cache v0 expects pos.size()==batch_size, got pos.size()={} batch_size={}",
+                             pos.size(), m_kv->batch_size);
         return;
     }
-    const size_t slot = (size_t)pos[0];
 
     if (L >= m_kv->key.size()) {
         POWERSERVE_LOG_ERROR("add_cache: invalid layer {}", L);
-        return;
-    }
-    if (slot >= m_kv->max_seq_len) {
-        POWERSERVE_LOG_ERROR("KVCache overflow: slot {} max_seq_len {}", slot, m_kv->max_seq_len);
         return;
     }
 
@@ -2370,85 +2364,96 @@ void OpenCLBackend::add_cache(const Tensor *k,
     }
 
     const size_t kv_dim = m_kv->kv_dim;
+    const size_t batch_size = pos.size();
 
-    // Expect token shape {kv_dim, 1, 1, 1}
-    if (k->m_shape[0] != kv_dim || k->m_shape[1] != 1 || k->m_shape[2] != 1 || k->m_shape[3] != 1 ||
-        v->m_shape[0] != kv_dim || v->m_shape[1] != 1 || v->m_shape[2] != 1 || v->m_shape[3] != 1) {
-        POWERSERVE_LOG_ERROR("add_cache shape mismatch: expect {{kv_dim,1,1,1}} (kv_dim={})", kv_dim);
+    // Expect token shape {kv_dim, batch_size, 1, 1}
+    if (k->m_shape[0] != kv_dim || k->m_shape[1] != batch_size || k->m_shape[2] != 1 || k->m_shape[3] != 1 ||
+        v->m_shape[0] != kv_dim || v->m_shape[1] != batch_size || v->m_shape[2] != 1 || v->m_shape[3] != 1) {
+        POWERSERVE_LOG_ERROR("add_cache shape mismatch: expect {{kv_dim, batch_size,1,1}} (kv_dim={}, batch_size={})",
+                             kv_dim, batch_size);
         return;
     }
 
     // ---- offset：bytes；create_buffer_view 会把 offset 加到 parent.base_offset 上（Scheme-B） ----
     const size_t token_bytes = kv_dim * sizeof(float);
-    const size_t offset      = slot * token_bytes;
+    const size_t batch_stride_bytes = token_bytes;
 
     Shape sTok{kv_dim, 1, 1, 1};
 
     try {
         auto &k_parent = *m_kv->key[L];
         auto &v_parent = *m_kv->value[L];
+        auto &k_src_parent = const_cast<Tensor *>(k)->get<OpenCLBuffer>();
+        auto &v_src_parent = const_cast<Tensor *>(v)->get<OpenCLBuffer>();
 
-        // ---- 关键一致性检查：pos vs position（不一致就很可能“写错行、读到全0”）----
-        if (slot != m_kv->position) {
-            // 不直接 abort：先把现场打出来，让你确认是不是这里导致错位
-            POWERSERVE_LOG_WARN("[KV][ADD_CACHE] position mismatch: slot(pos[0])={} m_kv->position={} (L={}, kv_dim={}, max_seq_len={})",
-                                    slot, m_kv->position, L, kv_dim, m_kv->max_seq_len);
-        }
+        for (size_t b = 0; b < batch_size; ++b) {
+            if (pos[b] < 0) {
+                POWERSERVE_LOG_ERROR("add_cache: invalid pos[{}]={}", b, pos[b]);
+                return;
+            }
+            const size_t slot = static_cast<size_t>(pos[b]);
+            if (slot >= m_kv->max_seq_len) {
+                POWERSERVE_LOG_ERROR("KVCache overflow: slot {} max_seq_len {}", slot, m_kv->max_seq_len);
+                return;
+            }
 
-        // ---- 边界（双保险；create_buffer_view 内部也会检查）----
-        if (offset + token_bytes > k_parent.get_size()) {
-            POWERSERVE_LOG_ERROR("[KV][ADD_CACHE] K view out of range: L={} slot={} offset={} token_bytes={} parent_size={}",
-                                 L, slot, offset, token_bytes, k_parent.get_size());
-            return;
-        }
-        if (offset + token_bytes > v_parent.get_size()) {
-            POWERSERVE_LOG_ERROR("[KV][ADD_CACHE] V view out of range: L={} slot={} offset={} token_bytes={} parent_size={}",
-                                 L, slot, offset, token_bytes, v_parent.get_size());
-            return;
-        }
+            const size_t dst_offset = slot * token_bytes;
+            const size_t src_offset = b * batch_stride_bytes;
 
-        auto k_view = powerserve::opencl::OpenCLBuffer::create_buffer_view<float>(k_parent, sTok, offset);
-        auto v_view = powerserve::opencl::OpenCLBuffer::create_buffer_view<float>(v_parent, sTok, offset);
+            if (dst_offset + token_bytes > k_parent.get_size()) {
+                POWERSERVE_LOG_ERROR("[KV][ADD_CACHE] K view out of range: L={} slot={} offset={} token_bytes={} parent_size={}",
+                                     L, slot, dst_offset, token_bytes, k_parent.get_size());
+                return;
+            }
+            if (dst_offset + token_bytes > v_parent.get_size()) {
+                POWERSERVE_LOG_ERROR("[KV][ADD_CACHE] V view out of range: L={} slot={} offset={} token_bytes={} parent_size={}",
+                                     L, slot, dst_offset, token_bytes, v_parent.get_size());
+                return;
+            }
 
-        if (!k_view || !v_view) {
-            POWERSERVE_LOG_ERROR("add_cache: create_buffer_view failed (L={}, slot={}, offset={})", L, slot, offset);
-            return;
-        }
+            auto k_view = powerserve::opencl::OpenCLBuffer::create_buffer_view<float>(k_parent, sTok, dst_offset);
+            auto v_view = powerserve::opencl::OpenCLBuffer::create_buffer_view<float>(v_parent, sTok, dst_offset);
+            auto k_src_view = powerserve::opencl::OpenCLBuffer::create_buffer_view<float>(k_src_parent, sTok, src_offset);
+            auto v_src_view = powerserve::opencl::OpenCLBuffer::create_buffer_view<float>(v_src_parent, sTok, src_offset);
+            if (!k_view || !v_view || !k_src_view || !v_src_view) {
+                POWERSERVE_LOG_ERROR("add_cache: create_buffer_view failed (L={}, slot={}, b={})", L, slot, b);
+                return;
+            }
 
-        Tensor t_dst_k(DataType::FP32, sTok);
-        Tensor t_dst_v(DataType::FP32, sTok);
-        t_dst_k.m_data = k_view;
-        t_dst_v.m_data = v_view;
+            Tensor t_dst_k(DataType::FP32, sTok);
+            Tensor t_dst_v(DataType::FP32, sTok);
+            Tensor t_src_k(DataType::FP32, sTok);
+            Tensor t_src_v(DataType::FP32, sTok);
+            t_dst_k.m_data = k_view;
+            t_dst_v.m_data = v_view;
+            t_src_k.m_data = k_src_view;
+            t_src_v.m_data = v_src_view;
 
-        // D2D 写入 cache 的这个 slot
-        this->copy(&t_dst_k, k);
-        this->copy(&t_dst_v, v);
+            this->copy(&t_dst_k, &t_src_k);
+            this->copy(&t_dst_v, &t_src_v);
+            
+            if (kv_dbg_enabled() && b == 0) {
+                Tensor host_k(DataType::FP32, Shape{8,1,1,1});
+                host_k.m_data = powerserve::CPUBuffer::create_buffer<float>(Shape{8,1,1,1});
+                Tensor k_first8(DataType::FP32, Shape{8,1,1,1});
+                auto k_first8_view = powerserve::opencl::OpenCLBuffer::create_buffer_view<float>(*k_view, Shape{8,1,1,1}, /*offset=*/0);
+                k_first8.m_data = k_first8_view;
+                this->copy(&host_k, &k_first8);
 
-        // ---- 可选：写完立刻抽样读回 8 个 float，确认“这一行真的被写了” ----
-        // copy() 的 CL kernel 会显式传 base_offset（Scheme-B）:contentReference[oaicite:4]{index=4}，所以这个抽样能验证 offset 是否生效。
-        Tensor host_k(DataType::FP32, Shape{8,1,1,1});
-            host_k.m_data = powerserve::CPUBuffer::create_buffer<float>(Shape{8,1,1,1});
+                auto &hb = host_k.get<powerserve::CPUBuffer>();
+                float *p = (float*)hb.m_data;
+                POWERSERVE_LOG_INFO("[KV][ADD_CACHE] L={} slot={} K_first8: {:.6f} {:.6f} {:.6f} {:.6f} {:.6f} {:.6f} {:.6f} {:.6f}",
+                                    L, slot, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+            }
 
-            Tensor k_first8(DataType::FP32, Shape{8,1,1,1});
-            // 从 t_dst_k 再切一个 view：offset=0（在 token 内部取前8）
-            auto k_first8_view = powerserve::opencl::OpenCLBuffer::create_buffer_view<float>(*k_view, Shape{8,1,1,1}, /*offset=*/0);
-            k_first8.m_data = k_first8_view;
-
-            this->copy(&host_k, &k_first8);
-
-            auto &hb = host_k.get<powerserve::CPUBuffer>();
-            float *p = (float*)hb.m_data;
-            POWERSERVE_LOG_INFO("[KV][ADD_CACHE] L={} slot={} K_first8: {:.6f} {:.6f} {:.6f} {:.6f} {:.6f} {:.6f} {:.6f} {:.6f}",
-                                L, slot, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
-
+            if (b < m_kv->positions.size()) {
+                m_kv->positions[b] = slot + 1;
+            }
+        }                
     } catch (const std::bad_cast &e) {
         POWERSERVE_LOG_ERROR("add_cache expects OpenCLBuffer in KVCache: {}", e.what());
         return;
     }
-
-    // ---- 更新 position：以 slot 为准，避免悄悄漂移 ----
-    // v0 语义是 decode append 1 token（OpenCLKV::position）:contentReference[oaicite:5]{index=5}
-    m_kv->position = slot + 1;
 }
 
 void OpenCLBackend::transpose(const Tensor *out, const Tensor *x) const {
@@ -2476,8 +2481,8 @@ void OpenCLBackend::transpose(const Tensor *out, const Tensor *x) const {
     std::swap(obuf.m_stride[0], obuf.m_stride[1]);
 }
 
-void OpenCLBackend::ensure_kv_cache_allocated_v0() {
-    // v0: batch fixed 1, FP32, prealloc
+void OpenCLBackend::ensure_kv_cache_allocated_v0(size_t batch_size) {
+    // v0: FP32, prealloc
     const int n_layers_i = m_llm.n_layers;
     const int seq_len_i  = m_llm.seq_len;   // n_ctx
     const int kv_dim_i   = m_llm.kv_dim;
@@ -2495,15 +2500,15 @@ void OpenCLBackend::ensure_kv_cache_allocated_v0() {
     if (!m_kv) m_kv = std::make_unique<powerserve::opencl::OpenCLKV>();
 
     // If already allocated with same spec, do nothing
-    if (m_kv->spec_matches(n_layers, kv_dim, max_seq_len)) {
+    if (m_kv->spec_matches(n_layers, kv_dim, max_seq_len, batch_size)) {
         return;
     }
 
     // (Re)allocate
     m_kv->kv_dim = kv_dim;
     m_kv->max_seq_len = max_seq_len;
-    m_kv->batch_size = 1;
-    m_kv->position = 0;
+    m_kv->batch_size = batch_size;
+    m_kv->positions.assign(batch_size, 0);
     m_kv->key.clear();
     m_kv->value.clear();
     m_kv->key.resize(n_layers);
@@ -2520,8 +2525,8 @@ void OpenCLBackend::ensure_kv_cache_allocated_v0() {
         }
     }
 
-    POWERSERVE_LOG_INFO("KVCache v0 allocated: layers={}, kv_dim={}, max_seq_len={}",
-                        n_layers, kv_dim, max_seq_len);
+    POWERSERVE_LOG_INFO("KVCache v0 allocated: layers={}, kv_dim={}, max_seq_len={}, batch_size={}",
+                        n_layers, kv_dim, max_seq_len, batch_size);
 }
 
 } // namespace powerserve::opencl

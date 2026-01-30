@@ -18,26 +18,29 @@ struct OpenCLKV {
     size_t kv_dim = 0;
     size_t max_seq_len = 0;
     size_t batch_size = 1;
-    size_t position = 0;
+    std::vector<size_t> positions = {};
 
     // Per-layer device buffers:
     // shape conceptually: {kv_dim, max_seq_len, 1, 1} FP32 contiguous
     std::vector<std::shared_ptr<powerserve::opencl::OpenCLBuffer>> key;
     std::vector<std::shared_ptr<powerserve::opencl::OpenCLBuffer>> value;
 
-    void reset() { position = 0; }
+    void reset() { positions.assign(batch_size, 0); }
 
     bool allocated() const {
         return kv_dim > 0 && max_seq_len > 0 &&
-               !key.empty() && key.size() == value.size();
+                !key.empty() && key.size() == value.size() &&
+               positions.size() == batch_size;
     }
 
-    bool spec_matches(size_t n_layers, size_t kv_dim_, size_t max_seq_len_) const {
+    bool spec_matches(size_t n_layers, size_t kv_dim_, size_t max_seq_len_, size_t batch_size_) const {
         return key.size() == n_layers &&
             value.size() == n_layers &&
             kv_dim == kv_dim_ &&
             max_seq_len == max_seq_len_ &&
-            batch_size == 1;
+            batch_size == batch_size_ &&
+            !positions.empty() &&
+            positions.size() == batch_size_;
     }
 
 };

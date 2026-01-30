@@ -230,7 +230,7 @@ private:
     mutable std::unique_ptr<powerserve::ggml::GGMLBackend> m_ggml_fallback;
     mutable size_t m_ggml_fallback_wsize = 0;
 
-    void ensure_kv_cache_allocated_v0();
+    void ensure_kv_cache_allocated_v0(size_t batch_size);
     mutable ModelConfig::LLMConfig m_llm;   // 保存模型参数来源
     mutable HyperParams m_hparams;          // 如果未来要用也方便
     mutable std::unique_ptr<powerserve::opencl::OpenCLKV> m_kv;
