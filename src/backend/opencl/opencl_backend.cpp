@@ -1556,21 +1556,34 @@ void OpenCLBackend::permute(const Tensor *out, const Tensor *x, Shape axes) cons
     if (!initialized) POWERSERVE_ABORT("OpenCL backend not initialized");
     if (!out || !x)   POWERSERVE_ABORT("permute got null tensor");
 
-    // permute = view: share the same underlying buffer, only rewrite stride
     auto *dst = const_cast<Tensor*>(out);
 
-    // require OpenCL buffers
-    auto &xbuf = const_cast<Tensor*>(x)->get<OpenCLBuffer>();
-    (void)xbuf.get_device_buffer(); // touch to validate
+    OpenCLBuffer *xbuf = nullptr;
+    OpenCLBuffer *obuf = nullptr;
+    try {
+        xbuf = &const_cast<Tensor*>(x)->get<OpenCLBuffer>();
+    } catch (const std::bad_cast &e) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::permute expects OpenCLBuffer input: {}", e.what());
+        POWERSERVE_ABORT("permute: input not OpenCLBuffer");
+    }
 
-    // share underlying cl_mem (including sub-buffer views)
-    dst->m_data = x->m_data;
+    if (!dst->m_data) {
+        auto view = OpenCLBuffer::create_buffer_view<float>(*xbuf, dst->m_shape, /*offset=*/0);
+        POWERSERVE_ASSERT(view && "permute: failed to create OpenCL view buffer");
+        dst->m_data = std::static_pointer_cast<BaseBuffer>(view);
+    }
 
-    auto &obuf = dst->get<OpenCLBuffer>();
+    try {
+        obuf = &dst->get<OpenCLBuffer>();
+    } catch (const std::bad_cast &e) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::permute expects OpenCLBuffer output: {}", e.what());
+        POWERSERVE_ABORT("permute: output not OpenCLBuffer");
+    }
+
     // new_stride[i] = old_stride[axes[i]]  (same as ggml: :contentReference[oaicite:6]{index=6})
     Stride new_stride{};
-    for (size_t i = 0; i < axes.size(); ++i) new_stride[i] = xbuf.m_stride[axes[i]];
-    obuf.m_stride = new_stride;
+    for (size_t i = 0; i < axes.size(); ++i) new_stride[i] = xbuf->m_stride[axes[i]];
+    obuf->m_stride = new_stride;
 }
 
 static inline uint32_t floor_log2_u32(uint32_t x) {
@@ -2460,25 +2473,33 @@ void OpenCLBackend::transpose(const Tensor *out, const Tensor *x) const {
     POWERSERVE_ASSERT(out && x);
     POWERSERVE_ASSERT(out->m_data && x->m_data);
 
-    // Ensure input is OpenCLBuffer-backed
+    auto *out_nc = const_cast<Tensor *>(out);
+    auto *x_nc   = const_cast<Tensor *>(x);
+
+    OpenCLBuffer *xbuf = nullptr;
+    OpenCLBuffer *obuf = nullptr;
     try {
-        (void)const_cast<Tensor *>(x)->get<OpenCLBuffer>();
+        xbuf = &x_nc->get<OpenCLBuffer>();
     } catch (const std::bad_cast &e) {
         POWERSERVE_LOG_ERROR("OpenCLBackend::transpose expects OpenCLBuffer input: {}", e.what());
         POWERSERVE_ABORT("transpose: input not OpenCLBuffer");
     }
 
-    // Share buffer object
-    auto *out_nc = const_cast<Tensor *>(out);
-    auto *x_nc   = const_cast<Tensor *>(x);
-    out_nc->m_data = x_nc->m_data;
+    if (!out_nc->m_data) {
+        auto view = OpenCLBuffer::create_buffer_view<float>(*xbuf, out_nc->m_shape, /*offset=*/0);
+        POWERSERVE_ASSERT(view && "transpose: failed to create OpenCL view buffer");
+        out_nc->m_data = std::static_pointer_cast<BaseBuffer>(view);
+    }
 
-    // Now both point to same OpenCLBuffer object
-    auto &xbuf = x_nc->get<OpenCLBuffer>();
-    auto &obuf = out_nc->get<OpenCLBuffer>();
+    try {
+        obuf = &out_nc->get<OpenCLBuffer>();
+    } catch (const std::bad_cast &e) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::transpose expects OpenCLBuffer output: {}", e.what());
+        POWERSERVE_ABORT("transpose: output not OpenCLBuffer");
+    }
 
-    obuf.m_stride = xbuf.m_stride;
-    std::swap(obuf.m_stride[0], obuf.m_stride[1]);
+    obuf->m_stride = xbuf->m_stride;
+    std::swap(obuf->m_stride[0], obuf->m_stride[1]);
 }
 
 void OpenCLBackend::ensure_kv_cache_allocated_v0(size_t batch_size) {
