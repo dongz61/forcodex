@@ -261,6 +261,12 @@ bool OpenCLBackend::initialize() {
         m_ggml_fallback->setup_threadpool();  // GGMLBackend::setup_threadpool() creates ThreadPool :contentReference[oaicite:4]{index=4}
     }
     
+    constexpr size_t kMinFallbackWSize = 256ULL * 1024 * 1024;
+    if (m_ggml_fallback_wsize < kMinFallbackWSize) {
+        m_ggml_fallback->setup_work_data(kMinFallbackWSize);
+        m_ggml_fallback_wsize = kMinFallbackWSize;
+    }
+
     initialized = true;
     
     return true;

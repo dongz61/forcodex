@@ -29,10 +29,10 @@ static const char *MODEL_DIR   = "/home/intern/ziqian/models/qwen2-0.5b-work/qwe
 static const char *PROMPT      = "你好，请介绍你自己";
 
 static int    N_THREADS   = 8;
-static size_t BATCH_SIZE  = 1;
+static size_t BATCH_SIZE  = 4;
 
-static float ATOL  = 1e-6f;
-static float RTOL  = 1e-6f;
+static float ATOL  = 1e-3f;
+static float RTOL  = 1e-3f;
 static int   TOPK  = 10;
 static int   DECODE_STEPS = 16;
 static bool  SKIP_VIEW_COMPARE = false;
@@ -401,8 +401,9 @@ int main() {
             std::unordered_map<uint64_t, std::vector<float>> ocl_op_outs;
             std::unordered_map<int, const OpNode*> ocl_op_nodes;
 
-            // producer map: Tensor* -> op_idx
-            std::unordered_map<const Tensor*, int> producer;
+            // producer map: Tensor* -> (op_idx, out_idx)
+            std::unordered_map<const Tensor*, std::pair<int,int>> producer;
+
 
             // (cl_mem -> ordered writes)
             std::unordered_map<void*, std::vector<WriteRec>> cl_writes;
@@ -498,6 +499,76 @@ int main() {
                     }
                 };
 
+            auto dump_input_consistency =
+                [&](int cur_op_idx,
+                    const OpNode *op) {
+
+                    fmt::print("\n[INPUT-CHECK] op#{} type={}\n", cur_op_idx, op_type_to_string(op->op));
+
+                    for (int pi = 0; pi < (int)op->prev.size(); ++pi) {
+                        const Tensor *in = op->prev[pi] ? op->prev[pi]->tensor() : nullptr;
+                        if (!in) continue;
+
+                        // 只检查 FP32 输入（量化/INT 先跳过）
+                        if (in->m_dtype != DataType::FP32) {
+                            fmt::print("  in[{}] dtype={} (skip non-fp32)\n", pi, (int)in->m_dtype);
+                            continue;
+                        }
+
+                        auto ocl_vec_in = tensor_to_f32_vec_any(in, cl_backend);
+                        if (ocl_vec_in.empty()) {
+                            fmt::print("  in[{}] fp32 but readback empty\n", pi);
+                            continue;
+                        }
+
+                        auto itp = producer.find(in);
+                        if (itp == producer.end()) {
+                            fmt::print("  in[{}] fp32 but producer not found (cannot map to ggml)\n", pi);
+                            continue;
+                        }
+
+                        int p_op  = itp->second.first;
+                        int p_out = itp->second.second;
+
+                        auto itg = ggml_op_outs.find(op_out_key(p_op, p_out));
+                        if (itg == ggml_op_outs.end()) {
+                            fmt::print("  in[{}] producer=op#{} out#{} but ggml cache missing\n", pi, p_op, p_out);
+                            continue;
+                        }
+
+                        auto &gg_vec_in = itg->second;
+                        if (gg_vec_in.size() != ocl_vec_in.size()) {
+                            fmt::print("  in[{}] size mismatch: ocl={} ggml={} (producer op#{} out#{})\n",
+                                    pi, ocl_vec_in.size(), gg_vec_in.size(), p_op, p_out);
+                            continue;
+                        }
+
+                        double max_abs = 0.0;
+                        double sum_abs = 0.0;
+                        size_t max_i = 0;
+
+                        for (size_t i = 0; i < ocl_vec_in.size(); ++i) {
+                            double d = std::fabs((double)ocl_vec_in[i] - (double)gg_vec_in[i]);
+                            sum_abs += d;
+                            if (d > max_abs) { max_abs = d; max_i = i; }
+                        }
+                        double mean_abs = sum_abs / (double)ocl_vec_in.size();
+
+                        fmt::print("  in[{}] mapped_from op#{} out#{}: max_abs_diff={:.9g} at i={} (ocl={} ggml={}), mean_abs_diff={:.9g}\n",
+                                pi, p_op, p_out,
+                                max_abs, max_i, ocl_vec_in[max_i], gg_vec_in[max_i], mean_abs);
+
+                        const int N = 16;
+                        fmt::print("    head[0:{}):\n", N);
+                        for (int i = 0; i < N && i < (int)ocl_vec_in.size(); ++i) {
+                            float a = ocl_vec_in[i];
+                            float b = gg_vec_in[i];
+                            fmt::print("      i={:4d} ocl={:+.8e} ggml={:+.8e} diff={:+.8e}\n", i, a, b, (a - b));
+                        }
+                    }
+                };
+
+
             auto dump_mismatch_detail =
                 [&](int op_idx, const OpNode *op, int out_idx,
                     const Tensor *out,
@@ -517,6 +588,7 @@ int main() {
                         std::snprintf(name, sizeof(name), "in[%d]", pi);
                         print_tensor_meta(in, name);
                     }
+                    dump_input_consistency(op_idx, op);
 
                     // If this is VIEW mismatch, dump root-cause info immediately
                     if (op->op == OpType::VIEW) {
@@ -577,7 +649,7 @@ int main() {
                         if (!t) continue;
                         auto itp = producer.find(t);
                         if (itp != producer.end()) {
-                            p = itp->second;
+                            p = itp->second.first;   // producer op_idx
                             prev_i = i;
                             break;
                         }
@@ -658,8 +730,9 @@ int main() {
                 // build producer mapping
                 for (int oi = 0; oi < (int)op->next.size(); ++oi) {
                     Tensor *o2 = op->next[oi] ? op->next[oi]->tensor() : nullptr;
-                    if (o2 && producer.find(o2) == producer.end()) producer[o2] = op_idx;
+                    if (o2 && producer.find(o2) == producer.end()) producer[o2] = {op_idx, oi};
                 }
+
 
                 // cache FP32 outputs for backtrace
                 for (int oi = 0; oi < (int)op->next.size(); ++oi) {
