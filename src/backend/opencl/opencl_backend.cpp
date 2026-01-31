@@ -2341,8 +2341,16 @@ void OpenCLBackend::reset_kv_batch_size(const size_t batch_size) const {
         POWERSERVE_LOG_ERROR("KVCache v0 expects batch_size > 0");
         return;
     }
+        if (m_kv->batch_size == batch_size && m_kv->positions.size() == batch_size) {
+        return;
+    }
+    std::vector<size_t> new_positions(batch_size, 0);
+    const size_t copy_count = std::min(batch_size, m_kv->positions.size());
+    for (size_t i = 0; i < copy_count; ++i) {
+        new_positions[i] = m_kv->positions[i];
+    }
+    m_kv->positions = std::move(new_positions);
     m_kv->batch_size = batch_size;
-    m_kv->reset();
 }
 
 void OpenCLBackend::add_cache(const Tensor *k,
