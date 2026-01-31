@@ -1,12 +1,9 @@
 #pragma once
 
-#include "backend/backend.hpp"          // Backend interface (do NOT redefine Backend here)
+#include "backend/backend.hpp"
 
-// --- OpenCL backend building blocks (current) ---
-#include "backend/opencl/opencl_env.hpp"
 #include "backend/opencl/opencl_kv_cache.hpp"
 
-// --- OpenCL backend building blocks (backup, keep if still exists) ---
 #include "backend/opencl/opencl_memory.hpp"
 #include "backend/opencl/opencl_kernel_manager.hpp"
 #include "backend/opencl/opencl_buffer.hpp"
@@ -56,8 +53,6 @@ public:
 
 public:
     // ========= Core components (current + backup merged) =========
-    // current
-    std::shared_ptr<OpenCLEnv> m_env;
 
     // backup (optional, keep if you still use them)
     std::shared_ptr<OpenCLKernelManager> kernel_manager;
@@ -132,55 +127,16 @@ public:
 
     void transpose(const Tensor *out, const Tensor *x) const override;
 
-public:
-    // ========= Extra helpers / legacy APIs (NOT Backend interface) =========
-    // (debug only)
-    std::shared_ptr<OpenCLBuffer> debug_get_k_cache(size_t L) const;
-    std::shared_ptr<OpenCLBuffer> debug_get_v_cache(size_t L) const;
-    
+public:    
     // Lightweight cache tensor wrappers for graph construction.
     std::pair<Tensor, Tensor> get_cache_tensors(size_t L) const;
 
     // 张量属性检查 / 并行任务估算（如果还需要）
     bool is_contiguous(const Tensor *tensor, int n) const;
-    int  get_n_tasks(std::shared_ptr<OpNode> op);
     enum ggml_type get_vec_dot_type(const Tensor *tensor);
 
-    // 其他算子（如果你项目里仍有调用，可以保留）
-    void silu(const Tensor *dst, const Tensor *src0) const;
-    void gelu(const Tensor *dst, const Tensor *src0) const;
-
-    // 旧接口风格的软最大/rope/rms_norm：保留给内部迁移使用
-    void rms_norm_legacy(Tensor *dst, const Tensor *src, float eps) const;
-    void softmax_legacy(const Tensor *dst, const Tensor *src0, const Tensor *src1) const;
-    void rope_legacy(
-        const Tensor *dst,
-        const Tensor *src0,
-        const Tensor *src1,
-        const RopeParams &p,
-        const Tensor *src2
-    ) const;
-
-    void diag_mask_inf(const Tensor *dst, const Tensor *src0, int n_past) const;
-
-    // plan/工作区
-    void setup_work_data(size_t work_size);
-
-    // 内存管理/数据传输（如果你仍想保留这些“直接 OpenCL API”入口）
-    cl_mem allocate_device_memory(size_t size);
-    void   free_device_memory(cl_mem buffer);
-
-    bool copy_to_device(cl_mem dst, const void *src, size_t size);
-    bool copy_to_host(void *dst, cl_mem src, size_t size);
-
-    // buffer 创建（更贴近你之前的实现；Executor 不应该直接用它）
+    // buffer 创建
     std::shared_ptr<OpenCLBuffer> create_buffer(Shape shape, DataType dtype);
-
-    // 线程池管理
-    void reset_threadpool();
-
-    // 设备信息
-    size_t      get_device_memory() const;
 
     bool is_initialized() const { return initialized; }
 
@@ -202,19 +158,7 @@ private:
     // ========= Internal helpers =========
     void setup_default_config();
 
-    cl_mem    get_cl_buffer(const Tensor *tensor) const;
-    cl_kernel get_kernel_for_type(const std::string &base_name, DataType dtype) const;
-    void set_kernel_args_from_tensors(
-        cl_kernel kernel,
-        const std::vector<const Tensor *> &tensors
-    ) const;
-
     // matmul helper
-    void matmul_batched_cpu_f32_fallback(
-        const Tensor *dst,
-        const Tensor *src0,
-        const Tensor *src1
-    ) const;
     void matmul_cpu_ggml_fallback(
         const Tensor *dst,
         const Tensor *src0,

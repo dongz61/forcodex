@@ -47,21 +47,6 @@ public:
     bool owns_buffer() const { return m_owns_buffer; }
     bool is_pooled() const { return m_is_pooled; }
 
-    // ---- Data movement ----
-    bool copy_to_device(const void* host_data, size_t size);
-    bool copy_to_host(void* host_data, size_t size);
-
-    bool copy_to_device_async(const void* host_data, size_t size, cl_event* event = nullptr);
-    bool copy_to_host_async(void* host_data, size_t size, cl_event* event = nullptr);
-
-    // ---- Mapping ----
-    void* map(cl_map_flags flags = CL_MAP_READ | CL_MAP_WRITE, size_t offset = 0, size_t size = 0);
-    bool  unmap(void* mapped_ptr);
-
-    // ---- Sync/helpers ----
-    void finish();
-    bool clear();
-
 public:
     // Keep member layout consistent with prior header (helps minimize churn)
     Stride m_stride;        // In bytes (keep consistent with CPUBuffer)
@@ -100,10 +85,6 @@ public:
             POWERSERVE_LOG_ERROR("Failed to allocate OpenCL buffer of size {}", size);
             return nullptr;
         }
-
-        // POWERSERVE_LOG_INFO("[CL-ALLOC] create_buffer bytes={} dev={} pooled=1",
-        //             size,
-        //             (void*)device_buffer);
 
         return std::make_shared<OpenCLBuffer>(stride, device_buffer, size, pool, true, true, false);
     }

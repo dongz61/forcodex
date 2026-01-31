@@ -33,16 +33,6 @@
 namespace powerserve::opencl {
 
 // for debug
-std::shared_ptr<OpenCLBuffer> OpenCLBackend::debug_get_k_cache(size_t L) const {
-    if (!m_kv || L >= m_kv->key.size()) return nullptr;
-    return m_kv->key[L];
-}
-
-std::shared_ptr<OpenCLBuffer> OpenCLBackend::debug_get_v_cache(size_t L) const {
-    if (!m_kv || L >= m_kv->value.size()) return nullptr;
-    return m_kv->value[L];
-}
-
 std::pair<Tensor, Tensor> OpenCLBackend::get_cache_tensors(size_t L) const {
     POWERSERVE_ASSERT(m_kv && m_kv->allocated());
     POWERSERVE_ASSERT(L < m_kv->key.size());
@@ -1134,82 +1124,6 @@ void OpenCLBackend::matmul_cpu_ggml_fallback(
 
     // ---- 4) H2D: host_c -> dst ----
     this->copy(dst, &host_c);
-}
-
-
-void OpenCLBackend::matmul_batched_cpu_f32_fallback(
-    const Tensor *dst,
-    const Tensor *src0,
-    const Tensor *src1
-) const {
-    // ---- D2H: src0/src1 -> host tensors ----
-    Tensor host_a(DataType::FP32, src0->m_shape);
-    host_a.m_data = powerserve::CPUBuffer::create_buffer<float>(src0->m_shape);
-    this->copy(&host_a, src0);
-
-    Tensor host_b(DataType::FP32, src1->m_shape);
-    host_b.m_data = powerserve::CPUBuffer::create_buffer<float>(src1->m_shape);
-    this->copy(&host_b, src1);
-
-    auto *a_host = static_cast<float *>(host_a.get<powerserve::CPUBuffer>().m_data);
-    auto *b_host = static_cast<float *>(host_b.get<powerserve::CPUBuffer>().m_data);
-
-    // ---- CPU output ----
-    Tensor host_c(DataType::FP32, dst->m_shape);
-    host_c.m_data = powerserve::CPUBuffer::create_buffer<float>(dst->m_shape);
-    auto *c_host = static_cast<float *>(host_c.get<powerserve::CPUBuffer>().m_data);
-
-    // Shapes (your contract):
-    // A {K, M, H2, H3}
-    // B {N, K, H2, H3}
-    // C {N, M, H2, H3} :contentReference[oaicite:9]{index=9}
-    const int K = (int)src0->m_shape[0];
-    const int M = (int)src0->m_shape[1];
-    const int N = (int)src1->m_shape[0];
-
-    const int H2 = (int)dst->m_shape[2];
-    const int H3 = (int)dst->m_shape[3];
-
-    // Basic shape sanity
-    if ((int)src1->m_shape[1] != K) {
-        auto *self = const_cast<OpenCLBackend *>(this);
-        log_tensor_meta(self, "dst(in)", dst);
-        log_tensor_meta(self, "A(in)",   src0);
-        log_tensor_meta(self, "B(in)",   src1);
-        POWERSERVE_LOG_ERROR("matmul_batched_cpu_f32_fallback: B.shape[1]!=K");
-        return;
-    }
-    if ((int)dst->m_shape[0] != N || (int)dst->m_shape[1] != M) {
-        POWERSERVE_LOG_ERROR("matmul_batched_cpu_f32_fallback: C shape mismatch");
-        return;
-    }
-    if ((int)src0->m_shape[2] != H2 || (int)src0->m_shape[3] != H3 ||
-        (int)src1->m_shape[2] != H2 || (int)src1->m_shape[3] != H3) {
-        POWERSERVE_LOG_ERROR("matmul_batched_cpu_f32_fallback: batch dims mismatch");
-        return;
-    }
-
-    const size_t a_batch_elems = (size_t)K * (size_t)M;
-    const size_t b_batch_elems = (size_t)N * (size_t)K;
-    const size_t c_batch_elems = (size_t)N * (size_t)M;
-
-    for (int i3 = 0; i3 < H3; ++i3) {
-        for (int i2 = 0; i2 < H2; ++i2) {
-            const size_t batch = (size_t)i3 * (size_t)H2 + (size_t)i2;
-
-            const float* A = a_host + batch * a_batch_elems;
-            const float* B = b_host + batch * b_batch_elems;
-            float*       C = c_host + batch * c_batch_elems;
-
-            cpu_gemm_f32_colmajorNK(C, A, B, K, M, N);
-        }
-    }
-
-    // ---- H2D: host_c -> dst ----
-    this->copy(dst, &host_c);
-
-    POWERSERVE_LOG_DEBUG("OpenCLBackend::matmul batched CPU fallback done (K={},M={},N={},H2={},H3={})",
-                         K, M, N, H2, H3);
 }
 
 void OpenCLBackend::matmul(const Tensor *dst, const Tensor *src0, const Tensor *src1) const {

@@ -316,16 +316,6 @@ void OpenCLContext::cleanup() {
     platform_ = nullptr;
 }
 
-cl_int OpenCLContext::flush() const {
-    if (!queue_) return CL_INVALID_COMMAND_QUEUE;
-    return clFlush(queue_);
-}
-
-cl_int OpenCLContext::finish() const {
-    if (!queue_) return CL_INVALID_COMMAND_QUEUE;
-    return clFinish(queue_);
-}
-
 std::string OpenCLContext::get_error_string(cl_int error) {
     switch(error) {
         case CL_SUCCESS: return "CL_SUCCESS";
@@ -392,32 +382,6 @@ bool OpenCLContext::select_device_by_name(const std::string& device_name) {
     
     for (const auto& device : devices) {
         if (device.name.find(device_name) != std::string::npos) {
-            device_ = device.id;
-            platform_ = device.platform_id;
-            return true;
-        }
-    }
-    
-    return false;
-}
-
-bool OpenCLContext::select_device(size_t device_index) {
-    auto devices = discover_devices();
-    
-    if (device_index >= devices.size()) {
-        return false;
-    }
-    
-    device_ = devices[device_index].id;
-    platform_ = devices[device_index].platform_id;
-    return true;
-}
-
-bool OpenCLContext::select_device_by_type(cl_device_type type) {
-    auto devices = discover_devices();
-    
-    for (const auto& device : devices) {
-        if (device.type == type && device.available) {
             device_ = device.id;
             platform_ = device.platform_id;
             return true;

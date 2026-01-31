@@ -68,27 +68,11 @@ public:
                          const std::string& source_code,
                          const std::string& extra_options = "");
     
-    // 从文件加载并编译
-    bool load_program_from_file(const std::string& program_name,
-                                const std::string& file_path,
-                                const std::string& extra_options = "");
-    
-    // 编译单个kernel（不推荐，通常一起编译一个program的多个kernels）
-    cl_kernel compile_kernel(const std::string& kernel_name,
-                             const std::string& source_code,
-                             const std::string& extra_options = "");
-    
     // === 内核获取接口 ===
     
     // 获取已编译的内核
     cl_kernel get_kernel(const std::string& kernel_name) const;
     cl_kernel get_cpy_kernel(powerserve::DataType src_t, powerserve::DataType dst_t) const;
-    
-    // 检查内核是否存在
-    bool has_kernel(const std::string& kernel_name) const;
-    
-    // 获取program中的所有kernels
-    std::vector<cl_kernel> get_all_kernels(const std::string& program_name) const;
     
     // === 内核参数设置辅助函数（仿照llama.cpp） ===
     
@@ -126,41 +110,10 @@ public:
         return true;
     }
     
-    // === 内核执行辅助函数 ===
-    
-    // 执行内核（1D）
-    bool enqueue_kernel_1d(cl_kernel kernel, 
-                          size_t global_size,
-                          size_t local_size = 0,
-                          cl_event* event = nullptr);
-    
-    // 执行内核（2D）
-    bool enqueue_kernel_2d(cl_kernel kernel,
-                          size_t global_size_x, size_t global_size_y,
-                          size_t local_size_x = 0, size_t local_size_y = 0,
-                          cl_event* event = nullptr);
-    
-    // 执行内核（3D）- 仿照llama.cpp的常见模式
-    bool enqueue_kernel_3d(cl_kernel kernel,
-                          size_t global_size_x, size_t global_size_y, size_t global_size_z,
-                          size_t local_size_x = 0, size_t local_size_y = 0, size_t local_size_z = 0,
-                          cl_event* event = nullptr);
-    
     // === 信息查询 ===
     
     size_t get_program_count() const { return programs_.size(); }
     size_t get_kernel_count() const { return kernel_cache_.size(); }
-    std::vector<std::string> get_available_kernels() const;
-    std::vector<std::string> get_available_programs() const;
-    
-    // === 嵌入式内核支持（仿照GGML_OPENCL_EMBED_KERNELS） ===
-    
-    // 注册嵌入式内核源码（在编译时嵌入）
-    void register_embedded_source(const std::string& program_name,
-                                  const std::string& source_code);
-    
-    // 检查是否有嵌入式源码
-    bool has_embedded_source(const std::string& program_name) const;
     
 private:
     std::shared_ptr<OpenCLContext> context_;

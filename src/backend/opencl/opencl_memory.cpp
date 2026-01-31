@@ -34,7 +34,6 @@ cl_mem OpenCLMemoryPool::allocate_impl(size_t size, cl_mem_flags flags, bool upd
         std::lock_guard<std::mutex> lock(mutex_);
         total_allocated_ += size;
         update_peak_usage();
-        // POWERSERVE_LOG_DEBUG("Allocated {} bytes of OpenCL memory, total: {}", size, total_allocated_);
     }
     
     return buffer;
@@ -195,13 +194,6 @@ bool OpenCLMemoryPool::copy_host_to_device(cl_mem dst, const void* src, size_t s
                              offset + size, dst_size);
         return false;
     }
-    
-    // volatile uint8_t probe = 0;
-    // const uint8_t* p = reinterpret_cast<const uint8_t*>(src);
-    // probe ^= p[0];
-    // probe ^= p[size - 1];
-    // (void)probe;
-    // POWERSERVE_LOG_ERROR(">>> PROBE_END src={} size={}", src, size);
 
     cl_int err = clEnqueueWriteBuffer(context_->get_queue(), dst, CL_TRUE,
                                   offset, size, src, 0, nullptr, nullptr);
@@ -267,68 +259,11 @@ bool OpenCLMemoryPool::copy_device_to_device(cl_mem dst, cl_mem src, size_t size
     return context_->check_error(err, "clEnqueueCopyBuffer");
 }
 
-bool OpenCLMemoryPool::copy_host_to_device_async(cl_mem dst, const void* src, size_t size, 
-                                                 cl_event* event, size_t offset) {
-    if (!dst || !src) {
-        POWERSERVE_LOG_ERROR("Invalid arguments for copy_host_to_device_async");
-        return false;
-    }
-    
-    cl_int err = clEnqueueWriteBuffer(context_->get_queue(), dst, CL_FALSE, 
-                                      offset, size, src, 0, nullptr, event);
-    return context_->check_error(err, "clEnqueueWriteBuffer async");
-}
-
-bool OpenCLMemoryPool::copy_device_to_host_async(void* dst, cl_mem src, size_t size, 
-                                                 cl_event* event, size_t offset) {
-    if (!dst || !src) {
-        POWERSERVE_LOG_ERROR("Invalid arguments for copy_device_to_host_async");
-        return false;
-    }
-    
-    cl_int err = clEnqueueReadBuffer(context_->get_queue(), src, CL_FALSE, 
-                                     offset, size, dst, 0, nullptr, event);
-    return context_->check_error(err, "clEnqueueReadBuffer async");
-}
-
-void* OpenCLMemoryPool::map_memory(cl_mem buffer, size_t offset, size_t size, cl_map_flags flags) {
-    if (!buffer) {
-        POWERSERVE_LOG_ERROR("Invalid buffer for map_memory");
-        return nullptr;
-    }
-    
-    cl_int err;
-    void* mapped_ptr = clEnqueueMapBuffer(context_->get_queue(), buffer, CL_TRUE, 
-                                          flags, offset, size, 0, nullptr, nullptr, &err);
-    
-    if (!context_->check_error(err, "clEnqueueMapBuffer")) {
-        return nullptr;
-    }
-    
-    return mapped_ptr;
-}
-
-bool OpenCLMemoryPool::unmap_memory(cl_mem buffer, void* mapped_ptr) {
-    if (!buffer || !mapped_ptr) {
-        POWERSERVE_LOG_ERROR("Invalid arguments for unmap_memory");
-        return false;
-    }
-    
-    cl_int err = clEnqueueUnmapMemObject(context_->get_queue(), buffer, mapped_ptr, 
-                                         0, nullptr, nullptr);
-    return context_->check_error(err, "clEnqueueUnmapMemObject");
-}
-
 void OpenCLMemoryPool::update_peak_usage() {
     if (total_allocated_ > peak_usage_) {
         peak_usage_ = total_allocated_;
         // POWERSERVE_LOG_DEBUG("New peak memory usage: {} bytes", peak_usage_);
     }
-}
-
-void OpenCLMemoryPool::finish_all_operations() {
-    cl_int err = clFinish(context_->get_queue());
-    context_->check_error(err, "clFinish");
 }
 
 } // namespace powerserve::opencl

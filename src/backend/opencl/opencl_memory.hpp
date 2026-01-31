@@ -36,24 +36,6 @@ public:
     bool copy_device_to_host(void* dst, cl_mem src, size_t size, size_t offset = 0);
     bool copy_device_to_device(cl_mem dst, cl_mem src, size_t size);
     
-    // 异步传输
-    bool copy_host_to_device_async(cl_mem dst, const void* src, size_t size, 
-                                   cl_event* event = nullptr, size_t offset = 0);
-    bool copy_device_to_host_async(void* dst, cl_mem src, size_t size, 
-                                   cl_event* event = nullptr, size_t offset = 0);
-    
-    // 内存映射
-    void* map_memory(cl_mem buffer, size_t offset, size_t size, cl_map_flags flags);
-    bool unmap_memory(cl_mem buffer, void* mapped_ptr);
-    
-    // 内存信息
-    size_t get_total_allocated() const { return total_allocated_; }
-    size_t get_peak_usage() const { return peak_usage_; }
-    size_t get_pool_size() const { return memory_pool_.size(); }
-    
-    // 等待所有操作完成
-    void finish_all_operations();
-    
 private:
     std::shared_ptr<OpenCLContext> context_;
     std::vector<MemoryBlock> memory_pool_;
