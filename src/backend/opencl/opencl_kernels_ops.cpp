@@ -227,9 +227,9 @@ void OpenCLBackend::add_broadcast(Tensor *dst, const Tensor *src0, const Tensor 
             err = clSetKernelArg(kernel, arg_index++, sizeof(cl_ulong), &offsetd);
             OCL_RETURN_IF_ERROR(ctx, err);
 
-            err = clSetKernelArg(kernel, arg_index++, sizeof(int), &ne0);
+            const int ne_vec4 = ne0 / 4;
+            err = clSetKernelArg(kernel, arg_index++, sizeof(int), &ne_vec4);
             OCL_RETURN_IF_ERROR(ctx, err);
-
         } else {
             err = clSetKernelArg(kernel, arg_index++, sizeof(cl_mem), &src0_data);
             OCL_RETURN_IF_ERROR(ctx, err);
