@@ -226,7 +226,9 @@ void Executor::allocate_buffers() {
                 // dtype whitelist for migration
                 if (tensor->m_dtype != DataType::FP32 &&
                     tensor->m_dtype != DataType::FP16 &&
-                    tensor->m_dtype != DataType::INT32) {
+                    tensor->m_dtype != DataType::INT32 &&
+                    tensor->m_dtype != DataType::GGML_Q4_0 &&
+                    tensor->m_dtype != DataType::GGML_Q8_0) {
                     continue;
                 }
 
@@ -244,6 +246,12 @@ void Executor::allocate_buffers() {
                     break;
                 case DataType::INT32:
                     create_opencl_buffer_for_tensor<int32_t>(&tmp);
+                    break;
+                case DataType::GGML_Q4_0:
+                    create_opencl_buffer_for_tensor<uint8_t>(&tmp);
+                    break;
+                case DataType::GGML_Q8_0:
+                    create_opencl_buffer_for_tensor<uint8_t>(&tmp);
                     break;
                 default:
                     POWERSERVE_ABORT("allocate_buffers migrate: unsupported dtype={} shape=[{}, {}, {}, {}]",
@@ -276,6 +284,14 @@ void Executor::allocate_buffers() {
         case DataType::INT32:
             if (use_opencl) create_opencl_buffer<int32_t>(node);
             else            create_cpu_buffer<int32_t>(node);
+            break;
+        case DataType::GGML_Q4_0:
+            if (use_opencl) create_opencl_buffer<uint8_t>(node);
+            else            POWERSERVE_ABORT("allocate_buffers: quant dtype on CPU path requires preloaded ggml buffer");
+            break;
+        case DataType::GGML_Q8_0:
+            if (use_opencl) create_opencl_buffer<uint8_t>(node);
+            else            POWERSERVE_ABORT("allocate_buffers: quant dtype on CPU path requires preloaded ggml buffer");
             break;
         default:
             POWERSERVE_ABORT("allocate_buffers: unsupported dtype");
@@ -326,22 +342,6 @@ void Executor::run() {
     POWERSERVE_ASSERT(backend != nullptr);
     const bool use_opencl = m_platform.using_opencl(model_id);
     plan();
-
-    // ziqian: compare whether two backends have same op order
-    // uint64_t h = hash_ops_signature(m_graph.ops);
-    // fmt::print("[OPSEQ HASH] model_id={} ops={} hash=0x{:016x}\n",
-    //            m_graph.m_model_id,
-    //            m_graph.ops.size(),
-    //            h);
-
-    // // 可选：打印前 20 个 op 概览，便于肉眼核对
-    // int limit = std::min<int>(20, (int)m_graph.ops.size());
-    // for (int i = 0; i < limit; ++i) {
-    //     auto &op = m_graph.ops[i];
-    //     fmt::print("  [op#{:03d}] type={} prev={} next={}\n",
-    //                i, (int)op->op, op->prev.size(), op->next.size());
-    // }
-    
 
     int op_idx = 0;
 

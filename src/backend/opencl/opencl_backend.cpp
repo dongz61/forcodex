@@ -120,12 +120,46 @@ std::shared_ptr<OpenCLBuffer> OpenCLBackend::create_buffer(Shape shape, DataType
             return OpenCLBuffer::create_buffer<cl_half>(shape, memory_pool);
         case DataType::INT32:
             return OpenCLBuffer::create_buffer<cl_int>(shape, memory_pool);
+
+        // ===== Quantized GGML buffers =====
+        case DataType::GGML_Q4_0:
+        case DataType::GGML_Q8_0: {
+            // Match ggml tensor layout:
+            // nb0 = ggml_type_size(type)
+            // nb1 = ggml_row_size(type, ne0)
+            // nb2 = nb1 * ne1
+            // nb3 = nb2 * ne2
+            const ggml_type gt = powerserve::ggml::convert_datatype_to_ggml(dtype);
+
+            Stride stride{};
+            stride[0] = (size_t) ggml_type_size(gt);
+            stride[1] = (size_t) ggml_row_size(gt, (int64_t) shape[0]);
+            stride[2] = stride[1] * (size_t) shape[1];
+            stride[3] = stride[2] * (size_t) shape[2];
+
+            const size_t bytes = stride[3] * (size_t) shape[3];
+
+            cl_mem device_buffer = memory_pool->allocate_pooled(bytes, CL_MEM_READ_WRITE);
+            if (!device_buffer) {
+                POWERSERVE_LOG_ERROR("Failed to allocate OpenCL quant buffer: dtype={} bytes={}",
+                                     (int) dtype, bytes);
+                return nullptr;
+            }
+
+            // Owns buffer, pooled, base_offset = 0
+            return std::make_shared<OpenCLBuffer>(stride, device_buffer, bytes, memory_pool,
+                                                  /*owns_buffer=*/true,
+                                                  /*is_pooled=*/true,
+                                                  /*base_offset=*/0);
+        }
+
         default:
             POWERSERVE_LOG_ERROR("Unsupported data type for OpenCL buffer: {}",
                                static_cast<int>(dtype));
             return nullptr;
     }
 }
+
 
 void OpenCLBackend::plan(std::vector<std::shared_ptr<OpNode>> & /*ops*/) {
 }

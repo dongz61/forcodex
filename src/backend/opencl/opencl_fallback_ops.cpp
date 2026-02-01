@@ -48,8 +48,10 @@ void OpenCLBackend::get_embedding(const Tensor *dst,
     this->copy(dst, &host_tmp);
 }
 
-static inline powerserve::BufferPtr create_cpu_buffer_for_dtype(powerserve::DataType dt, const powerserve::Shape &shape) {
+static inline powerserve::BufferPtr create_cpu_buffer_for_dtype(powerserve::DataType dt,
+                                                                const powerserve::Shape &shape) {
     using powerserve::CPUBuffer;
+
     switch (dt) {
     case powerserve::DataType::FP32:
         return CPUBuffer::create_buffer<float>(shape);
@@ -59,6 +61,25 @@ static inline powerserve::BufferPtr create_cpu_buffer_for_dtype(powerserve::Data
         return CPUBuffer::create_buffer<int32_t>(shape);
     case powerserve::DataType::INT64:
         return CPUBuffer::create_buffer<int64_t>(shape);
+
+    // ===== Quantized GGML buffers (match ggml nb[] layout) =====
+    case powerserve::DataType::GGML_Q4_0:
+    case powerserve::DataType::GGML_Q8_0: {
+        const ggml_type gt = powerserve::ggml::convert_datatype_to_ggml(dt);
+
+        powerserve::Stride stride{};
+        stride[0] = (size_t) ggml_type_size(gt);
+        stride[1] = (size_t) ggml_row_size(gt, (int64_t) shape[0]);
+        stride[2] = stride[1] * (size_t) shape[1];
+        stride[3] = stride[2] * (size_t) shape[2];
+
+        const size_t bytes = stride[3] * (size_t) shape[3];
+        void *ptr = malloc(bytes);
+        POWERSERVE_ASSERT(ptr && "malloc failed for quant CPU buffer");
+
+        return std::make_shared<CPUBuffer>(stride, ptr, /*allocated_by_malloc=*/true);
+    }
+
     default:
         POWERSERVE_ABORT("create_cpu_buffer_for_dtype: unsupported dtype {}", (int)dt);
     }
@@ -89,15 +110,9 @@ void OpenCLBackend::matmul_cpu_ggml_fallback(
     }
 
     if (!is_cpu_tensor(src1)) {
-        if (src1->m_dtype == DataType::GGML_Q4_0 || src1->m_dtype == DataType::GGML_Q8_0) {
-            POWERSERVE_ABORT(
-                "matmul_cpu_ggml_fallback: quant tensor (dtype={}) is on device, but quant D2H copy not implemented",
-                (int)src1->m_dtype
-            );
-        }
         host_b = Tensor(src1->m_dtype, src1->m_shape);
         host_b.m_data = create_cpu_buffer_for_dtype(src1->m_dtype, src1->m_shape);
-        this->copy(&host_b, src1);
+        this->copy(&host_b, src1);   // supports quant bytes via ggml_compat_nbytes in opencl_tensor_ops.cpp
         b_host = &host_b;
     }
 
@@ -202,18 +217,8 @@ void OpenCLBackend::matmul(const Tensor *dst, const Tensor *src0, const Tensor *
         }
     }
 
-    const Tensor *A_cpu = src0;
-    const Tensor *B_cpu = src1;
-
-    Tensor tmpB_cpu;
-    if (is_opencl(src1)) {
-        tmpB_cpu = Tensor(DataType::FP32, src1->m_shape);
-        tmpB_cpu.m_data = powerserve::CPUBuffer::create_buffer<float>(src1->m_shape);
-        self->copy(&tmpB_cpu, src1);
-        B_cpu = &tmpB_cpu;
-    }
-
-    self->matmul_cpu_ggml_fallback(dst, A_cpu, B_cpu);
+    // Let the ggml fallback handle any needed D2H/H2D conversions (including quant types).
+    self->matmul_cpu_ggml_fallback(dst, src0, src1);
 }
 
 void OpenCLBackend::rmsnorm(
