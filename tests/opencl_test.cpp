@@ -55,6 +55,17 @@ static inline bool allclose(const std::vector<float> &a, const std::vector<float
     return true;
 }
 
+static inline float max_abs_diff(const std::vector<float> &a, const std::vector<float> &b) {
+    if (a.size() != b.size()) return INFINITY;
+    float m = 0.0f;
+    for (size_t i = 0; i < a.size(); ++i) {
+        float d = std::fabs(a[i] - b[i]);
+        if (d > m) m = d;
+    }
+    return m;
+}
+
+
 // CPU reference for logits when:
 // - emb is [K] vector
 // - B is stored as [K,N] row-major (k-major then v), index = k*N + v
@@ -245,6 +256,11 @@ bool run_opencl_backend_matmul_quant_noncontigA_test() {
         }
     }
 
+    std::vector<float> A_contig_storage;
+    Tensor A_cpu_contig = make_cpu_tensor_f32(A_shape, A_contig_storage);
+    // Fill as ggml-friendly layout: idx = k + K*m
+    std::memcpy(A_contig_storage.data(), A_logical.data(), A_logical.size() * sizeof(float));
+
     // -------------------------
     // Create a device buffer big enough to honor the padded stride.
     // Allocate as {K, M*pad_factor, 1, 1}, then "view" it as {K, M, 1, 1} by overriding stride.
@@ -335,6 +351,10 @@ bool run_opencl_backend_matmul_quant_noncontigA_test() {
     std::vector<float> C_ggml_storage;
     Tensor C_ggml_cpu = make_cpu_tensor_f32(C_shape, C_ggml_storage);
 
+    // Also compute GGML baseline with contiguous A (matches OpenCLBackend's pack behavior)
+    std::vector<float> C_ggml_contig_storage;
+    Tensor C_ggml_contig_cpu = make_cpu_tensor_f32(C_shape, C_ggml_contig_storage);
+
     {
         powerserve::ggml::GGMLBackend ggml_be(cfg, hp);
         ggml_be.setup_threadpool();
@@ -352,6 +372,8 @@ bool run_opencl_backend_matmul_quant_noncontigA_test() {
             ggml_be.setup_work_data(work);
         }
         ggml_be.matmul(&C_ggml_cpu, &B_q_cpu, &A_cpu_pad);
+        ggml_be.matmul(&C_ggml_contig_cpu, &B_q_cpu, &A_cpu_contig);
+
     }
 
     // -------------------------
@@ -387,6 +409,20 @@ bool run_opencl_backend_matmul_quant_noncontigA_test() {
 
     // (1) OpenCL vs GGML (this is your alignment target)
     bool ok_ocl_vs_ggml = allclose(C_host_storage, C_ggml_storage, atol, rtol, &bad_i, &bad_diff);
+    {
+        const float d_ocl_ggml_pad    = max_abs_diff(C_host_storage, C_ggml_storage);
+        const float d_ocl_ggml_contig = max_abs_diff(C_host_storage, C_ggml_contig_storage);
+        const float d_ggml_pad_ref    = max_abs_diff(C_ggml_storage, C_ref);
+        const float d_ggml_contig_ref = max_abs_diff(C_ggml_contig_storage, C_ref);
+        const float d_ocl_ref         = max_abs_diff(C_host_storage, C_ref);
+
+        printf("[DIAG] max_abs_diff:\n");
+        printf("  OCL vs GGML(padded A)    = %.6f\n", (double)d_ocl_ggml_pad);
+        printf("  OCL vs GGML(contig A)    = %.6f\n", (double)d_ocl_ggml_contig);
+        printf("  GGML(padded A) vs REF    = %.6f\n", (double)d_ggml_pad_ref);
+        printf("  GGML(contig A) vs REF    = %.6f\n", (double)d_ggml_contig_ref);
+        printf("  OCL vs REF               = %.6f\n", (double)d_ocl_ref);
+    }
     if (!ok_ocl_vs_ggml) {
         POWERSERVE_LOG_ERROR("OpenCL vs GGML (Q8_0 x noncontig A) mismatch");
         printf("bad_i=%zu ocl=%f ggml=%f diff=%f\n",
@@ -399,21 +435,11 @@ bool run_opencl_backend_matmul_quant_noncontigA_test() {
         for (size_t i = 0; i < std::min<size_t>(8, C_host_storage.size()); ++i) printf("%f ", (double)C_host_storage[i]);
         printf("\nGGML head: ");
         for (size_t i = 0; i < std::min<size_t>(8, C_ggml_storage.size()); ++i) printf("%f ", (double)C_ggml_storage[i]);
+        printf("\nGGML(contig) head: ");
+        for (size_t i = 0; i < std::min<size_t>(8, C_ggml_contig_storage.size()); ++i) printf("%f ", (double)C_ggml_contig_storage[i]);
         printf("\nREF head:  ");
         for (size_t i = 0; i < std::min<size_t>(8, C_ref.size()); ++i) printf("%f ", (double)C_ref[i]);
         printf("\n");
-
-        // Debug: verify D2H pack for non-contig A
-        std::vector<float> A_dev_host_storage;
-        Tensor A_dev_host = make_cpu_tensor_f32(A_shape, A_dev_host_storage);
-        backend.copy(&A_dev_host, &A_dev);
-        printf("A_dev D2H head: ");
-        for (size_t i = 0; i < std::min<size_t>(8, A_dev_host_storage.size()); ++i) printf("%f ", (double)A_dev_host_storage[i]);
-        printf("\nA_logical head: ");
-        for (size_t i = 0; i < std::min<size_t>(8, A_logical.size()); ++i) printf("%f ", (double)A_logical[i]);
-        printf("\n");
-
-        return false;
     }
 
     // (2) GGML vs CPU FP32 ref (quantization sanity)
