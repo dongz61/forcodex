@@ -136,7 +136,7 @@ public:
     enum ggml_type get_vec_dot_type(const Tensor *tensor);
 
     // buffer 创建
-    std::shared_ptr<OpenCLBuffer> create_buffer(Shape shape, DataType dtype);
+    std::shared_ptr<OpenCLBuffer> create_buffer(Shape shape, DataType dtype) const;
 
     bool is_initialized() const { return initialized; }
 
@@ -173,6 +173,55 @@ private:
     // ---- GGML reusable fallback executor for CPU ops (matmul etc.) ----
     mutable std::unique_ptr<powerserve::ggml::GGMLBackend> m_ggml_fallback;
     mutable size_t m_ggml_fallback_wsize = 0;
+
+        // ===== Quant weight split cache (for OpenCL quant kernels expecting separate qs/d arrays) =====
+    struct QuantSplitKey {
+        cl_mem   mem = nullptr;
+        size_t   base_offset = 0;
+        DataType dtype = DataType::FP32;
+        Shape    shape{};
+    };
+
+    struct QuantSplitKeyHash {
+        size_t operator()(const QuantSplitKey& k) const noexcept {
+            size_t h = std::hash<void*>{}((void*)k.mem);
+            auto mix = [&](size_t v) {
+                h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+            };
+            mix(std::hash<size_t>{}(k.base_offset));
+            mix(std::hash<int>{}((int)k.dtype));
+            for (int i = 0; i < (int)k.shape.size(); ++i) mix(std::hash<size_t>{}(k.shape[i]));
+            return h;
+        }
+    };
+
+    struct QuantSplitKeyEq {
+        bool operator()(const QuantSplitKey& a, const QuantSplitKey& b) const noexcept {
+            return a.mem == b.mem &&
+                   a.base_offset == b.base_offset &&
+                   a.dtype == b.dtype &&
+                   a.shape == b.shape;
+        }
+    };
+
+    struct QuantSplitBuffers {
+        std::shared_ptr<OpenCLBuffer> q;   // qs-only buffer (bytes)
+        std::shared_ptr<OpenCLBuffer> d;   // d-only buffer (half)
+        size_t blocks_total = 0;
+    };
+
+    mutable std::unordered_map<QuantSplitKey, QuantSplitBuffers, QuantSplitKeyHash, QuantSplitKeyEq> m_quant_split_cache;
+    mutable std::mutex m_quant_split_mutex;
+
+    QuantSplitBuffers get_or_create_split_q4_0(const Tensor* w) const;
+    QuantSplitBuffers get_or_create_split_q8_0(const Tensor* w) const;
+
+    void matmul_opencl_f16_f32(const Tensor* dst, const Tensor* w, const Tensor* x) const;
+    void matmul_opencl_q4_0_f32(const Tensor* dst, const Tensor* w, const Tensor* x) const;
+    void matmul_opencl_q8_0_f32(const Tensor* dst, const Tensor* w, const Tensor* x) const;
+
+    void clear_quant_cache() const;
+
 
     void ensure_kv_cache_allocated_v0(size_t batch_size);
     mutable ModelConfig::LLMConfig m_llm;   // 保存模型参数来源

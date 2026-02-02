@@ -61,4 +61,24 @@
 #include "mul_mat_f16_f32.cl.h"
 #endif
 
+#ifdef OPENCL_MUL_MV_Q4_0_F32_8X_FLAT_CL_AVAILABLE
+#include "mul_mv_q4_0_f32_8x_flat.cl.h"
+#endif
+
+#ifdef OPENCL_MUL_MV_Q8_0_F32_FLAT_CL_AVAILABLE
+#include "mul_mv_q8_0_f32_flat.cl.h"
+#endif
+
+#ifdef OPENCL_MUL_MM_Q8_0_F32_L4_LM_CL_AVAILABLE
+#include "mul_mm_q8_0_f32_l4_lm.cl.h"
+#endif
+
+#ifdef OPENCL_MUL_MAT_Q4_0_F32_SIMPLE_CL_AVAILABLE
+#include "mul_mat_q4_0_f32_simple.cl.h"
+#endif
+
+#ifdef OPENCL_MUL_MAT_Q8_0_F32_SIMPLE_CL_AVAILABLE
+#include "mul_mat_q8_0_f32_simple.cl.h"
+#endif
+
 #endif // POWERSERVE_OPENCL_EMBED_KERNELS

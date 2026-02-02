@@ -1,3 +1,11 @@
+// Auto-generated from mul_mv_q8_0_f32_flat.cl
+#pragma once
+
+#include <string>
+
+namespace powerserve::opencl::embedded {
+
+const std::string mul_mv_q8_0_f32_flat_cl_source = R"CLC(
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 
 #ifdef cl_intel_subgroups
@@ -201,3 +209,7 @@ kernel void kernel_mul_mv_q8_0_f32_flat(
     }
 }
 
+
+)CLC";
+
+} // namespace powerserve::opencl::embedded

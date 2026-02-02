@@ -39,7 +39,7 @@ bool OpenCLKernelManager::initialize(const OpenCLCompileOptions& options) {
 
 bool OpenCLKernelManager::compile_embedded_kernels() {
 #ifdef POWERSERVE_OPENCL_EMBED_KERNELS
-    
+
     bool all_success = true;
     
     // 1. 编译 copy 内核
@@ -123,6 +123,37 @@ bool OpenCLKernelManager::compile_embedded_kernels() {
         }
     }
 #endif // OPENCL_MATMUL_CL_AVAILABLE
+
+     // 5.1 编译通用 simple quant matmul kernels（无 subgroups，NVIDIA 可用）
+#ifdef OPENCL_MUL_MAT_Q4_0_F32_SIMPLE_CL_AVAILABLE
+    {
+        const std::string& src = ::powerserve::opencl::embedded::mul_mat_q4_0_f32_simple_cl_source;
+        if (!src.empty()) {
+            if (!compile_program("mul_mat_q4_0_f32_simple_kernels", src)) {
+                POWERSERVE_LOG_ERROR("Failed to compile mul_mat_q4_0_f32_simple kernels");
+                all_success = false;
+            }
+        } else {
+            POWERSERVE_LOG_ERROR("mul_mat_q4_0_f32_simple kernel source is empty!");
+            all_success = false;
+        }
+    }
+#endif
+
+#ifdef OPENCL_MUL_MAT_Q8_0_F32_SIMPLE_CL_AVAILABLE
+    {
+        const std::string& src = ::powerserve::opencl::embedded::mul_mat_q8_0_f32_simple_cl_source;
+        if (!src.empty()) {
+            if (!compile_program("mul_mat_q8_0_f32_simple_kernels", src)) {
+                POWERSERVE_LOG_ERROR("Failed to compile mul_mat_q8_0_f32_simple kernels");
+                all_success = false;
+            }
+        } else {
+            POWERSERVE_LOG_ERROR("mul_mat_q8_0_f32_simple kernel source is empty!");
+            all_success = false;
+        }
+    }
+#endif
 
     // 6. 编译 rms_norm 内核
 #ifdef OPENCL_RMS_NORM_CL_AVAILABLE

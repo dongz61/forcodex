@@ -36,6 +36,7 @@ void OpenCLBackend::cleanup() {
     std::cout << "[DEBUG] === CLEANUP TEST VERSION ===" << std::endl;
 
     std::cout << "[DEBUG] 1. Cleaning OpenCL context first..." << std::endl;
+    clear_quant_cache();
     if (context) {
         context.reset();
         std::cout << "[DEBUG] Context released" << std::endl;
@@ -107,7 +108,7 @@ bool OpenCLBackend::initialize() {
     return true;
 }
 
-std::shared_ptr<OpenCLBuffer> OpenCLBackend::create_buffer(Shape shape, DataType dtype) {
+std::shared_ptr<OpenCLBuffer> OpenCLBackend::create_buffer(Shape shape, DataType dtype) const {
     if (!memory_pool) {
         POWERSERVE_LOG_ERROR("Memory pool not initialized");
         return nullptr;
@@ -206,6 +207,11 @@ bool OpenCLBackend::is_contiguous(const Tensor *t, int n) const {
         if ((size_t)actual[i] != expected[i]) return false;
     }
     return true;
+}
+
+void OpenCLBackend::clear_quant_cache() const {
+    std::lock_guard<std::mutex> lock(m_quant_split_mutex);
+    m_quant_split_cache.clear();
 }
 
 } // namespace powerserve::opencl

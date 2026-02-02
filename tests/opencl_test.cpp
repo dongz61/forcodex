@@ -116,8 +116,8 @@ bool run_opencl_backend_matmul_quant_noncontigA_test() {
     cfg.n_layers   = 1;
     cfg.n_heads    = 1;
     cfg.n_kv_heads = 1;
-    cfg.kv_dim     = 64;
-    cfg.head_size  = 64;
+    cfg.kv_dim     = 896;
+    cfg.head_size  = 896;
     cfg.seq_len    = 16;
 
     HyperParams hp{};
@@ -129,8 +129,8 @@ bool run_opencl_backend_matmul_quant_noncontigA_test() {
         return false;
     }
 
-    const int K = 64;
-    const int N = 64;
+    const int K = 896;
+    const int N = 896;
     const int M = 4;
 
     // -------------------------
@@ -147,13 +147,18 @@ bool run_opencl_backend_matmul_quant_noncontigA_test() {
     std::vector<float> B_f32_storage;
     Tensor B_f32_cpu = make_cpu_tensor_f32(B_shape, B_f32_storage);
 
+    uint32_t seed = 1;
+    auto urand = [&]() {
+        seed = 1664525u * seed + 1013904223u;
+        return (seed & 0x00FFFFFF) / float(0x01000000); // [0,1)
+    };
+
     for (int n = 0; n < N; ++n) {
         for (int k = 0; k < K; ++k) {
-            B_f32_storage[(size_t)k + (size_t)K * (size_t)n] =
-                0.01f * (float)n - 0.0007f * (float)k;
+            float r = urand() * 2.0f - 1.0f;             // [-1,1)
+            B_f32_storage[(size_t)k + (size_t)K * (size_t)n] = 0.2f * r; // scale
         }
     }
-
    // -------------------------
     // Quantize B to Q8_0 (CPUBuffer) -- ALIGNED storage
     // -------------------------
@@ -264,6 +269,44 @@ bool run_opencl_backend_matmul_quant_noncontigA_test() {
     // Upload A (H2D) — this MUST exercise your non-contig H2D copy path
     backend.copy(&A_dev, &A_cpu_pad);
 
+    Tensor B_q_dev(DataType::GGML_Q8_0, B_shape);
+    B_q_dev.m_data = backend.create_buffer(B_shape, DataType::GGML_Q8_0);
+
+    // Ensure ggml-like stride on device view (CRITICAL)
+    {
+        auto &buf = B_q_dev.get<OpenCLBuffer>();
+        buf.m_stride = B_q_stride;
+    }
+
+    // H2D raw copy of quant blocks
+    backend.copy(&B_q_dev, &B_q_cpu);
+
+    // D2H back and memcmp to ensure exact bytes
+    std::vector<uint8_t> B_back_bytes(row_size * (size_t)N);
+    {
+        Tensor B_back(DataType::GGML_Q8_0, B_shape);
+        Stride st{};
+        st[0] = (int)ggml_type_size(GGML_TYPE_Q8_0);   // 34
+        st[1] = (int)row_size;
+        st[2] = st[1] * N;
+        st[3] = st[2];
+        B_back.m_data = std::make_shared<powerserve::CPUBuffer>(st, B_back_bytes.data());
+        backend.copy(&B_back, &B_q_dev);
+    }
+
+    const uint8_t* src0 = (const uint8_t*)B_q_blocks.data();
+    const uint8_t* src1 = (const uint8_t*)B_back_bytes.data();
+    size_t bytes_total = row_size * (size_t)N;
+    if (std::memcmp(src0, src1, bytes_total) != 0) {
+        size_t first = 0;
+        for (; first < bytes_total; ++first) if (src0[first] != src1[first]) break;
+        printf("[TEST][FATAL] B_q_dev bytes mismatch! first=%zu cpu=0x%02x dev=0x%02x\n",
+            first, src0[first], src1[first]);
+        return false;
+    } else {
+        printf("[TEST] B_q_dev bytes match CPU (size=%zu)\n", bytes_total);
+    }
+
     // -------------------------
     // Matmul on backend: C = A * B
     // A: OpenCL FP32 non-contig
@@ -278,7 +321,7 @@ bool run_opencl_backend_matmul_quant_noncontigA_test() {
 
     Tensor C_dev = make_opencl_tensor_f32(backend, C_shape);
     // backend.matmul expects weight (B) first, activation (A) second
-    backend.matmul(&C_dev, &B_q_cpu, &A_dev);
+    backend.matmul(&C_dev, &B_q_dev, &A_dev);
 
     // D2H result
     std::vector<float> C_host_storage;
@@ -315,13 +358,21 @@ bool run_opencl_backend_matmul_quant_noncontigA_test() {
     // CPU reference (float): C[n,m] = sum_k A[k,m] * B[k,n]
     // where B is in ggml-friendly layout idx = k + K*n
     // -------------------------
+    std::vector<float> B_deq((size_t)K * (size_t)N, 0.f);
+    for (int n = 0; n < N; ++n) {
+        const block_q8_0* row = (const block_q8_0*)(B_q_blocks.data() + (size_t)nb * (size_t)n);
+        dequantize_row_q8_0(row, B_deq.data() + (size_t)K * (size_t)n, K);
+    }
+
+    // CPU ref: C[n,m] = sum_k A[k,m] * B_deq[k,n]
     std::vector<float> C_ref((size_t)N * (size_t)M, 0.f);
     for (int m = 0; m < M; ++m) {
         for (int n = 0; n < N; ++n) {
             double acc = 0.0;
+            const float* Brow = B_deq.data() + (size_t)K * (size_t)n;
             for (int k = 0; k < K; ++k) {
                 const float a = A_logical[(size_t)k + (size_t)K * (size_t)m];
-                const float b = B_f32_storage[(size_t)k + (size_t)K * (size_t)n];
+                const float b = Brow[(size_t)k];
                 acc += (double)a * (double)b;
             }
             C_ref[(size_t)n + (size_t)N * (size_t)m] = (float)acc;
@@ -329,8 +380,8 @@ bool run_opencl_backend_matmul_quant_noncontigA_test() {
     }
 
     // Compare
-    const float atol = 5e-3f;
-    const float rtol = 5e-3f;
+    const float atol = 1e-6f;
+    const float rtol = 1e-6f;
     size_t bad_i = 0;
     float bad_diff = 0.f;
 
