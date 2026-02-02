@@ -565,18 +565,13 @@ void OpenCLBackend::matmul(const Tensor *dst, const Tensor *src0, const Tensor *
         POWERSERVE_ABORT("OpenCLBackend::matmul: unsupported weight dtype {} (no ggml fallback)", (int)src0->m_dtype);
     }
 
-    // Current implementation: 2D only (most linear layers)
-    if (dst->m_shape[2] != 1 || dst->m_shape[3] != 1 ||
-        src0->m_shape[2] != 1 || src0->m_shape[3] != 1 ||
-        src1->m_shape[2] != 1 || src1->m_shape[3] != 1) {
-        POWERSERVE_ABORT("OpenCLBackend::matmul: only supports 2D tensors (shape[2]=shape[3]=1) for now");
-    }
-
     // Shapes: w=[K,N], x=[K,M], dst=[N,M]
     const int K  = (int)src0->m_shape[0];
     const int N  = (int)src0->m_shape[1];
     const int Kx = (int)src1->m_shape[0];
     const int M  = (int)src1->m_shape[1];
+    const size_t B2 = dst->m_shape[2];
+    const size_t B3 = dst->m_shape[3];
 
     if (Kx != K) {
         POWERSERVE_ABORT("OpenCLBackend::matmul: K mismatch w.K={} x.K={}", K, Kx);
@@ -584,6 +579,13 @@ void OpenCLBackend::matmul(const Tensor *dst, const Tensor *src0, const Tensor *
     if ((int)dst->m_shape[0] != N || (int)dst->m_shape[1] != M) {
         POWERSERVE_ABORT("OpenCLBackend::matmul: dst shape mismatch, expected [N,M]=[{},{}], got [{},{}]",
                          N, M, (int)dst->m_shape[0], (int)dst->m_shape[1]);
+    }
+    if (src1->m_shape[2] != B2 || src1->m_shape[3] != B3) {
+        POWERSERVE_ABORT("OpenCLBackend::matmul: src1 batch dims mismatch dst (src1=[{},{}], dst=[{},{}])",
+                         (int)src1->m_shape[2], (int)src1->m_shape[3], (int)B2, (int)B3);
+    }
+    if (!::powerserve::tensor_can_mul_mat(src0, src1)) {
+        POWERSERVE_ABORT("OpenCLBackend::matmul: src0 batch dims not broadcastable to src1");
     }
 
     auto *self = const_cast<OpenCLBackend *>(this);
@@ -642,22 +644,89 @@ void OpenCLBackend::matmul(const Tensor *dst, const Tensor *src0, const Tensor *
         need_scatter_back = true;
     }
 
-    // Dispatch by weight dtype (no ggml fallback)
-    switch (w_dev->m_dtype) {
-        case DataType::FP16:
-            matmul_opencl_f16_f32(dst_use, w_dev, x_use);
-            break;
-        case DataType::FP32:
-            matmul_opencl_f32_f32(dst_use, w_dev, x_use);
-            break;
-        case DataType::GGML_Q4_0:
-            matmul_opencl_q4_0_f32(dst_use, w_dev, x_use);
-            break;
-        case DataType::GGML_Q8_0:
-            matmul_opencl_q8_0_f32(dst_use, w_dev, x_use);
-            break;
-        default:
-            POWERSERVE_ABORT("OpenCLBackend::matmul: unreachable dtype {}", (int)w_dev->m_dtype);
+    auto *w_buf = dynamic_cast<OpenCLBuffer *>(&const_cast<Tensor *>(w_dev)->get<BaseBuffer>());
+    auto *x_buf = dynamic_cast<OpenCLBuffer *>(&const_cast<Tensor *>(x_use)->get<BaseBuffer>());
+    auto *d_buf = dynamic_cast<OpenCLBuffer *>(&const_cast<Tensor *>(dst_use)->get<BaseBuffer>());
+    POWERSERVE_ASSERT(w_buf && x_buf && d_buf);
+
+    const Shape w_slice_shape{ w_dev->m_shape[0], w_dev->m_shape[1], 1, 1 };
+    const Shape x_slice_shape{ x_use->m_shape[0], x_use->m_shape[1], 1, 1 };
+    const Shape d_slice_shape{ dst_use->m_shape[0], dst_use->m_shape[1], 1, 1 };
+
+    auto slice_bytes_for = [](const Tensor *base) -> size_t {
+        if (base->m_dtype == DataType::GGML_Q4_0 || base->m_dtype == DataType::GGML_Q8_0) {
+            const ggml_type gt = powerserve::ggml::convert_datatype_to_ggml(base->m_dtype);
+            return (size_t)ggml_row_size(gt, (int64_t)base->m_shape[0]) * (size_t)base->m_shape[1];
+        }
+        return powerserve::get_type_size(base->m_dtype) * (size_t)base->m_shape[0] * (size_t)base->m_shape[1];
+    };
+
+    auto make_slice = [](const Tensor *base,
+                         OpenCLBuffer *buf,
+                         size_t offset_bytes,
+                         size_t slice_bytes,
+                         const Shape &shape) {
+        Tensor slice(base->m_dtype, shape);
+        auto view = std::make_shared<OpenCLBuffer>(
+            buf->m_stride,
+            buf->get_device_buffer(),
+            slice_bytes,
+            buf->memory_pool,
+            /*owns_buffer=*/false,
+            buf->is_pooled(),
+            buf->get_base_offset() + offset_bytes
+        );
+        slice.m_data = std::move(view);
+        return slice;
+    };
+
+    const size_t w_slice_bytes = slice_bytes_for(w_dev);
+    const size_t x_slice_bytes = slice_bytes_for(x_use);
+    const size_t d_slice_bytes = slice_bytes_for(dst_use);
+
+    const size_t w_stride2 = w_slice_bytes;
+    const size_t w_stride3 = w_slice_bytes * w_dev->m_shape[2];
+    const size_t x_stride2 = x_slice_bytes;
+    const size_t x_stride3 = x_slice_bytes * x_use->m_shape[2];
+    const size_t d_stride2 = d_slice_bytes;
+    const size_t d_stride3 = d_slice_bytes * dst_use->m_shape[2];
+
+    for (size_t i3 = 0; i3 < B3; ++i3) {
+        const size_t w_i3 = (src0->m_shape[3] == 1) ? 0 : (i3 % src0->m_shape[3]);
+        const size_t x_i3 = i3;
+        const size_t d_i3 = i3;
+
+        for (size_t i2 = 0; i2 < B2; ++i2) {
+            const size_t w_i2 = (src0->m_shape[2] == 1) ? 0 : (i2 % src0->m_shape[2]);
+            const size_t x_i2 = i2;
+            const size_t d_i2 = i2;
+
+            const size_t w_off = w_i2 * w_stride2 + w_i3 * w_stride3;
+            const size_t x_off = x_i2 * x_stride2 + x_i3 * x_stride3;
+            const size_t d_off = d_i2 * d_stride2 + d_i3 * d_stride3;
+
+            Tensor w_slice = make_slice(w_dev, w_buf, w_off, w_slice_bytes, w_slice_shape);
+            Tensor x_slice = make_slice(x_use, x_buf, x_off, x_slice_bytes, x_slice_shape);
+            Tensor d_slice = make_slice(dst_use, d_buf, d_off, d_slice_bytes, d_slice_shape);
+
+            // Dispatch by weight dtype (no ggml fallback)
+            switch (w_dev->m_dtype) {
+                case DataType::FP16:
+                    matmul_opencl_f16_f32(&d_slice, &w_slice, &x_slice);
+                    break;
+                case DataType::FP32:
+                    matmul_opencl_f32_f32(&d_slice, &w_slice, &x_slice);
+                    break;
+                case DataType::GGML_Q4_0:
+                    matmul_opencl_q4_0_f32(&d_slice, &w_slice, &x_slice);
+                    break;
+                case DataType::GGML_Q8_0:
+                    matmul_opencl_q8_0_f32(&d_slice, &w_slice, &x_slice);
+                    break;
+                default:
+                    POWERSERVE_ABORT("OpenCLBackend::matmul: unreachable dtype {}", (int)w_dev->m_dtype);
+            }
+        }
     }
 
     if (need_scatter_back) {
