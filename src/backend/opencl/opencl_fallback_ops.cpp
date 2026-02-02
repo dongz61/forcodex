@@ -533,44 +533,79 @@ void OpenCLBackend::matmul(const Tensor *dst, const Tensor *src0, const Tensor *
                          N, M, (int)dst->m_shape[0], (int)dst->m_shape[1]);
     }
 
-    // Ensure src1 and dst are OpenCL buffers + contiguous when needed
+    auto *self = const_cast<OpenCLBackend *>(this);
+
+    // ---- ensure weight is on OpenCL + ggml-contiguous ----
+    Tensor tmp_w_upload;
+    Tensor tmp_w_contig;
+    const Tensor *w_dev = src0;
+
+    // If weight is still on CPU (can happen depending on loader / backend init), upload it.
+    if (!dynamic_cast<powerserve::opencl::OpenCLBuffer *>(src0->m_data.get())) {
+        tmp_w_upload = Tensor(src0->m_dtype, src0->m_shape);
+        tmp_w_upload.m_data = self->create_buffer(src0->m_shape, src0->m_dtype);
+        self->copy(&tmp_w_upload, src0); // H2D, supports quant bytes via copy path
+        w_dev = &tmp_w_upload;
+    }
+
+    // If weight is a view / non-ggml-contig on device, pack/copy to a contiguous buffer.
+    if (!is_contiguous(w_dev, 4)) {
+        tmp_w_contig = Tensor(w_dev->m_dtype, w_dev->m_shape);
+        tmp_w_contig.m_data = self->create_buffer(w_dev->m_shape, w_dev->m_dtype);
+        detail::cpy_tensor_cl(self, w_dev, &tmp_w_contig);
+        w_dev = &tmp_w_contig;
+    }
+
+    // ---- Ensure src1 and dst are OpenCL buffers + contiguous when needed ----
     Tensor tmp_x_dev;
     Tensor tmp_dst_dev;
 
-    const Tensor* x_use = src1;
+    const Tensor *x_use = src1;
     if (!is_contiguous(src1, 4)) {
         tmp_x_dev = Tensor(DataType::FP32, src1->m_shape);
-        tmp_x_dev.m_data = create_buffer(src1->m_shape, DataType::FP32);
-        detail::cpy_tensor_cl(this, src1, &tmp_x_dev);
+        tmp_x_dev.m_data = self->create_buffer(src1->m_shape, DataType::FP32);
+        detail::cpy_tensor_cl(self, src1, &tmp_x_dev);
+        x_use = &tmp_x_dev;
+    } else if (!dynamic_cast<powerserve::opencl::OpenCLBuffer *>(src1->m_data.get())) {
+        // (rare) if activation is CPU but contiguous, upload
+        tmp_x_dev = Tensor(DataType::FP32, src1->m_shape);
+        tmp_x_dev.m_data = self->create_buffer(src1->m_shape, DataType::FP32);
+        self->copy(&tmp_x_dev, src1);
         x_use = &tmp_x_dev;
     }
 
-    const Tensor* dst_use = dst;
+    const Tensor *dst_use = dst;
     bool need_scatter_back = false;
     if (!is_contiguous(dst, 4)) {
         tmp_dst_dev = Tensor(DataType::FP32, dst->m_shape);
-        tmp_dst_dev.m_data = create_buffer(dst->m_shape, DataType::FP32);
+        tmp_dst_dev.m_data = self->create_buffer(dst->m_shape, DataType::FP32);
+        dst_use = &tmp_dst_dev;
+        need_scatter_back = true;
+    } else if (!dynamic_cast<powerserve::opencl::OpenCLBuffer *>(dst->m_data.get())) {
+        // (rare) dst on CPU: compute into temp and copy back
+        tmp_dst_dev = Tensor(DataType::FP32, dst->m_shape);
+        tmp_dst_dev.m_data = self->create_buffer(dst->m_shape, DataType::FP32);
         dst_use = &tmp_dst_dev;
         need_scatter_back = true;
     }
 
-    // Dispatch by weight dtype
-    switch (src0->m_dtype) {
+    // Dispatch by weight dtype (no ggml fallback)
+    switch (w_dev->m_dtype) {
         case DataType::FP16:
-            matmul_opencl_f16_f32(dst_use, src0, x_use);
+            matmul_opencl_f16_f32(dst_use, w_dev, x_use);
             break;
         case DataType::GGML_Q4_0:
-            matmul_opencl_q4_0_f32(dst_use, src0, x_use);
+            matmul_opencl_q4_0_f32(dst_use, w_dev, x_use);
             break;
         case DataType::GGML_Q8_0:
-            matmul_opencl_q8_0_f32(dst_use, src0, x_use);
+            matmul_opencl_q8_0_f32(dst_use, w_dev, x_use);
             break;
         default:
-            POWERSERVE_ABORT("OpenCLBackend::matmul: unreachable dtype {}", (int)src0->m_dtype);
+            POWERSERVE_ABORT("OpenCLBackend::matmul: unreachable dtype {}", (int)w_dev->m_dtype);
     }
 
     if (need_scatter_back) {
-        detail::cpy_tensor_cl(this, dst_use, dst);
+        detail::cpy_tensor_cl(self, dst_use, dst);
     }
 }
 
