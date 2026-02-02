@@ -497,18 +497,71 @@ void OpenCLBackend::matmul_opencl_q8_0_f32(const Tensor* dst, const Tensor* w, c
     OCL_RETURN_IF_ERROR(ctx, clFinish(ctx->get_queue()));
 }
 
+void OpenCLBackend::matmul_opencl_f32_f32(const Tensor* dst, const Tensor* w, const Tensor* x) const {
+    auto* ctx = context.get();
+    POWERSERVE_ASSERT(ctx && kernel_manager);
 
+    auto* w_cl = dynamic_cast<OpenCLBuffer*>(&const_cast<Tensor*>(w)->get<BaseBuffer>());
+    auto* x_cl = dynamic_cast<OpenCLBuffer*>(&const_cast<Tensor*>(x)->get<BaseBuffer>());
+    auto* d_cl = dynamic_cast<OpenCLBuffer*>(&const_cast<Tensor*>(dst)->get<BaseBuffer>());
+    POWERSERVE_ASSERT(w_cl && x_cl && d_cl);
+
+    const int K = (int)w->m_shape[0];
+    const int N = (int)w->m_shape[1];
+    const int M = (int)x->m_shape[1];
+
+    cl_kernel k = kernel_manager->get_kernel("kernel_mul_mat_f32_f32_simple");
+    POWERSERVE_ASSERT(k && "kernel_mul_mat_f32_f32_simple not found");
+
+    cl_mem wmem  = w_cl->get_device_buffer();
+    cl_mem xmem  = x_cl->get_device_buffer();
+    cl_mem out   = d_cl->get_device_buffer();
+
+    const cl_ulong off_w  = (cl_ulong)w_cl->get_base_offset();
+    const cl_ulong off_x  = (cl_ulong)x_cl->get_base_offset();
+    const cl_ulong off_d  = (cl_ulong)d_cl->get_base_offset();
+
+    const cl_ulong nb_w1   = (cl_ulong)w_cl->get_stride()[1];
+    const cl_ulong nb_x1   = (cl_ulong)x_cl->get_stride()[1];
+    const cl_ulong nb_dst1 = (cl_ulong)d_cl->get_stride()[1];
+
+    cl_uint arg = 0;
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &wmem));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_w));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &xmem));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_x));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &out));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_d));
+
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &K));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &N));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &M));
+
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb_w1));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb_x1));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb_dst1));
+
+    const size_t local[2]  = { 16, 16 };
+    const size_t global[2] = {
+        ((size_t)N + local[0] - 1) / local[0] * local[0],
+        ((size_t)M + local[1] - 1) / local[1] * local[1],
+    };
+
+    OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), k, 2, nullptr, global, local, 0, nullptr, nullptr));
+    OCL_RETURN_IF_ERROR(ctx, clFinish(ctx->get_queue()));
+}
 
 void OpenCLBackend::matmul(const Tensor *dst, const Tensor *src0, const Tensor *src1) const {
     POWERSERVE_ASSERT(dst && src0 && src1);
     POWERSERVE_ASSERT(context && kernel_manager);
 
-    // We only support: (weight: FP16/Q4_0/Q8_0) x (activations: FP32) -> FP32
+    // We only support: (weight: FP16/FP32/Q4_0/Q8_0) x (activations: FP32) -> FP32
     if (dst->m_dtype != DataType::FP32 || src1->m_dtype != DataType::FP32) {
         POWERSERVE_ABORT("OpenCLBackend::matmul: only supports dst=FP32 and src1=FP32 (got dst={}, src1={})",
                          (int)dst->m_dtype, (int)src1->m_dtype);
     }
-    if (!(src0->m_dtype == DataType::FP16 || src0->m_dtype == DataType::GGML_Q4_0 || src0->m_dtype == DataType::GGML_Q8_0)) {
+    if (!(src0->m_dtype == DataType::FP16 || src0->m_dtype == DataType::FP32 ||
+          src0->m_dtype == DataType::GGML_Q4_0 || src0->m_dtype == DataType::GGML_Q8_0)) {
         POWERSERVE_ABORT("OpenCLBackend::matmul: unsupported weight dtype {} (no ggml fallback)", (int)src0->m_dtype);
     }
 
@@ -593,6 +646,9 @@ void OpenCLBackend::matmul(const Tensor *dst, const Tensor *src0, const Tensor *
     switch (w_dev->m_dtype) {
         case DataType::FP16:
             matmul_opencl_f16_f32(dst_use, w_dev, x_use);
+            break;
+        case DataType::FP32:
+            matmul_opencl_f32_f32(dst_use, w_dev, x_use);
             break;
         case DataType::GGML_Q4_0:
             matmul_opencl_q4_0_f32(dst_use, w_dev, x_use);

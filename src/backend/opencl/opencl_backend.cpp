@@ -80,10 +80,10 @@ bool OpenCLBackend::initialize() {
 
     OpenCLCompileOptions options;
     options.opencl_c_std = "CL3.0";
-    options.enable_mad = true;
-    options.unsafe_math = true;
-    options.finite_math = true;
-    options.fast_relaxed_math = true;
+    options.enable_mad = false;
+    options.unsafe_math = false;
+    options.finite_math = false;
+    options.fast_relaxed_math = false;
 
     if (!kernel_manager->initialize(options)) {
         POWERSERVE_LOG_ERROR("Failed to initialize OpenCL kernel manager");

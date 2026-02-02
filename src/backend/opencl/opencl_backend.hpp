@@ -217,6 +217,7 @@ private:
     QuantSplitBuffers get_or_create_split_q8_0(const Tensor* w) const;
 
     void matmul_opencl_f16_f32(const Tensor* dst, const Tensor* w, const Tensor* x) const;
+    void matmul_opencl_f32_f32(const Tensor* dst, const Tensor* w, const Tensor* x) const;
     void matmul_opencl_q4_0_f32(const Tensor* dst, const Tensor* w, const Tensor* x) const;
     void matmul_opencl_q8_0_f32(const Tensor* dst, const Tensor* w, const Tensor* x) const;
 
