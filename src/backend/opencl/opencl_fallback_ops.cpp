@@ -850,63 +850,6 @@ static inline uint32_t floor_log2_u32(uint32_t x) {
     return r;
 }
 
-static void softmax_ext_cpu_f32_ggml_semantics(
-    float *dst,
-    const float *src0,
-    const float *src1,
-    int ne00, int ne01, int ne02, int ne03,
-    float scale,
-    float max_bias
-) {
-    const uint32_t n_head = (uint32_t)ne02;
-    const uint32_t n_head_log2 = 1u << (uint32_t)floor_log2_u32(n_head);
-
-    const float m0 = std::pow(2.0f, -(max_bias)        / (float)n_head_log2);
-    const float m1 = std::pow(2.0f, -(max_bias / 2.0f) / (float)n_head_log2);
-
-    const int nc = ne00;
-    const int nr = ne01 * ne02 * ne03;
-
-    std::vector<float> wp((size_t)nc);
-
-    for (int i1 = 0; i1 < nr; ++i1) {
-        const uint32_t h = (uint32_t)((i1 / ne01) % ne02);
-
-        const float slope =
-            (max_bias > 0.0f)
-            ? (h < n_head_log2
-                ? std::pow(m0, (float)(h + 1))
-                : std::pow(m1, (float)(2*(h - n_head_log2) + 1)))
-            : 1.0f;
-
-        const float *sp = src0 + (size_t)i1 * (size_t)nc;
-        float *dp       = dst  + (size_t)i1 * (size_t)nc;
-
-        const float *mp = src1 ? (src1 + (size_t)(i1 % ne01) * (size_t)ne00) : nullptr;
-
-        for (int i = 0; i < nc; ++i) {
-            float v = sp[i] * scale;
-            if (mp) v += slope * mp[i];
-            wp[i] = v;
-        }
-
-        float mx = -INFINITY;
-        for (int i = 0; i < nc; ++i) mx = std::max(mx, wp[i]);
-
-        float sum = 0.0f;
-        for (int i = 0; i < nc; ++i) {
-            float e = std::exp(wp[i] - mx);
-            dp[i] = e;
-            sum += e;
-        }
-
-        const float inv = 1.0f / sum;
-        for (int i = 0; i < nc; ++i) {
-            dp[i] *= inv;
-        }
-    }
-}
-
 void OpenCLBackend::softmax_ext(
     const Tensor *out,
     const Tensor *x,
