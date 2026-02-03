@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <vector>
 
 namespace powerserve::opencl {
@@ -806,38 +807,250 @@ void OpenCLBackend::rope(
     const std::vector<int> &pos,
     const ModelConfig::LLMConfig::RopeConfig &rope_cfg
 ) const {
+    auto fallback_to_cpu = [&]() {
+        if (!m_ggml_fallback) {
+            POWERSERVE_LOG_ERROR("m_ggml_fallback is null (initialize() not called?)");
+            return;
+        }
+
+        if (out->m_dtype != DataType::FP32 || src->m_dtype != DataType::FP32) {
+            POWERSERVE_LOG_ERROR("OpenCLBackend::rope fallback only supports FP32");
+            return;
+        }
+
+        Tensor host_x(DataType::FP32, src->m_shape);
+        host_x.m_data = powerserve::CPUBuffer::create_buffer<float>(src->m_shape);
+        this->copy(&host_x, src);
+
+        Tensor host_y(DataType::FP32, out->m_shape);
+        host_y.m_data = powerserve::CPUBuffer::create_buffer<float>(out->m_shape);
+
+        m_ggml_fallback->rope(&host_y, &host_x, pos, rope_cfg);
+
+        this->copy(out, &host_y);
+    };
+
     if (!initialized) {
         POWERSERVE_LOG_ERROR("OpenCL backend not initialized");
-        return;
-    }
-    if (!m_ggml_fallback) {
-        POWERSERVE_LOG_ERROR("m_ggml_fallback is null (initialize() not called?)");
         return;
     }
     if (!out || !src) {
         POWERSERVE_LOG_ERROR("OpenCLBackend::rope got null tensor");
         return;
     }
-
-    if (out->m_dtype != DataType::FP32 || src->m_dtype != DataType::FP32) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::rope fallback only supports FP32");
+    if (pos.empty()) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::rope got empty pos");
         return;
     }
+
     if (out->m_shape != src->m_shape) {
         POWERSERVE_LOG_ERROR("OpenCLBackend::rope requires out.shape == src.shape");
         return;
     }
 
-    Tensor host_x(DataType::FP32, src->m_shape);
-    host_x.m_data = powerserve::CPUBuffer::create_buffer<float>(src->m_shape);
-    this->copy(&host_x, src);
+    auto *self = const_cast<OpenCLBackend *>(this);
+    auto *ctx = self->context.get();
+    if (!ctx || !self->kernel_manager) {
+        POWERSERVE_LOG_WARN("OpenCLBackend::rope missing OpenCL context/kernel manager, fallback to CPU");
+        fallback_to_cpu();
+        return;
+    }
 
-    Tensor host_y(DataType::FP32, out->m_shape);
-    host_y.m_data = powerserve::CPUBuffer::create_buffer<float>(out->m_shape);
+    const bool is_f32 = (src->m_dtype == DataType::FP32);
+    const bool is_f16 = (src->m_dtype == DataType::FP16);
+    if ((!is_f32 && !is_f16) || out->m_dtype != src->m_dtype) {
+        POWERSERVE_LOG_WARN("OpenCLBackend::rope unsupported dtype, fallback to CPU");
+        fallback_to_cpu();
+        return;
+    }
 
-    m_ggml_fallback->rope(&host_y, &host_x, pos, rope_cfg);
+    if (pos.size() != src->m_shape[2]) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::rope pos.size() {} != src shape[2] {}", pos.size(), src->m_shape[2]);
+        fallback_to_cpu();
+        return;
+    }
 
-    this->copy(out, &host_y);
+    auto *src_cl = dynamic_cast<OpenCLBuffer *>(&const_cast<Tensor *>(src)->get<BaseBuffer>());
+    auto *out_cl = dynamic_cast<OpenCLBuffer *>(&const_cast<Tensor *>(out)->get<BaseBuffer>());
+    if (!src_cl || !out_cl) {
+        POWERSERVE_LOG_WARN("OpenCLBackend::rope expects OpenCLBuffer, fallback to CPU");
+        fallback_to_cpu();
+        return;
+    }
+
+    Shape pos_shape{pos.size(), 1, 1, 1};
+    Tensor pos_host(DataType::INT32, pos_shape);
+    pos_host.m_data = powerserve::CPUBuffer::create_buffer<int32_t>(pos_shape);
+    auto &pos_cpu = pos_host.get<powerserve::CPUBuffer>();
+    std::memcpy(pos_cpu.m_data, pos.data(), pos.size() * sizeof(int32_t));
+
+    Tensor pos_dev(DataType::INT32, pos_shape);
+    pos_dev.m_data = self->create_buffer(pos_shape, DataType::INT32);
+    if (!pos_dev.m_data) {
+        POWERSERVE_LOG_WARN("OpenCLBackend::rope failed to allocate pos buffer, fallback to CPU");
+        fallback_to_cpu();
+        return;
+    }
+    self->copy(&pos_dev, &pos_host);
+
+    auto *pos_cl = dynamic_cast<OpenCLBuffer *>(&pos_dev.get<BaseBuffer>());
+    if (!pos_cl) {
+        POWERSERVE_LOG_WARN("OpenCLBackend::rope failed to create pos OpenCLBuffer, fallback to CPU");
+        fallback_to_cpu();
+        return;
+    }
+
+    cl_mem X_cl = src_cl->get_device_buffer();
+    cl_mem P_cl = pos_cl->get_device_buffer();
+    cl_mem Y_cl = out_cl->get_device_buffer();
+    if (!X_cl || !P_cl || !Y_cl) {
+        POWERSERVE_LOG_WARN("OpenCLBackend::rope invalid cl_mem buffers, fallback to CPU");
+        fallback_to_cpu();
+        return;
+    }
+
+    cl_mem S_cl = X_cl;
+    const cl_ulong off0 = static_cast<cl_ulong>(src_cl->get_base_offset());
+    const cl_ulong off1 = static_cast<cl_ulong>(pos_cl->get_base_offset());
+    const cl_ulong off2 = off0;
+    const cl_ulong offd = static_cast<cl_ulong>(out_cl->get_base_offset());
+
+    const int ne00 = static_cast<int>(src->m_shape[0]);
+    const int ne01 = static_cast<int>(src->m_shape[1]);
+    const int ne02 = static_cast<int>(src->m_shape[2]);
+    const int ne03 = static_cast<int>(src->m_shape[3]);
+
+    const int ne0 = static_cast<int>(out->m_shape[0]);
+    const int ne1 = static_cast<int>(out->m_shape[1]);
+    const int ne2 = static_cast<int>(out->m_shape[2]);
+    const int ne3 = static_cast<int>(out->m_shape[3]);
+
+    const auto src_stride = src_cl->get_stride();
+    const auto dst_stride = out_cl->get_stride();
+
+    const cl_ulong nb00 = static_cast<cl_ulong>(src_stride[0]);
+    const cl_ulong nb01 = static_cast<cl_ulong>(src_stride[1]);
+    const cl_ulong nb02 = static_cast<cl_ulong>(src_stride[2]);
+    const cl_ulong nb03 = static_cast<cl_ulong>(src_stride[3]);
+
+    const cl_ulong nb0 = static_cast<cl_ulong>(dst_stride[0]);
+    const cl_ulong nb1 = static_cast<cl_ulong>(dst_stride[1]);
+    const cl_ulong nb2 = static_cast<cl_ulong>(dst_stride[2]);
+    const cl_ulong nb3 = static_cast<cl_ulong>(dst_stride[3]);
+
+    if (ne00 == 0 || ne01 == 0 || ne02 == 0 || ne03 == 0) {
+        return;
+    }
+
+    RopeParams params{};
+    params.n_past = 0;
+    params.n_dims = rope_cfg.n_dims;
+    params.n_ctx_orig = rope_cfg.n_ctx_orig;
+    params.freq_base = rope_cfg.freq_base;
+    params.freq_scale = rope_cfg.freq_scale;
+    params.ext_factor = rope_cfg.ext_factor;
+    params.attn_factor = rope_cfg.attn_factor;
+    params.beta_fast = rope_cfg.beta_fast;
+    params.beta_slow = rope_cfg.beta_slow;
+    params.mode = rope_cfg.rope_type;
+    const bool mode_is_default = params.mode < 0;
+    const bool is_neox = mode_is_default ? true : ((params.mode & GGML_ROPE_TYPE_NEOX) != 0);
+    const bool is_mrope = (!mode_is_default) && ((params.mode & GGML_ROPE_TYPE_MROPE) != 0);
+    const bool is_vision = (!mode_is_default) && (params.mode == GGML_ROPE_TYPE_VISION);
+    const int is_imrope = (params.mode == GGML_ROPE_TYPE_IMROPE) ? 1 : 0;
+    POWERSERVE_LOG_INFO(
+        "OpenCLBackend::rope rope_type={} (effective mode={}, neox={}, mrope={}, vision={})",
+        rope_cfg.rope_type,
+        params.mode,
+        is_neox,
+        is_mrope,
+        is_vision
+    );
+
+    cl_kernel kernel = nullptr;
+    if (is_neox) {
+        kernel = self->kernel_manager->get_kernel(is_f16 ? "kernel_rope_neox_f16" : "kernel_rope_neox_f32");
+    } else if (is_mrope && !is_vision) {
+        kernel = self->kernel_manager->get_kernel(is_f16 ? "kernel_rope_multi_f16" : "kernel_rope_multi_f32");
+    } else if (is_vision) {
+        kernel = self->kernel_manager->get_kernel(is_f16 ? "kernel_rope_vision_f16" : "kernel_rope_vision_f32");
+    } else {
+        kernel = self->kernel_manager->get_kernel(is_f16 ? "kernel_rope_norm_f16" : "kernel_rope_norm_f32");
+    }
+
+    if (!kernel) {
+        POWERSERVE_LOG_WARN("OpenCLBackend::rope kernel not found, fallback to CPU");
+        fallback_to_cpu();
+        return;
+    }
+
+    cl_uint arg = 0;
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(cl_mem), &X_cl));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off0));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(cl_mem), &P_cl));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off1));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(cl_mem), &S_cl));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off2));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(cl_mem), &Y_cl));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &offd));
+
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(int), &ne00));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(int), &ne01));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(int), &ne02));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(int), &ne03));
+
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb00));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb01));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb02));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb03));
+
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(int), &ne0));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(int), &ne1));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(int), &ne2));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(int), &ne3));
+
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb0));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb1));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb2));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb3));
+
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(int), &params.n_past));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(int), &params.n_dims));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(int), &params.n_ctx_orig));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(float), &params.freq_base));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(float), &params.freq_scale));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(float), &params.ext_factor));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(float), &params.attn_factor));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(float), &params.beta_fast));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(float), &params.beta_slow));
+
+    if (is_mrope || is_vision) {
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(int32_t) * 4, params.sections));
+    }
+    if (is_mrope && !is_vision) {
+        OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(int), &is_imrope));
+    }
+
+    const int nth = std::min(64, ne00);
+    const size_t local[3]  = {static_cast<size_t>(nth), 1, 1};
+    const size_t global[3] = {
+        static_cast<size_t>(ne01) * static_cast<size_t>(nth),
+        static_cast<size_t>(ne02),
+        static_cast<size_t>(ne03)
+    };
+
+    OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(
+        ctx->get_queue(),
+        kernel,
+        3,
+        nullptr,
+        global,
+        local,
+        0,
+        nullptr,
+        nullptr
+    ));
+    OCL_RETURN_IF_ERROR(ctx, clFinish(ctx->get_queue()));
 }
 
 void OpenCLBackend::softmax(const Tensor * /*out*/, const Tensor * /*x*/) const {
