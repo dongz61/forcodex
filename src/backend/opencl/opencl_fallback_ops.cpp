@@ -958,14 +958,6 @@ void OpenCLBackend::rope(
     const bool is_mrope = (!mode_is_default) && ((params.mode & GGML_ROPE_TYPE_MROPE) != 0);
     const bool is_vision = (!mode_is_default) && (params.mode == GGML_ROPE_TYPE_VISION);
     const int is_imrope = (params.mode == GGML_ROPE_TYPE_IMROPE) ? 1 : 0;
-    POWERSERVE_LOG_INFO(
-        "OpenCLBackend::rope rope_type={} (effective mode={}, neox={}, mrope={}, vision={})",
-        rope_cfg.rope_type,
-        params.mode,
-        is_neox,
-        is_mrope,
-        is_vision
-    );
 
     cl_kernel kernel = nullptr;
     if (is_neox) {
