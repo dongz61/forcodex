@@ -19,6 +19,7 @@ if (POWERSERVE_WITH_OPENCL)
         # 添加OpenCL测试程序
         add_executable(opencl_test "opencl_test.cpp")
         add_executable(logits_cmp "logits_cmp.cpp")
+        add_executable(tokens_cmp "tokens_cmp.cpp")
         
         # 链接OpenCL
         target_link_libraries(opencl_test PRIVATE 
@@ -52,6 +53,22 @@ if (POWERSERVE_WITH_OPENCL)
             ${CMAKE_SOURCE_DIR}
         )
 
+        target_link_libraries(tokens_cmp PRIVATE
+            powerserve
+            OpenCL::OpenCL
+        )
+
+        if (NOT MSVC)
+            target_compile_options(tokens_cmp PRIVATE
+                -Wall
+                -Wextra
+                -Wno-unused-parameter
+            )
+        endif()
+
+        target_include_directories(tokens_cmp PRIVATE
+            ${CMAKE_SOURCE_DIR}
+        )
         
         # 添加一个方便运行测试的自定义命令
         add_custom_target(run_opencl_test
@@ -67,6 +84,12 @@ if (POWERSERVE_WITH_OPENCL)
             WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
         )
         
+        add_custom_target(run_tokens_cmp
+            COMMAND POWERSERVE_USE_OPENCL=1 ./tokens_cmp
+            DEPENDS tokens_cmp
+            WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+        )
+
     else()
         message(FATAL_ERROR "OpenCL not found. Install OpenCL development package.")
     endif()

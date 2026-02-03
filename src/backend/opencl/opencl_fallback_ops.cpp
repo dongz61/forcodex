@@ -356,33 +356,42 @@ void OpenCLBackend::matmul_opencl_f16_f32(const Tensor* dst, const Tensor* w, co
     const int Mm = N;
     const int Nn = M;
 
-    cl_kernel k = kernel_manager->get_kernel("kernel_mul_mat_f16_f32");
-    POWERSERVE_ASSERT(k && "kernel_mul_mat_f16_f32 not found (did you embed/compile mul_mat_f16_f32.cl?)");
+    cl_kernel k = kernel_manager->get_kernel("kernel_mul_mat_f16_f32_simple");
+    POWERSERVE_ASSERT(k && "kernel_mul_mat_f16_f32_simple not found (did you embed/compile mul_mat_f16_f32.cl?)");
 
-    cl_mem A = w_cl->get_device_buffer();
-    cl_mem B = x_cl->get_device_buffer();
-    cl_mem C = d_cl->get_device_buffer();
+    cl_mem wmem  = w_cl->get_device_buffer();
+    cl_mem xmem  = x_cl->get_device_buffer();
+    cl_mem out   = d_cl->get_device_buffer();
 
-    const cl_ulong A_off = (cl_ulong)w_cl->get_base_offset();
-    const cl_ulong B_off = (cl_ulong)x_cl->get_base_offset();
-    const cl_ulong C_off = (cl_ulong)d_cl->get_base_offset();
+    const cl_ulong off_w  = (cl_ulong)w_cl->get_base_offset();
+    const cl_ulong off_x  = (cl_ulong)x_cl->get_base_offset();
+    const cl_ulong off_d  = (cl_ulong)d_cl->get_base_offset();
+
+    const cl_ulong nb_w1   = (cl_ulong)w_cl->get_stride()[1];
+    const cl_ulong nb_x1   = (cl_ulong)x_cl->get_stride()[1];
+    const cl_ulong nb_dst1 = (cl_ulong)d_cl->get_stride()[1];
 
     cl_uint arg = 0;
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &Mm));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &Nn));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &wmem));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_w));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &xmem));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_x));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &out));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_d));
     OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &K));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &A));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &A_off));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &B));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &B_off));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &C));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &C_off));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &N));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &M));
 
-    // kernel uses 2D local ids: (WG_M=16, WG_N=8)
-    const size_t local[2] = { 16, 8 };
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb_w1));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb_x1));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb_dst1));
+
+    const size_t local[2]  = { 16, 16 };
+
+
     const size_t global[2] = {
-        ceil_div((size_t)Mm, (size_t)64) * local[0],
-        ceil_div((size_t)Nn, (size_t)64) * local[1],
+        ((size_t)N + local[0] - 1) / local[0] * local[0],
+        ((size_t)M + local[1] - 1) / local[1] * local[1],
     };
 
     OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), k, 2, nullptr, global, local, 0, nullptr, nullptr));
@@ -691,13 +700,16 @@ void OpenCLBackend::matmul(const Tensor *dst, const Tensor *src0, const Tensor *
     const size_t d_stride2 = d_slice_bytes;
     const size_t d_stride3 = d_slice_bytes * dst_use->m_shape[2];
 
+    const size_t r2 = B2 / src0->m_shape[2];
+    const size_t r3 = B3 / src0->m_shape[3];
+
     for (size_t i3 = 0; i3 < B3; ++i3) {
-        const size_t w_i3 = (src0->m_shape[3] == 1) ? 0 : (i3 % src0->m_shape[3]);
+        const size_t w_i3 = (src0->m_shape[3] == 1) ? 0 : (i3 / r3);
         const size_t x_i3 = i3;
         const size_t d_i3 = i3;
 
         for (size_t i2 = 0; i2 < B2; ++i2) {
-            const size_t w_i2 = (src0->m_shape[2] == 1) ? 0 : (i2 % src0->m_shape[2]);
+            const size_t w_i2 = (src0->m_shape[2] == 1) ? 0 : (i2 / r2);
             const size_t x_i2 = i2;
             const size_t d_i2 = i2;
 
