@@ -34,6 +34,18 @@ static inline bool is_adreno_device(cl_device_id dev) {
            (vendor.find("Qualcomm") != std::string::npos);
 }
 
+static inline bool device_supports_fp64(cl_device_id dev) {
+    size_t n = 0;
+    if (clGetDeviceInfo(dev, CL_DEVICE_EXTENSIONS, 0, nullptr, &n) != CL_SUCCESS || n == 0) {
+        return false;
+    }
+    std::string ext(n, '\0');
+    if (clGetDeviceInfo(dev, CL_DEVICE_EXTENSIONS, n, ext.data(), nullptr) != CL_SUCCESS) {
+        return false;
+    }
+    return ext.find("cl_khr_fp64") != std::string::npos || ext.find("cl_amd_fp64") != std::string::npos;
+}
+
 void OpenCLBackend::get_embedding(const Tensor *dst,
                                   const Tensor *weight,
                                   const std::vector<int> &tokens) const {
@@ -905,7 +917,7 @@ void OpenCLBackend::rmsnorm(
     const Tensor *weight,
     float eps
 ) const {
-    if (!initialized || !m_ggml_fallback) {
+    if (!initialized) {
         POWERSERVE_LOG_ERROR("OpenCLBackend::rmsnorm not ready");
         return;
     }
@@ -922,26 +934,148 @@ void OpenCLBackend::rmsnorm(
         return;
     }
 
-    Tensor host_x(DataType::FP32, x->m_shape);
-    host_x.m_data = powerserve::CPUBuffer::create_buffer<float>(x->m_shape);
-    this->copy(&host_x, x);
-
-    const Tensor *host_w_ptr = weight;
-    Tensor host_w;
-    try {
-        (void)const_cast<Tensor*>(weight)->get<powerserve::CPUBuffer>();
-    } catch (const std::bad_cast &) {
-        host_w = Tensor(DataType::FP32, weight->m_shape);
-        host_w.m_data = powerserve::CPUBuffer::create_buffer<float>(weight->m_shape);
-        this->copy(&host_w, weight);
-        host_w_ptr = &host_w;
+    auto *self = const_cast<OpenCLBackend *>(this);
+    auto *ctx = self->context.get();
+    if (!ctx || !self->kernel_manager) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::rmsnorm missing OpenCL context/kernel manager");
+        return;
     }
 
-    Tensor host_y(DataType::FP32, o->m_shape);
-    host_y.m_data = powerserve::CPUBuffer::create_buffer<float>(o->m_shape);
-    m_ggml_fallback->rmsnorm(&host_y, &host_x, host_w_ptr, eps);
+    Tensor tmp_x_dev;
+    const Tensor *x_dev = ensure_contiguous_or_pack_f32(self, x, /*n_dims_check=*/4, tmp_x_dev);
 
-    this->copy(o, &host_y);
+    Tensor tmp_w_upload;
+    const Tensor *w_dev = weight;
+    auto *w_cl = dynamic_cast<OpenCLBuffer *>(&const_cast<Tensor *>(w_dev)->get<BaseBuffer>());
+    if (!w_cl) {
+        tmp_w_upload = Tensor(weight->m_dtype, weight->m_shape);
+        tmp_w_upload.m_data = self->create_buffer(weight->m_shape, weight->m_dtype);
+        if (!tmp_w_upload.m_data) {
+            POWERSERVE_LOG_ERROR("OpenCLBackend::rmsnorm failed to allocate weight buffer");
+            return;
+        }
+        self->copy(&tmp_w_upload, weight);
+        w_dev = &tmp_w_upload;
+    }
+
+    Tensor tmp_w_dev;
+    w_dev = ensure_contiguous_or_pack_f32(self, w_dev, /*n_dims_check=*/4, tmp_w_dev);
+
+    Tensor tmp_out_dev;
+    const Tensor *out_dev = o;
+    if (!self->is_contiguous(o, /*n_dims_check=*/4)) {
+        tmp_out_dev = Tensor(o->m_dtype, o->m_shape);
+        tmp_out_dev.m_data = self->create_buffer(o->m_shape, o->m_dtype);
+        if (!tmp_out_dev.m_data) {
+            POWERSERVE_LOG_ERROR("OpenCLBackend::rmsnorm failed to allocate temp output buffer");
+            return;
+        }
+        out_dev = &tmp_out_dev;
+    }
+
+    auto *x_cl = dynamic_cast<OpenCLBuffer *>(&const_cast<Tensor *>(x_dev)->get<BaseBuffer>());
+    w_cl = dynamic_cast<OpenCLBuffer *>(&const_cast<Tensor *>(w_dev)->get<BaseBuffer>());
+    auto *o_cl = dynamic_cast<OpenCLBuffer *>(&const_cast<Tensor *>(out_dev)->get<BaseBuffer>());
+    if (!x_cl || !w_cl || !o_cl) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::rmsnorm requires OpenCLBuffer inputs");
+        return;
+    }
+
+    cl_kernel kernel = self->kernel_manager->get_kernel("kernel_rms_norm_mul");
+    if (!kernel) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::rmsnorm kernel_rms_norm_mul not found");
+        return;
+    }
+
+    cl_mem mem_x = x_cl->get_device_buffer();
+    cl_mem mem_w = w_cl->get_device_buffer();
+    cl_mem mem_o = o_cl->get_device_buffer();
+    if (!mem_x || !mem_w || !mem_o) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::rmsnorm invalid cl_mem buffers");
+        return;
+    }
+
+    const int ne00 = (int)x_dev->m_shape[0];
+    const int ne01 = (int)x_dev->m_shape[1];
+    const int ne02 = (int)x_dev->m_shape[2];
+    const int ne03 = (int)x_dev->m_shape[3];
+
+    const int ne10 = (int)w_dev->m_shape[0];
+    const int ne11 = (int)w_dev->m_shape[1];
+    const int ne12 = (int)w_dev->m_shape[2];
+    const int ne13 = (int)w_dev->m_shape[3];
+
+    const auto x_stride = x_cl->get_stride();
+    const cl_ulong nb01 = (cl_ulong)x_stride[1];
+    const cl_ulong nb02 = (cl_ulong)x_stride[2];
+    const cl_ulong nb03 = (cl_ulong)x_stride[3];
+
+    const auto w_stride = w_cl->get_stride();
+    const cl_ulong nb11 = (cl_ulong)w_stride[1];
+    const cl_ulong nb12 = (cl_ulong)w_stride[2];
+    const cl_ulong nb13 = (cl_ulong)w_stride[3];
+
+    const auto o_stride = o_cl->get_stride();
+    const cl_ulong nb1 = (cl_ulong)o_stride[1];
+    const cl_ulong nb2 = (cl_ulong)o_stride[2];
+    const cl_ulong nb3 = (cl_ulong)o_stride[3];
+
+    const cl_ulong off_x = (cl_ulong)x_cl->get_base_offset();
+    const cl_ulong off_w = (cl_ulong)w_cl->get_base_offset();
+    const cl_ulong off_o = (cl_ulong)o_cl->get_base_offset();
+
+    cl_uint arg = 0;
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(cl_mem), &mem_x));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off_x));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(cl_mem), &mem_w));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off_w));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(cl_mem), &mem_o));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off_o));
+
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(int), &ne00));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(int), &ne01));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(int), &ne02));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(int), &ne03));
+
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb01));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb02));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb03));
+
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(int), &ne10));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(int), &ne11));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(int), &ne12));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(int), &ne13));
+
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb11));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb12));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb13));
+
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb1));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb2));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb3));
+
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, sizeof(float), &eps));
+
+    const uint32_t chunk = std::max<uint32_t>(1u, (uint32_t)(ne00 / 4));
+    const uint32_t local_cap = std::min<uint32_t>(256u, chunk);
+    const size_t local_size = (size_t)(1u << floor_log2_u32(std::max(1u, local_cap)));
+    const bool use_fp64 = device_supports_fp64(ctx->get_device());
+    const size_t local_mem_bytes = local_size * (use_fp64 ? sizeof(double) : sizeof(float));
+    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(kernel, arg++, local_mem_bytes, nullptr));
+
+    const size_t local[3]  = { local_size, 1, 1 };
+    const size_t global[3] = {
+        local_size * (size_t)ne01,
+        (size_t)ne02,
+        (size_t)ne03
+    };
+
+    OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), kernel, 3, nullptr, global, local, 0, nullptr, nullptr));
+    OCL_RETURN_IF_ERROR(ctx, clFinish(ctx->get_queue()));
+
+    if (out_dev != o) {
+        detail::cpy_tensor_cl(self, out_dev, o);
+    }
 }
 
 void OpenCLBackend::rope(
