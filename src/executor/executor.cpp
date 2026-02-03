@@ -121,11 +121,6 @@ void Executor::allocate_buffers() {
     if (use_opencl) {
         for (auto &op : m_graph.ops) {
             switch (op->op) {
-            case OpType::GET_EMBEDDING: {
-                // embedding Phase1 expects weight on CPU
-                Tensor* w = op->prev[0]->tensor();   // weight
-                if (w) skip_migrate.insert(w);
-            } break;
             case OpType::RMS_NORM: {
                 // rmsnorm Phase1 expects weight on CPU (your backend does D2H -> CPU -> H2D)
                 Tensor* w = op->prev[1]->tensor();   // weight

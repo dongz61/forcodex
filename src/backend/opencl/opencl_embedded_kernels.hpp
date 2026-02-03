@@ -81,4 +81,8 @@
 #include "mul_mat_q8_0_f32_simple.cl.h"
 #endif
 
+#ifdef OPENCL_GET_ROWS_CL_AVAILABLE
+#include "get_rows.cl.h"
+#endif
+
 #endif // POWERSERVE_OPENCL_EMBED_KERNELS

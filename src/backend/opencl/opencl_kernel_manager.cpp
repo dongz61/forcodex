@@ -203,7 +203,7 @@ bool OpenCLKernelManager::compile_embedded_kernels() {
     }
 #endif // OPENCL_ROPE_CL_AVAILABLE
 
-    // 8.1 编译 get_rows 内核
+    // 9. 编译 get_rows 内核
 #ifdef OPENCL_GET_ROWS_CL_AVAILABLE
     {
         const std::string& get_rows_source = ::powerserve::opencl::embedded::get_rows_cl_source;
@@ -220,7 +220,7 @@ bool OpenCLKernelManager::compile_embedded_kernels() {
     }
 #endif // OPENCL_GET_ROWS_CL_AVAILABLE
 
-    // 9. 编译 diag_mask_inf 内核
+    // 10. 编译 diag_mask_inf 内核
 #ifdef OPENCL_DIAG_MASK_INF_CL_AVAILABLE
     {
         const std::string& diag_mask_inf_source = ::powerserve::opencl::embedded::diag_mask_inf_cl_source;
