@@ -34,6 +34,12 @@ static inline bool is_adreno_device(cl_device_id dev) {
            (vendor.find("Qualcomm") != std::string::npos);
 }
 
+static inline uint32_t floor_log2_u32(uint32_t x) {
+    uint32_t r = 0;
+    while ((1u << (r + 1)) <= x) ++r;
+    return r;
+}
+
 static inline bool device_supports_fp64(cl_device_id dev) {
     size_t n = 0;
     if (clGetDeviceInfo(dev, CL_DEVICE_EXTENSIONS, 0, nullptr, &n) != CL_SUCCESS || n == 0) {
@@ -1324,12 +1330,6 @@ void OpenCLBackend::rope(
 
 void OpenCLBackend::softmax(const Tensor * /*out*/, const Tensor * /*x*/) const {
     POWERSERVE_ABORT("OpenCLBackend::softmax TODO");
-}
-
-static inline uint32_t floor_log2_u32(uint32_t x) {
-    uint32_t r = 0;
-    while ((1u << (r + 1)) <= x) ++r;
-    return r;
 }
 
 void OpenCLBackend::softmax_ext(

@@ -114,24 +114,6 @@ void Executor::allocate_buffers() {
         POWERSERVE_ASSERT(cl_backend && "OpenCL backend is null or not OpenCLBackend");
     }
 
-    // ------------------------------------------------------------
-    // 0) Build a set of tensors that must stay on CPU (weights/params)
-    // ------------------------------------------------------------
-    std::unordered_set<Tensor*> skip_migrate;
-    if (use_opencl) {
-        for (auto &op : m_graph.ops) {
-            switch (op->op) {
-            case OpType::RMS_NORM: {
-                // rmsnorm Phase1 expects weight on CPU (your backend does D2H -> CPU -> H2D)
-                Tensor* w = op->prev[1]->tensor();   // weight
-                if (w) skip_migrate.insert(w);
-            } break;
-            default:
-                break;
-            }
-        }
-    }
-
     std::unordered_set<Tensor*> view_op_outputs;
     if (use_opencl) {
         for (auto &op : m_graph.ops) {
@@ -195,11 +177,6 @@ void Executor::allocate_buffers() {
         if (tensor->m_data) {
             if (!use_opencl) {
                 continue; // CPU backend no-op
-            }
-
-            // Do NOT migrate weights/params
-            if (skip_migrate.count(tensor) > 0) {
-                continue;
             }
 
             // already OpenCLBuffer -> skip
