@@ -574,6 +574,15 @@ void OpenCLBackend::matmul(const Tensor *dst, const Tensor *src0, const Tensor *
         POWERSERVE_ABORT("OpenCLBackend::matmul: unsupported weight dtype {} (no ggml fallback)", (int)src0->m_dtype);
     }
 
+    // fallback
+    if (src0->m_dtype == DataType::FP32 || src0->m_dtype == DataType::GGML_Q8_0) {
+        if (!m_ggml_fallback) {
+            POWERSERVE_ABORT("OpenCLBackend::matmul: ggml fallback not initialized for FP32/Q8_0 alignment");
+        }
+        matmul_cpu_ggml_fallback(dst, src0, src1);
+        return;
+    }
+
     // Shapes: w=[K,N], x=[K,M], dst=[N,M]
     const int K  = (int)src0->m_shape[0];
     const int N  = (int)src0->m_shape[1];
