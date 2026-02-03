@@ -203,6 +203,23 @@ bool OpenCLKernelManager::compile_embedded_kernels() {
     }
 #endif // OPENCL_ROPE_CL_AVAILABLE
 
+    // 8.1 编译 get_rows 内核
+#ifdef OPENCL_GET_ROWS_CL_AVAILABLE
+    {
+        const std::string& get_rows_source = ::powerserve::opencl::embedded::get_rows_cl_source;
+
+        if (!get_rows_source.empty()) {
+            if (!compile_program("get_rows_kernels", get_rows_source)) {
+                POWERSERVE_LOG_ERROR("Failed to compile get_rows kernels");
+                all_success = false;
+            }
+        } else {
+            POWERSERVE_LOG_ERROR("get_rows kernel source is empty!");
+            all_success = false;
+        }
+    }
+#endif // OPENCL_GET_ROWS_CL_AVAILABLE
+
     // 9. 编译 diag_mask_inf 内核
 #ifdef OPENCL_DIAG_MASK_INF_CL_AVAILABLE
     {

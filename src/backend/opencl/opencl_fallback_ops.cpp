@@ -37,8 +37,24 @@ static inline bool is_adreno_device(cl_device_id dev) {
 void OpenCLBackend::get_embedding(const Tensor *dst,
                                   const Tensor *weight,
                                   const std::vector<int> &tokens) const {
+    if (!initialized) {
+        POWERSERVE_LOG_ERROR("OpenCL backend not initialized");
+        return;
+    }
+    if (!dst || !weight) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding got null tensor");
+        return;
+    }
+    if (tokens.empty()) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding got empty tokens");
+        return;
+    }
     if (dst->m_dtype != DataType::FP32) {
         POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding dst must be FP32");
+        return;
+    }
+    if (dst->m_shape[1] != tokens.size()) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding dst batch {} != tokens {}", dst->m_shape[1], tokens.size());
         return;
     }
 
@@ -48,25 +64,152 @@ void OpenCLBackend::get_embedding(const Tensor *dst,
         return;
     }
 
-    auto weight_host = dynamic_cast<CPUBuffer *>(weight->m_data.get());
-    if (!weight_host) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding weight must be CPUBuffer");
+    auto weight_device = dynamic_cast<OpenCLBuffer *>(weight->m_data.get());
+    if (!weight_device) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding weight must be OpenCLBuffer");
         return;
     }
 
-    POWERSERVE_ASSERT(m_ggml_fallback && "m_ggml_fallback must be initialized in OpenCLBackend::initialize()");
-
-    constexpr size_t kMinWSize = 1 * 1024 * 1024;
-    if (m_ggml_fallback_wsize < kMinWSize) {
-        m_ggml_fallback->setup_work_data(kMinWSize);
-        m_ggml_fallback_wsize = kMinWSize;
+    auto *self = const_cast<OpenCLBackend *>(this);
+    auto *ctx = self->context.get();
+    if (!ctx || !self->kernel_manager) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding missing OpenCL context/kernel manager");
+        return;
     }
 
-    Tensor host_tmp(DataType::FP32, dst->m_shape);
-    host_tmp.m_data = CPUBuffer::create_buffer<float>(dst->m_shape);
-    m_ggml_fallback->get_embedding(&host_tmp, weight, tokens);
+    Shape tokens_shape{tokens.size(), 1, 1, 1};
+    Tensor tokens_host(DataType::INT32, tokens_shape);
+    tokens_host.m_data = powerserve::CPUBuffer::create_buffer<int32_t>(tokens_shape);
+    auto &tokens_cpu = tokens_host.get<powerserve::CPUBuffer>();
+    std::memcpy(tokens_cpu.m_data, tokens.data(), tokens.size() * sizeof(int32_t));
 
-    this->copy(dst, &host_tmp);
+    Tensor tokens_dev(DataType::INT32, tokens_shape);
+    tokens_dev.m_data = self->create_buffer(tokens_shape, DataType::INT32);
+    if (!tokens_dev.m_data) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding failed to allocate tokens buffer");
+        return;
+    }
+    self->copy(&tokens_dev, &tokens_host);
+
+    auto *tokens_cl = dynamic_cast<OpenCLBuffer *>(&tokens_dev.get<BaseBuffer>());
+    if (!tokens_cl) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding failed to create tokens OpenCLBuffer");
+        return;
+    }
+
+    cl_mem w_cl = weight_device->get_device_buffer();
+    cl_mem t_cl = tokens_cl->get_device_buffer();
+    cl_mem o_cl = dst_device->get_device_buffer();
+    if (!w_cl || !t_cl || !o_cl) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding invalid cl_mem buffers");
+        return;
+    }
+
+    const cl_ulong off_w = static_cast<cl_ulong>(weight_device->get_base_offset());
+    const cl_ulong off_t = static_cast<cl_ulong>(tokens_cl->get_base_offset());
+    const cl_ulong off_o = static_cast<cl_ulong>(dst_device->get_base_offset());
+
+    const int dim = static_cast<int>(dst->m_shape[0]);
+    const int batch = static_cast<int>(tokens.size());
+    if (dim <= 0 || batch <= 0) {
+        return;
+    }
+
+    cl_kernel kernel = nullptr;
+    if (weight->m_dtype == DataType::FP32) {
+        kernel = self->kernel_manager->get_kernel("kernel_get_rows_f32");
+    } else if (weight->m_dtype == DataType::GGML_Q4_0) {
+        kernel = self->kernel_manager->get_kernel("kernel_get_rows_q4_0");
+    } else if (weight->m_dtype == DataType::GGML_Q8_0) {
+        kernel = self->kernel_manager->get_kernel("kernel_get_rows_q8_0");
+    } else {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding unsupported weight dtype {}", (int)weight->m_dtype);
+        return;
+    }
+
+    if (!kernel) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding kernel not found");
+        return;
+    }
+
+    const auto w_stride = weight_device->get_stride();
+    const auto dst_stride = dst_device->get_stride();
+
+    cl_int err = CL_SUCCESS;
+    cl_uint arg = 0;
+
+    if (weight->m_dtype == DataType::FP32) {
+        const cl_ulong nb_w0 = static_cast<cl_ulong>(w_stride[0]);
+        const cl_ulong nb_w1 = static_cast<cl_ulong>(w_stride[1]);
+        const cl_ulong nb_dst0 = static_cast<cl_ulong>(dst_stride[0]);
+        const cl_ulong nb_dst1 = static_cast<cl_ulong>(dst_stride[1]);
+
+        err = clSetKernelArg(kernel, arg++, sizeof(cl_mem), &w_cl);
+        OCL_RETURN_IF_ERROR(ctx, err);
+        err = clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off_w);
+        OCL_RETURN_IF_ERROR(ctx, err);
+        err = clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb_w0);
+        OCL_RETURN_IF_ERROR(ctx, err);
+        err = clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb_w1);
+        OCL_RETURN_IF_ERROR(ctx, err);
+        err = clSetKernelArg(kernel, arg++, sizeof(cl_mem), &t_cl);
+        OCL_RETURN_IF_ERROR(ctx, err);
+        err = clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off_t);
+        OCL_RETURN_IF_ERROR(ctx, err);
+        err = clSetKernelArg(kernel, arg++, sizeof(cl_mem), &o_cl);
+        OCL_RETURN_IF_ERROR(ctx, err);
+        err = clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off_o);
+        OCL_RETURN_IF_ERROR(ctx, err);
+        err = clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb_dst0);
+        OCL_RETURN_IF_ERROR(ctx, err);
+        err = clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb_dst1);
+        OCL_RETURN_IF_ERROR(ctx, err);
+        err = clSetKernelArg(kernel, arg++, sizeof(int), &dim);
+        OCL_RETURN_IF_ERROR(ctx, err);
+        err = clSetKernelArg(kernel, arg++, sizeof(int), &batch);
+        OCL_RETURN_IF_ERROR(ctx, err);
+    } else {
+        const cl_ulong nb_w1 = static_cast<cl_ulong>(w_stride[1]);
+        const cl_ulong nb_dst1 = static_cast<cl_ulong>(dst_stride[1]);
+
+        err = clSetKernelArg(kernel, arg++, sizeof(cl_mem), &w_cl);
+        OCL_RETURN_IF_ERROR(ctx, err);
+        err = clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off_w);
+        OCL_RETURN_IF_ERROR(ctx, err);
+        err = clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb_w1);
+        OCL_RETURN_IF_ERROR(ctx, err);
+        err = clSetKernelArg(kernel, arg++, sizeof(cl_mem), &t_cl);
+        OCL_RETURN_IF_ERROR(ctx, err);
+        err = clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off_t);
+        OCL_RETURN_IF_ERROR(ctx, err);
+        err = clSetKernelArg(kernel, arg++, sizeof(cl_mem), &o_cl);
+        OCL_RETURN_IF_ERROR(ctx, err);
+        err = clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off_o);
+        OCL_RETURN_IF_ERROR(ctx, err);
+        err = clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb_dst1);
+        OCL_RETURN_IF_ERROR(ctx, err);
+        err = clSetKernelArg(kernel, arg++, sizeof(int), &dim);
+        OCL_RETURN_IF_ERROR(ctx, err);
+        err = clSetKernelArg(kernel, arg++, sizeof(int), &batch);
+        OCL_RETURN_IF_ERROR(ctx, err);
+    }
+
+    size_t global[2] = {static_cast<size_t>(dim), static_cast<size_t>(batch)};
+    if (weight->m_dtype == DataType::GGML_Q4_0) {
+        const size_t chunks = (static_cast<size_t>(dim) + 15) / 16;
+        global[0] = chunks;
+    }
+    cl_command_queue q = ctx->get_queue();
+    err = clEnqueueNDRangeKernel(q, kernel, 2, nullptr, global, nullptr, 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding kernel launch failed: {}", ctx->get_error_string(err));
+        return;
+    }
+
+    err = clFinish(q);
+    if (err != CL_SUCCESS) {
+        POWERSERVE_LOG_WARN("OpenCLBackend::get_embedding clFinish failed: {}", ctx->get_error_string(err));
+    }
 }
 
 static inline powerserve::BufferPtr create_cpu_buffer_for_dtype(powerserve::DataType dt,
