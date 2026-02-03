@@ -955,28 +955,112 @@ void OpenCLBackend::softmax_ext(
         return;
     }
 
-    Tensor host_x(DataType::FP32, x_dev->m_shape);
-    host_x.m_data = powerserve::CPUBuffer::create_buffer<float>(x_dev->m_shape);
-    self->copy(&host_x, x_dev);
+    auto *context = self->context.get();
+    if (!context || !self->kernel_manager) {
+        POWERSERVE_LOG_ERROR("softmax_ext: OpenCL context or kernel manager not initialized");
+        return;
+    }
 
-    Tensor host_m(DataType::FP32, m_dev->m_shape);
-    host_m.m_data = powerserve::CPUBuffer::create_buffer<float>(m_dev->m_shape);
-    self->copy(&host_m, m_dev);
+    auto *x_cl = dynamic_cast<OpenCLBuffer *>(&const_cast<Tensor *>(x_dev)->get<BaseBuffer>());
+    auto *m_cl = dynamic_cast<OpenCLBuffer *>(&const_cast<Tensor *>(m_dev)->get<BaseBuffer>());
+    auto *o_cl = dynamic_cast<OpenCLBuffer *>(&const_cast<Tensor *>(out)->get<BaseBuffer>());
+    if (!x_cl || !m_cl || !o_cl) {
+        POWERSERVE_LOG_ERROR("softmax_ext: x/mask/out must be OpenCLBuffer");
+        return;
+    }
 
-    Tensor host_out(DataType::FP32, out->m_shape);
-    host_out.m_data = powerserve::CPUBuffer::create_buffer<float>(out->m_shape);
+    cl_kernel kernel = self->kernel_manager->get_kernel("kernel_soft_max");
+    if (!kernel) {
+        POWERSERVE_LOG_ERROR("softmax_ext: kernel_soft_max not found");
+        return;
+    }
 
-    const float *x_buf = (const float *)host_x.get<CPUBuffer>().m_data;
-    const float *m_buf = (const float *)host_m.get<CPUBuffer>().m_data;
-    float *o_buf       = (float *)host_out.get<CPUBuffer>().m_data;
+    const cl_mem mem_x = x_cl->get_device_buffer();
+    const cl_mem mem_m = m_cl->get_device_buffer();
+    const cl_mem mem_o = o_cl->get_device_buffer();
+    if (!mem_x || !mem_m || !mem_o) {
+        POWERSERVE_LOG_ERROR("softmax_ext: invalid cl_mem buffers");
+        return;
+    }
 
-    softmax_ext_cpu_f32_ggml_semantics(
-        o_buf, x_buf, m_buf,
-        ne00, ne01, ne02, ne03,
-        scale, max_bias
-    );
+    const cl_ulong off_x = (cl_ulong)x_cl->get_base_offset();
+    const cl_ulong off_m = (cl_ulong)m_cl->get_base_offset();
+    const cl_ulong off_o = (cl_ulong)o_cl->get_base_offset();
 
-    self->copy(out, &host_out);
+    const auto x_stride = x_cl->get_stride();
+    const cl_ulong nb01 = (cl_ulong)x_stride[1];
+    const cl_ulong nb02 = (cl_ulong)x_stride[2];
+    const cl_ulong nb03 = (cl_ulong)x_stride[3];
+
+    const auto m_stride = m_cl->get_stride();
+    const cl_ulong nb11 = (cl_ulong)m_stride[1];
+    const cl_ulong nb12 = (cl_ulong)m_stride[2];
+    const cl_ulong nb13 = (cl_ulong)m_stride[3];
+
+    const auto o_stride = o_cl->get_stride();
+    const cl_ulong nb1 = (cl_ulong)o_stride[1];
+    const cl_ulong nb2 = (cl_ulong)o_stride[2];
+    const cl_ulong nb3 = (cl_ulong)o_stride[3];
+
+    const int ne12 = (int)m_dev->m_shape[2];
+    const int ne13 = (int)m_dev->m_shape[3];
+
+    const uint32_t n_head = (uint32_t)ne02;
+    const uint32_t n_head_log2 = 1u << (uint32_t)floor_log2_u32(n_head);
+    const float m0 = std::pow(2.0f, -(max_bias)        / (float)n_head_log2);
+    const float m1 = std::pow(2.0f, -(max_bias / 2.0f) / (float)n_head_log2);
+
+    cl_uint arg = 0;
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(cl_mem), &mem_x));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off_x));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(cl_mem), &mem_m));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off_m));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(cl_mem), &mem_x));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off_x));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(cl_mem), &mem_o));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off_o));
+
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(int), &ne00));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb01));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb02));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb03));
+
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(int), &ne12));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(int), &ne13));
+
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb11));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb12));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb13));
+
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb1));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb2));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb3));
+
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(float), &scale));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(float), &max_bias));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(float), &m0));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(float), &m1));
+    const int n_head_log2_i = (int)n_head_log2;
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(int), &n_head_log2_i));
+
+    const uint32_t local_cap = std::min<uint32_t>((uint32_t)ne00, 256u);
+    const size_t local_work_size = (size_t)(1u << floor_log2_u32(std::max(1u, local_cap)));
+    const size_t local_mem_size = local_work_size * sizeof(float);
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, local_mem_size, nullptr));
+
+    const size_t global[3] = {
+        static_cast<size_t>(ne01) * local_work_size,
+        static_cast<size_t>(ne02),
+        static_cast<size_t>(ne03)
+    };
+    const size_t local[3] = { local_work_size, 1, 1 };
+
+    OCL_RETURN_IF_ERROR(context, clEnqueueNDRangeKernel(
+        context->get_queue(), kernel,
+        3, nullptr, global, local,
+        0, nullptr, nullptr
+    ));
+    OCL_RETURN_IF_ERROR(context, clFinish(context->get_queue()));
 }
 
 } // namespace powerserve::opencl
