@@ -510,37 +510,6 @@ void OpenCLBackend::silu_hadamard(const Tensor * out,
     const size_t n = out->n_elements();
     if (n == 0) return;
 
-    {
-        Tensor hb_cpu(DataType::FP32, hb->m_shape);
-        hb_cpu.m_data = powerserve::CPUBuffer::create_buffer<float>(hb->m_shape);
-
-        Tensor hb2_cpu(DataType::FP32, hb2->m_shape);
-        hb2_cpu.m_data = powerserve::CPUBuffer::create_buffer<float>(hb2->m_shape);
-
-        Tensor out_cpu(DataType::FP32, out->m_shape);
-        out_cpu.m_data = powerserve::CPUBuffer::create_buffer<float>(out->m_shape);
-
-        this->copy(&hb_cpu, hb);
-        this->copy(&hb2_cpu, hb2);
-
-        if (m_ggml_fallback) {
-            m_ggml_fallback->silu_hadamard(&out_cpu, &hb_cpu, &hb2_cpu);
-        } else {
-            float *out_data = static_cast<float *>(out_cpu.get<CPUBuffer>().m_data);
-            float *hb_data  = static_cast<float *>(hb_cpu.get<CPUBuffer>().m_data);
-            float *hb2_data = static_cast<float *>(hb2_cpu.get<CPUBuffer>().m_data);
-            for (size_t j = 0; j < hb_cpu.n_elements(); ++j) {
-                float val = hb_data[j];
-                val *= (1.0f / (1.0f + expf(-val)));
-                val *= hb2_data[j];
-                out_data[j] = val;
-            }
-        }
-
-        this->copy(out, &out_cpu);
-        return;
-    }
-
     cl_mem a = nullptr;
     cl_mem b = nullptr;
     cl_mem o = nullptr;
