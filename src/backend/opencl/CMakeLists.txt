@@ -8,7 +8,6 @@ if (OpenCL_FOUND)
     # 添加OpenCL源文件到主库
     target_sources(powerserve PRIVATE
         "opencl_backend.cpp"
-        "opencl_fallback_ops.cpp"
         "opencl_kernels_ops.cpp"
         "opencl_kv_cache_ops.cpp"
         "opencl_context.cpp"
