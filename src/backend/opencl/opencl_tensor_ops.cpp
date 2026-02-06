@@ -220,7 +220,6 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
             if (!memory_pool->copy_host_to_device(dev, src_cpu->m_data, src_bytes, dst_off)) {
                 POWERSERVE_LOG_ERROR("copy: shape-mismatch H2D copy_host_to_device failed");
             }
-            clFinish(context->get_queue());
             return;
         }
 
@@ -262,7 +261,6 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
             if (!memory_pool->copy_host_to_device(dst_dev, host.data(), src_bytes, dst_off)) {
                 POWERSERVE_LOG_ERROR("copy: shape-mismatch H2D staging failed");
             }
-            clFinish(context->get_queue());
             return;
         }
 
@@ -294,7 +292,6 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
             if (!memory_pool->copy_host_to_device(dev, host, src_bytes, dst_off)) {
                 POWERSERVE_LOG_ERROR("H2D: copy_host_to_device failed");
             }
-            clFinish(context->get_queue());
             return;
         }
 
@@ -314,7 +311,6 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
             if (!memory_pool->copy_host_to_device(dev, host_src, src_bytes, dst_off)) {
                 POWERSERVE_LOG_ERROR("H2D: copy_host_to_device failed");
             }
-            clFinish(context->get_queue());
             return;
         }
 

@@ -56,9 +56,29 @@ void OpenCLBackend::cleanup() {
 
     m_ggml_fallback.reset();
     m_ggml_fallback_wsize = 0;
+    m_tokens_buffer.reset();
+    m_tokens_capacity = 0;
 
     initialized = false;
     std::cout << "[DEBUG] === CLEANUP DONE ===" << std::endl;
+}
+
+void OpenCLBackend::ensure_tokens_buffer(size_t token_count) const {
+    if (token_count == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(m_tokens_mutex);
+    if (m_tokens_buffer && m_tokens_capacity >= token_count) {
+        return;
+    }
+    Shape shape{token_count, 1, 1, 1};
+    auto buffer = create_buffer(shape, DataType::INT32);
+    if (!buffer) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::ensure_tokens_buffer failed to allocate tokens buffer");
+        return;
+    }
+    m_tokens_buffer = std::move(buffer);
+    m_tokens_capacity = token_count;
 }
 
 bool OpenCLBackend::initialize() {

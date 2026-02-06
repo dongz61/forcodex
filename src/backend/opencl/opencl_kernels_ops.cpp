@@ -657,23 +657,15 @@ void OpenCLBackend::get_embedding(const Tensor *dst,
         return;
     }
 
-    Shape tokens_shape{tokens.size(), 1, 1, 1};
-    Tensor tokens_host(DataType::INT32, tokens_shape);
-    tokens_host.m_data = powerserve::CPUBuffer::create_buffer<int32_t>(tokens_shape);
-    auto &tokens_cpu = tokens_host.get<powerserve::CPUBuffer>();
-    std::memcpy(tokens_cpu.m_data, tokens.data(), tokens.size() * sizeof(int32_t));
-
-    Tensor tokens_dev(DataType::INT32, tokens_shape);
-    tokens_dev.m_data = self->create_buffer(tokens_shape, DataType::INT32);
-    if (!tokens_dev.m_data) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding failed to allocate tokens buffer");
-        return;
+    self->ensure_tokens_buffer(tokens.size());
+    OpenCLBuffer *tokens_cl = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(self->m_tokens_mutex);
+        tokens_cl = self->m_tokens_buffer.get();
     }
-    self->copy(&tokens_dev, &tokens_host);
 
-    auto *tokens_cl = dynamic_cast<OpenCLBuffer *>(&tokens_dev.get<BaseBuffer>());
     if (!tokens_cl) {
-        POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding failed to create tokens OpenCLBuffer");
+        POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding failed to prepare tokens buffer");
         return;
     }
 
@@ -717,6 +709,13 @@ void OpenCLBackend::get_embedding(const Tensor *dst,
 
     cl_int err = CL_SUCCESS;
     cl_uint arg = 0;
+    const size_t tokens_bytes = tokens.size() * sizeof(int32_t);
+    cl_event write_event = nullptr;
+    err = clEnqueueWriteBuffer(ctx->get_queue(), t_cl, CL_FALSE, off_t, tokens_bytes, tokens.data(), 0, nullptr, &write_event);
+    if (err != CL_SUCCESS) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding token write failed: {}", ctx->get_error_string(err));
+        return;
+    }
 
     if (weight->m_dtype == DataType::FP32) {
         const cl_ulong nb_w0 = static_cast<cl_ulong>(w_stride[0]);
@@ -780,16 +779,13 @@ void OpenCLBackend::get_embedding(const Tensor *dst,
         global[0] = chunks;
     }
     cl_command_queue q = ctx->get_queue();
-    err = clEnqueueNDRangeKernel(q, kernel, 2, nullptr, global, nullptr, 0, nullptr, nullptr);
+    err = clEnqueueNDRangeKernel(q, kernel, 2, nullptr, global, nullptr, 1, &write_event, nullptr);
     if (err != CL_SUCCESS) {
         POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding kernel launch failed: {}", ctx->get_error_string(err));
+        clReleaseEvent(write_event);
         return;
     }
-
-    err = clFinish(q);
-    if (err != CL_SUCCESS) {
-        POWERSERVE_LOG_WARN("OpenCLBackend::get_embedding clFinish failed: {}", ctx->get_error_string(err));
-    }
+    clReleaseEvent(write_event);
 }
 
 void OpenCLBackend::matmul_cpu_ggml_fallback(
