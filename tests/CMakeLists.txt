@@ -19,6 +19,7 @@ if (POWERSERVE_WITH_OPENCL)
         # 添加OpenCL测试程序
         add_executable(opencl_test "opencl_test.cpp")
         add_executable(matmul_diff_test "matmul_diff_test.cpp")
+        add_executable(layer_diff_test "layer_diff_test.cpp")
         add_executable(logits_cmp "logits_cmp.cpp")
         add_executable(tokens_cmp "tokens_cmp.cpp")
         
@@ -31,6 +32,10 @@ if (POWERSERVE_WITH_OPENCL)
             powerserve
             OpenCL::OpenCL
         )
+        target_link_libraries(layer_diff_test PRIVATE
+            powerserve
+            OpenCL::OpenCL
+        )
         
         # 添加编译选项
         if (NOT MSVC)
@@ -40,6 +45,11 @@ if (POWERSERVE_WITH_OPENCL)
                 -Wno-unused-parameter
             )
             target_compile_options(matmul_diff_test PRIVATE
+                -Wall
+                -Wextra
+                -Wno-unused-parameter
+            )
+            target_compile_options(layer_diff_test PRIVATE
                 -Wall
                 -Wextra
                 -Wno-unused-parameter
@@ -82,6 +92,9 @@ if (POWERSERVE_WITH_OPENCL)
         target_include_directories(matmul_diff_test PRIVATE
             ${CMAKE_SOURCE_DIR}
         )
+        target_include_directories(layer_diff_test PRIVATE
+            ${CMAKE_SOURCE_DIR}
+        )
         
         # 添加一个方便运行测试的自定义命令
         add_custom_target(run_opencl_test
@@ -95,6 +108,12 @@ if (POWERSERVE_WITH_OPENCL)
             DEPENDS matmul_diff_test
             WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
             COMMENT "Running matmul diff tests..."
+        )
+        add_custom_target(run_layer_diff_test
+            COMMAND POWERSERVE_USE_OPENCL=1 ./layer_diff_test
+            DEPENDS layer_diff_test
+            WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+            COMMENT "Running layer diff tests..."
         )
 
         add_custom_target(run_logits_cmp
