@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -189,7 +190,7 @@ static bool should_run_case(const TestCase &) {
     return true;
 }
 
-static bool run_case(OpenCLBackend &backend, const ModelConfig::LLMConfig &cfg, const HyperParams &hp, const TestCase &tc) {
+static bool run_case(const ModelConfig::LLMConfig &cfg, const HyperParams &hp, const TestCase &tc) {
     if (!should_run_case(tc)) {
         POWERSERVE_LOG_INFO("[matmul_diff] skip case={} (filter)", tc.name);
         return true;
@@ -197,6 +198,12 @@ static bool run_case(OpenCLBackend &backend, const ModelConfig::LLMConfig &cfg, 
 
     POWERSERVE_LOG_INFO("[matmul_diff] run case={} dtype={} K={} N={} M={}",
                         tc.name, (int)tc.weight_dtype, tc.K, tc.N, tc.M);
+
+    OpenCLBackend backend(cfg, hp);
+    if (!backend.initialize()) {
+        POWERSERVE_LOG_ERROR("[matmul_diff] case={} OpenCL backend initialize failed", tc.name);
+        return false;
+    }
 
     Shape w_shape{(size_t)tc.K, (size_t)tc.N, 1, 1};
     Shape x_shape{(size_t)tc.K, (size_t)tc.M, 1, 1};
@@ -301,12 +308,6 @@ static bool run_matmul_diff_suite() {
     HyperParams hp{};
     hp.n_threads = 1;
 
-    OpenCLBackend backend(cfg, hp);
-    if (!backend.initialize()) {
-        POWERSERVE_LOG_ERROR("[matmul_diff] OpenCL backend initialize failed");
-        return false;
-    }
-
     const std::vector<TestCase> cases = {
         {"fp16_m1",  DataType::FP16,      256, 320, 1,  1u, {2e-2f, 2e-2f, 0.9990f}},
         {"fp16_m8",  DataType::FP16,      256, 320, 8,  2u, {2e-2f, 2e-2f, 0.9990f}},
@@ -318,7 +319,7 @@ static bool run_matmul_diff_suite() {
 
     bool ok = true;
     for (const auto &tc : cases) {
-        ok = run_case(backend, cfg, hp, tc) && ok;
+        ok = run_case(cfg, hp, tc) && ok;
     }
     return ok;
 }

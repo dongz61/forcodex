@@ -188,6 +188,7 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
     }
 
     const bool shape_match = src->m_shape == dst->m_shape;
+    const bool invalidate_quant_split_cache = is_ggml_quant_dtype(dst->m_dtype);
     if (!shape_match) {
         const bool src_contig = is_contiguous(src, 4);
         const bool dst_contig = is_contiguous(dst, 4);
@@ -211,6 +212,9 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
         }
 
         if (src_cpu && dst_cl) {
+            if (invalidate_quant_split_cache) {
+                clear_quant_cache();
+            }
             cl_mem dev = dst_cl->get_device_buffer();
             if (!dev || !src_cpu->m_data) {
                 POWERSERVE_LOG_ERROR("copy: invalid host/dev for shape-mismatch H2D");
@@ -237,6 +241,9 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
         }
 
         if (src_cl && dst_cl) {
+            if (invalidate_quant_split_cache) {
+                clear_quant_cache();
+            }
             cl_mem src_dev = src_cl->get_device_buffer();
             cl_mem dst_dev = dst_cl->get_device_buffer();
             if (!src_dev || !dst_dev) {
@@ -277,6 +284,9 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
     auto* dst_cl  = dynamic_cast<OpenCLBuffer*>(&dst_base);
 
     if (src_cpu && dst_cl) {
+        if (invalidate_quant_split_cache) {
+            clear_quant_cache();
+        }
         void* host = src_cpu->m_data;
         cl_mem dev = dst_cl->get_device_buffer();
         if (!host || !dev) {
@@ -397,6 +407,9 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
     }
 
     if (src_cl && dst_cl) {
+        if (invalidate_quant_split_cache) {
+            clear_quant_cache();
+        }
         const size_t src_off = src_cl->get_base_offset();
         const size_t dst_off = dst_cl->get_base_offset();
 
