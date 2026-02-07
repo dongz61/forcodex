@@ -90,23 +90,6 @@ bool OpenCLKernelManager::compile_embedded_kernels() {
     }
 #endif // OPENCL_SILU_CL_AVAILABLE
 
-    // 4. 编译 gelu 内核
-#ifdef OPENCL_GELU_CL_AVAILABLE
-    {
-        const std::string& gelu_source = ::powerserve::opencl::embedded::gelu_cl_source;
-        
-        if (!gelu_source.empty()) {
-            if (!compile_program("gelu_kernels", gelu_source)) {
-                POWERSERVE_LOG_ERROR("Failed to compile gelu kernels");
-                all_success = false;
-            }
-        } else {
-            POWERSERVE_LOG_ERROR("gelu kernel source is empty!");
-            all_success = false;
-        }
-    }
-#endif // OPENCL_GELU_CL_AVAILABLE
-
     // 5. 编译 matmul 内核
 #ifdef OPENCL_MATMUL_CL_AVAILABLE
     {

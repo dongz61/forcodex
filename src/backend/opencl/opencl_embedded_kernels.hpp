@@ -31,14 +31,6 @@
 #include "silu.cl.h"
 #endif
 
-#ifdef OPENCL_GELU_CL_AVAILABLE
-#include "gelu.cl.h"
-#endif
-
-#ifdef OPENCL_RELU_CL_AVAILABLE
-#include "relu.cl.h"
-#endif
-
 //modified
 #ifdef OPENCL_SOFTMAX_CL_AVAILABLE
 #include "softmax_f32.cl.h"
