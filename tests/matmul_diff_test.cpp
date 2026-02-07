@@ -185,12 +185,8 @@ static bool run_ggml_matmul_ref(
     return true;
 }
 
-static bool should_run_case(const TestCase &tc) {
-    const char *f = std::getenv("POWERSERVE_MATMUL_CASE_FILTER");
-    if (!f || !*f) return true;
-    const std::string filter(f);
-    const std::string name(tc.name);
-    return name.find(filter) != std::string::npos;
+static bool should_run_case(const TestCase &) {
+    return true;
 }
 
 static bool run_case(OpenCLBackend &backend, const ModelConfig::LLMConfig &cfg, const HyperParams &hp, const TestCase &tc) {
