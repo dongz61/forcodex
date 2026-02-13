@@ -20,8 +20,8 @@ static inline int round_ties_away_from_zero(float x) {
 }
 
 static inline char quantize_to_q8(float x, float id) {
-    // id = 127 / amax
-    int q = (int)rint(x * id);
+    // id = 127 / amax; ggml uses roundf semantics (ties away from zero)
+    int q = round_ties_away_from_zero(x * id);
     q = clamp(q, -127, 127);
     return (char)q;
 }

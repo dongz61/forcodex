@@ -1,4 +1,5 @@
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#pragma OPENCL FP_CONTRACT OFF
 
 #define LOAD_VEC_A 4
 #define LOAD_VEC_B 4
@@ -132,7 +133,7 @@ kernel void kernel_mul_mm_q8_0_f32_l4_lm(
             for (int cc = 0; cc < TN; cc++) {
                 for (int cr = 0; cr < TM; cr++) {
                     const int sums_idx = cc*TM + cr;
-                    sums[sums_idx] = mad(cache_a[cr], cache_b[cc], sums[sums_idx]);
+                    sums[sums_idx] += cache_a[cr] * cache_b[cc];
                 }
             }
         }

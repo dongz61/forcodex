@@ -42,6 +42,11 @@ struct TestCase {
     Threshold th;
 };
 
+static inline bool matmul_diff_dbg_enabled() {
+    const char *e = std::getenv("POWERSERVE_OCL_MATMUL_DBG");
+    return e && e[0] != '\0' && e[0] != '0';
+}
+
 static inline Stride make_contig_stride_bytes(const Shape &shape, size_t elem_bytes) {
     Stride st{};
     st[0] = (int)elem_bytes;
@@ -208,6 +213,20 @@ static bool run_case(const ModelConfig::LLMConfig &cfg, const HyperParams &hp, c
     Shape w_shape{(size_t)tc.K, (size_t)tc.N, 1, 1};
     Shape x_shape{(size_t)tc.K, (size_t)tc.M, 1, 1};
     Shape d_shape{(size_t)tc.N, (size_t)tc.M, 1, 1};
+    if (matmul_diff_dbg_enabled()) {
+        const char *expected_q8_path =
+            (tc.weight_dtype == DataType::GGML_Q8_0 && tc.M >= 32 && (tc.K % 32) == 0)
+                ? "kernel_mul_mm_q8_0_f32_l4_lm"
+                : (tc.weight_dtype == DataType::GGML_Q8_0 ? "kernel_mul_mv_q8_0_f32_flat_or_simple" : "non-q8");
+        POWERSERVE_LOG_INFO(
+            "[matmul_diff][dbg] case={} shapes w=[{},{},{},{}] x=[{},{},{},{}] d=[{},{},{},{}] expected_q8_path={}",
+            tc.name,
+            w_shape[0], w_shape[1], w_shape[2], w_shape[3],
+            x_shape[0], x_shape[1], x_shape[2], x_shape[3],
+            d_shape[0], d_shape[1], d_shape[2], d_shape[3],
+            expected_q8_path
+        );
+    }
 
     std::vector<float> w_f32((size_t)tc.K * (size_t)tc.N, 0.0f);
     std::vector<float> x_f32((size_t)tc.K * (size_t)tc.M, 0.0f);
@@ -252,6 +271,33 @@ static bool run_case(const ModelConfig::LLMConfig &cfg, const HyperParams &hp, c
     Tensor w_dev = make_opencl_tensor(backend, w_shape, tc.weight_dtype);
     Tensor x_dev = make_opencl_tensor(backend, x_shape, DataType::FP32);
     Tensor d_dev = make_opencl_tensor(backend, d_shape, DataType::FP32);
+    if (matmul_diff_dbg_enabled()) {
+        auto *wcb = dynamic_cast<CPUBuffer *>(w_cpu.m_data.get());
+        auto *xcb = dynamic_cast<CPUBuffer *>(x_cpu.m_data.get());
+        auto *wdb = dynamic_cast<OpenCLBuffer *>(w_dev.m_data.get());
+        auto *xdb = dynamic_cast<OpenCLBuffer *>(x_dev.m_data.get());
+        auto *ddb = dynamic_cast<OpenCLBuffer *>(d_dev.m_data.get());
+        if (wcb && xcb) {
+            POWERSERVE_LOG_INFO(
+                "[matmul_diff][dbg] case={} cpu_strideB w=[{},{},{},{}] x=[{},{},{},{}]",
+                tc.name,
+                wcb->m_stride[0], wcb->m_stride[1], wcb->m_stride[2], wcb->m_stride[3],
+                xcb->m_stride[0], xcb->m_stride[1], xcb->m_stride[2], xcb->m_stride[3]
+            );
+        }
+        if (wdb && xdb && ddb) {
+            const auto wst = wdb->get_stride();
+            const auto xst = xdb->get_stride();
+            const auto dst = ddb->get_stride();
+            POWERSERVE_LOG_INFO(
+                "[matmul_diff][dbg] case={} dev_strideB w=[{},{},{},{}] x=[{},{},{},{}] d=[{},{},{},{}]",
+                tc.name,
+                wst[0], wst[1], wst[2], wst[3],
+                xst[0], xst[1], xst[2], xst[3],
+                dst[0], dst[1], dst[2], dst[3]
+            );
+        }
+    }
 
     backend.copy(&w_dev, &w_cpu);
     backend.copy(&x_dev, &x_cpu);
@@ -313,8 +359,13 @@ static bool run_matmul_diff_suite() {
         {"fp16_m8",  DataType::FP16,      256, 320, 8,  2u, {2e-2f, 2e-2f, 0.9990f}},
         {"fp32_m1",  DataType::FP32,      256, 320, 1,  3u, {2e-3f, 2e-3f, 0.9999f}},
         {"fp32_m8",  DataType::FP32,      256, 320, 8,  4u, {2e-3f, 2e-3f, 0.9999f}},
-        {"q8_0_m1",  DataType::GGML_Q8_0, 256, 320, 1,  5u, {5e-2f, 5e-2f, 0.9980f}},
-        {"q8_0_m8",  DataType::GGML_Q8_0, 256, 320, 8,  6u, {5e-2f, 5e-2f, 0.9980f}},
+        // Tighten q8 thresholds to better catch early matmul drift.
+        {"q8_0_m1",  DataType::GGML_Q8_0, 256, 320, 1,  5u, {2e-2f, 2e-2f, 0.9990f}},
+        {"q8_0_m8",  DataType::GGML_Q8_0, 256, 320, 8,  6u, {2e-2f, 2e-2f, 0.9990f}},
+        // Reproduce layer-diff op#2-like geometry (Q8_0 * FP32, M>=32 path).
+        {"q8_0_k896_n896_m1",  DataType::GGML_Q8_0, 896, 896, 1,  7u, {2e-2f, 2e-2f, 0.9990f}},
+        {"q8_0_k896_n896_m77", DataType::GGML_Q8_0, 896, 896, 77, 8u, {2e-2f, 2e-2f, 0.9990f}},
+        {"q8_0_k896_n896_m78", DataType::GGML_Q8_0, 896, 896, 78, 9u, {2e-2f, 2e-2f, 0.9990f}},
     };
 
     bool ok = true;

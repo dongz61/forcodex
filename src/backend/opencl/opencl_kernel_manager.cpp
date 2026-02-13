@@ -130,6 +130,21 @@ bool OpenCLKernelManager::compile_embedded_kernels() {
     }
 #endif
 
+#ifdef OPENCL_Q8_ALIGN_X_F32_CL_AVAILABLE
+    {
+        const std::string& src = ::powerserve::opencl::embedded::q8_align_x_f32_cl_source;
+        if (!src.empty()) {
+            if (!compile_program("q8_align_x_f32_kernels", src)) {
+                POWERSERVE_LOG_ERROR("Failed to compile q8_align_x_f32 kernels");
+                all_success = false;
+            }
+        } else {
+            POWERSERVE_LOG_ERROR("q8_align_x_f32 kernel source is empty!");
+            all_success = false;
+        }
+    }
+#endif
+
 #ifdef OPENCL_MUL_MV_Q4_0_F32_8X_FLAT_CL_AVAILABLE
     {
         const std::string& src = ::powerserve::opencl::embedded::mul_mv_q4_0_f32_8x_flat_cl_source;
@@ -648,7 +663,4 @@ std::vector<std::string> OpenCLKernelManager::split_kernel_names(const std::stri
 }
 
 } // namespace powerserve::opencl
-
-
-
 

@@ -15,7 +15,7 @@ static inline int round_ties_away_from_zero(float x) {
 }
 
 static inline char quantize_to_q8(float x, float id) {
-    int q = (int)rint(x * id);
+    int q = round_ties_away_from_zero(x * id);
     q = clamp(q, -127, 127);
     return (char)q;
 }

@@ -25,8 +25,9 @@ using namespace powerserve;
 // ======================
 // CONFIG (adjust if needed)
 // ======================
-static const char *MODEL_DIR   = "/home/intern/ziqian/models/qwen2-0.5b-work/qwen2-0.5b-gguf";
-static const char *PROMPT      = "你好，请介绍你自己";
+static const char *MODEL_DIR   = "/data/local/tmp/ziqian/models/qwen2-0.5b-work/qwen2-0.5b-powerserve";
+static const char *PROMPT      = "In recent years, the landscape of artificial intelligence has been significantly transformed by the advent of large language models (LLMs). Traditionally, these models have been deployed in cloud environments due to their computational demands. However, the emergence of on-edge LLMs is reshaping how AI can be utilized at the edge of networks, offering numerous advantages in terms of latency, privacy, and accessibility.";
+
 
 static int    N_THREADS   = 8;
 static size_t BATCH_SIZE  = 4;

@@ -1,4 +1,5 @@
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#pragma OPENCL FP_CONTRACT OFF
 
 #ifdef cl_intel_subgroups
 #pragma OPENCL EXTENSION cl_intel_subgroups : enable

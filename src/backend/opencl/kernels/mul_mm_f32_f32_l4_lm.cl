@@ -9,6 +9,8 @@
 #define TM 4
 #define TN 8
 
+#pragma OPENCL FP_CONTRACT OFF
+
 kernel void kernel_mul_mm_f32_f32_l4_lm(
     global float4 * src0,
     ulong offset0,
@@ -125,7 +127,7 @@ kernel void kernel_mul_mm_f32_f32_l4_lm(
             for (int cc = 0; cc < TN; cc++) {
                 for (int cr = 0; cr < TM; cr++) {
                     const int sums_idx = cc*TM + cr;
-                    sums[sums_idx] = mad(cache_a[cr], cache_b[cc], sums[sums_idx]);
+                    sums[sums_idx] += cache_a[cr] * cache_b[cc];
                 }
             }
         }
