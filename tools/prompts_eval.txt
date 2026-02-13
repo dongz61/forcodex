@@ -1,0 +1,15 @@
+# Keep each prompt on one line.
+# Mix short/long, zh/en, QA/summarization/instruction.
+
+In recent years, the landscape of artificial intelligence has been significantly transformed by the advent of large language models. Explain this trend in about 120 words.
+Write a concise abstract about deploying LLMs on edge devices, including latency, privacy, and energy tradeoffs.
+Summarize the pros and cons of cloud AI vs edge AI in 8 bullet points.
+Give three practical methods to reduce hallucination in small language models.
+Translate this sentence to Chinese: Large models can be useful, but deployment constraints matter.
+你好，请介绍你自己，并说明你和传统搜索引擎的区别。
+请用中文写一段 100 字左右的介绍，主题是“端侧大模型的应用场景”。
+You are a strict reviewer. Critique the following claim: "Bigger models are always better in production."
+Write a short Python function that removes duplicated adjacent sentences from a paragraph.
+Explain why deterministic decoding is useful for backend regression testing.
+Provide a checklist for evaluating text quality degradation when changing inference backends.
+Describe one failure mode where a model keeps repeating and never emits EOS, and suggest mitigations.
