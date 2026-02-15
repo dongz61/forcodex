@@ -33,12 +33,19 @@ python forcodex/tools/backend_eval.py `
   --n-predicts 128 `
   --base-env LD_LIBRARY_PATH=/system/lib64:/vendor/lib64 `
   --opencl-env POWERSERVE_Q8_FAST_ALIGN_X=1 `
-  --out-json backend_eval_report.json
+  --out-json backend_eval_report.json `
+  --out-text backend_eval_outputs.txt
 ```
 
 The script runs each prompt twice:
 - ggml: `POWERSERVE_USE_OPENCL=0`
 - opencl: `POWERSERVE_USE_OPENCL=1`
+
+It also writes extracted text outputs incrementally (after each prompt) to `--out-text`:
+- format:
+  - `pXXX:`
+  - `ggml:`
+  - `opencl:`
 
 ## 3) Acceptance suggestions
 
