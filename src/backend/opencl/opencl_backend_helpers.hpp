@@ -114,7 +114,6 @@ static inline void cpy_tensor_cl(const OpenCLBackend* self,
     OCL_RETURN_IF_ERROR(context, clEnqueueNDRangeKernel(self->context->get_queue(),
                                                         k, 3, nullptr, global, local,
                                                         0, nullptr, nullptr));
-    OCL_RETURN_IF_ERROR(context, clFinish(self->context->get_queue()));
 }
 
 static inline const Tensor *ensure_contiguous_or_pack_f32(

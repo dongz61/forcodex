@@ -495,7 +495,6 @@ void OpenCLBackend::cont(const Tensor *out, const Tensor *x) const {
     if (!memory_pool->copy_host_to_device(dst_dev, host.data(), x_bytes, dst_off)) {
         POWERSERVE_ABORT("cont: copy_host_to_device failed");
     }
-    clFinish(context->get_queue());
 }
 
 void OpenCLBackend::permute(const Tensor *out, const Tensor *x, Shape axes) const {

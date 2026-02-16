@@ -101,4 +101,8 @@
 #include "get_rows.cl.h"
 #endif
 
+#ifdef OPENCL_GET_MASK_CL_AVAILABLE
+#include "get_mask.cl.h"
+#endif
+
 #endif // POWERSERVE_OPENCL_EMBED_KERNELS

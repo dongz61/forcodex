@@ -1,4 +1,4 @@
-﻿// opencl_kernel_manager.cpp
+// opencl_kernel_manager.cpp
 #include "opencl_kernel_manager.hpp"
 #include <fstream>
 #include <sstream>
@@ -325,6 +325,22 @@ bool OpenCLKernelManager::compile_embedded_kernels() {
         }
     }
 #endif // OPENCL_GET_ROWS_CL_AVAILABLE
+
+#ifdef OPENCL_GET_MASK_CL_AVAILABLE
+    {
+        const std::string& get_mask_source = ::powerserve::opencl::embedded::get_mask_cl_source;
+
+        if (!get_mask_source.empty()) {
+            if (!compile_program("get_mask_kernels", get_mask_source)) {
+                POWERSERVE_LOG_ERROR("Failed to compile get_mask kernels");
+                all_success = false;
+            }
+        } else {
+            POWERSERVE_LOG_ERROR("get_mask kernel source is empty!");
+            all_success = false;
+        }
+    }
+#endif // OPENCL_GET_MASK_CL_AVAILABLE
 
 #ifdef OPENCL_DIAG_MASK_INF_CL_AVAILABLE
     {

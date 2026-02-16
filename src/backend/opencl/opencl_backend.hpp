@@ -109,6 +109,8 @@ public:
         float max_bias
     ) const override;
 
+    void get_mask(const Tensor *out, const std::vector<int> &pos) const;
+
     void silu_hadamard(const Tensor *out, const Tensor *hb, const Tensor *hb2) const override;
     void copy(const Tensor *dst, const Tensor *src) const override;
 
@@ -137,6 +139,7 @@ public:
 
     // buffer 创建
     std::shared_ptr<OpenCLBuffer> create_buffer(Shape shape, DataType dtype) const;
+    std::shared_ptr<OpenCLBuffer> get_or_create_resident_buffer(const Tensor *src) const;
 
     bool is_initialized() const { return initialized; }
 
@@ -212,6 +215,39 @@ private:
 
     mutable std::unordered_map<QuantSplitKey, QuantSplitBuffers, QuantSplitKeyHash, QuantSplitKeyEq> m_quant_split_cache;
     mutable std::mutex m_quant_split_mutex;
+
+    struct ResidentBufferKey {
+        const BaseBuffer *host_buf = nullptr;
+        DataType dtype = DataType::FP32;
+        Shape shape{};
+        Stride stride{};
+    };
+
+    struct ResidentBufferKeyHash {
+        size_t operator()(const ResidentBufferKey &k) const noexcept {
+            size_t h = std::hash<const void *>{}(k.host_buf);
+            auto mix = [&](size_t v) {
+                h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+            };
+            mix(std::hash<int>{}((int)k.dtype));
+            for (int i = 0; i < (int)k.shape.size(); ++i) mix(std::hash<size_t>{}(k.shape[i]));
+            for (int i = 0; i < (int)k.stride.size(); ++i) mix(std::hash<size_t>{}(k.stride[i]));
+            return h;
+        }
+    };
+
+    struct ResidentBufferKeyEq {
+        bool operator()(const ResidentBufferKey &a, const ResidentBufferKey &b) const noexcept {
+            return a.host_buf == b.host_buf &&
+                   a.dtype == b.dtype &&
+                   a.shape == b.shape &&
+                   a.stride == b.stride;
+        }
+    };
+
+    mutable std::unordered_map<ResidentBufferKey, std::shared_ptr<OpenCLBuffer>, ResidentBufferKeyHash, ResidentBufferKeyEq>
+        m_resident_buffers;
+    mutable std::mutex m_resident_buffers_mutex;
 
     QuantSplitBuffers get_or_create_split_q4_0(const Tensor* w) const;
     QuantSplitBuffers get_or_create_split_q8_0(const Tensor* w) const;

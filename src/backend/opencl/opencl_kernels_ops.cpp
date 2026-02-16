@@ -443,10 +443,6 @@ void OpenCLBackend::add_minimal(Tensor * dst, const Tensor * src0, const Tensor 
         return;
     }
 
-    err = clFinish(q);
-    if (err != CL_SUCCESS) {
-        POWERSERVE_LOG_WARN("clFinish failed: {}", context->get_error_string(err));
-    }
 }
 
 void OpenCLBackend::add_broadcast(Tensor *dst, const Tensor *src0, const Tensor *src1) const {
@@ -680,11 +676,6 @@ void OpenCLBackend::add_broadcast(Tensor *dst, const Tensor *src0, const Tensor 
             OCL_RETURN_IF_ERROR(ctx, err);
         }
 
-        err = clFinish(context->get_queue());
-        if (err != CL_SUCCESS) {
-            POWERSERVE_LOG_WARN("clFinish failed: {}", context->get_error_string(err));
-        }
-
     } catch (const std::bad_cast& e) {
         POWERSERVE_LOG_ERROR("Invalid buffer type for add: {}", e.what());
     } catch (const std::exception& e) {
@@ -848,10 +839,6 @@ void OpenCLBackend::matmul_minimal(Tensor * dst,
         return;
     }
 
-    err = clFinish(q);
-    if (err != CL_SUCCESS) {
-        POWERSERVE_LOG_WARN("clFinish failed: {}", context->get_error_string(err));
-    }
 }
 
 void OpenCLBackend::silu_hadamard(const Tensor * out,
@@ -952,10 +939,6 @@ void OpenCLBackend::silu_hadamard(const Tensor * out,
         POWERSERVE_ABORT("clEnqueueNDRangeKernel failed: {}", context->get_error_string(err));
     }
 
-    err = clFinish(q);
-    if (err != CL_SUCCESS) {
-        POWERSERVE_ABORT("clFinish failed: {}", context->get_error_string(err));
-    }
 }
 
 void OpenCLBackend::get_embedding(const Tensor *dst,
@@ -1473,7 +1456,6 @@ void OpenCLBackend::matmul_opencl_f16_f32(const Tensor* dst, const Tensor* w, co
                 (size_t)ne12 * (size_t)ne13
             };
             OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), k, 3, nullptr, global, local, 0, nullptr, nullptr));
-            OCL_RETURN_IF_ERROR(ctx, clFinish(ctx->get_queue()));
             return;
         }
     }
@@ -1527,7 +1509,6 @@ void OpenCLBackend::matmul_opencl_f16_f32(const Tensor* dst, const Tensor* w, co
                 (size_t)ne12 * (size_t)ne13
             };
             OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), k, 3, nullptr, global, local, 0, nullptr, nullptr));
-            OCL_RETURN_IF_ERROR(ctx, clFinish(ctx->get_queue()));
             return;
         }
     }
@@ -1556,7 +1537,6 @@ void OpenCLBackend::matmul_opencl_f16_f32(const Tensor* dst, const Tensor* w, co
         };
 
         OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), k, 2, nullptr, global, local, 0, nullptr, nullptr));
-        OCL_RETURN_IF_ERROR(ctx, clFinish(ctx->get_queue()));
         return;
     }
 
@@ -1588,7 +1568,6 @@ void OpenCLBackend::matmul_opencl_f16_f32(const Tensor* dst, const Tensor* w, co
         ((size_t)ne11 + local[1] - 1) / local[1] * local[1],
     };
     OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), k, 2, nullptr, global, local, 0, nullptr, nullptr));
-    OCL_RETURN_IF_ERROR(ctx, clFinish(ctx->get_queue()));
 }
 
 void OpenCLBackend::matmul_opencl_q4_0_f32(const Tensor* dst, const Tensor* w, const Tensor* x) const {
@@ -1718,7 +1697,6 @@ void OpenCLBackend::matmul_opencl_q4_0_f32(const Tensor* dst, const Tensor* w, c
         };
 
         OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), k, 3, nullptr, global, local, 0, nullptr, nullptr));
-        OCL_RETURN_IF_ERROR(ctx, clFinish(ctx->get_queue()));
         return;
         }
     }
@@ -1771,7 +1749,6 @@ void OpenCLBackend::matmul_opencl_q4_0_f32(const Tensor* dst, const Tensor* w, c
         ((size_t)M + local[1] - 1) / local[1] * local[1],
     };
     OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), k, 2, nullptr, global, local, 0, nullptr, nullptr));
-    OCL_RETURN_IF_ERROR(ctx, clFinish(ctx->get_queue()));
 }
 
 void OpenCLBackend::matmul_opencl_q8_0_f32(const Tensor* dst, const Tensor* w, const Tensor* x) const {
@@ -1970,7 +1947,6 @@ void OpenCLBackend::matmul_opencl_q8_0_f32(const Tensor* dst, const Tensor* w, c
                 (size_t)ne12 * (size_t)ne13
             };
             OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), k_q8_intx, 3, nullptr, global, local, 0, nullptr, nullptr));
-            OCL_RETURN_IF_ERROR(ctx, clFinish(ctx->get_queue()));
             return;
         }
     }
@@ -2026,7 +2002,6 @@ void OpenCLBackend::matmul_opencl_q8_0_f32(const Tensor* dst, const Tensor* w, c
             (size_t)ne12 * (size_t)ne13
         };
         OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), k, 3, nullptr, global, local, 0, nullptr, nullptr));
-        OCL_RETURN_IF_ERROR(ctx, clFinish(ctx->get_queue()));
         return;
         }
     }
@@ -2076,7 +2051,6 @@ void OpenCLBackend::matmul_opencl_q8_0_f32(const Tensor* dst, const Tensor* w, c
                 (size_t)ne12 * (size_t)ne13
             };
             OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), k, 3, nullptr, global, local, 0, nullptr, nullptr));
-            OCL_RETURN_IF_ERROR(ctx, clFinish(ctx->get_queue()));
             return;
         }
     }
@@ -2126,7 +2100,6 @@ void OpenCLBackend::matmul_opencl_q8_0_f32(const Tensor* dst, const Tensor* w, c
         ((size_t)M + local[1] - 1) / local[1] * local[1],
     };
     OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), k, 2, nullptr, global, local, 0, nullptr, nullptr));
-    OCL_RETURN_IF_ERROR(ctx, clFinish(ctx->get_queue()));
 }
 
 void OpenCLBackend::matmul_opencl_f32_f32(const Tensor* dst, const Tensor* w, const Tensor* x) const {
@@ -2217,7 +2190,6 @@ void OpenCLBackend::matmul_opencl_f32_f32(const Tensor* dst, const Tensor* w, co
                 (size_t)ne12 * (size_t)ne13
             };
             OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), k, 3, nullptr, global, local, 0, nullptr, nullptr));
-            OCL_RETURN_IF_ERROR(ctx, clFinish(ctx->get_queue()));
             return;
         }
     }
@@ -2263,7 +2235,6 @@ void OpenCLBackend::matmul_opencl_f32_f32(const Tensor* dst, const Tensor* w, co
         };
 
         OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), k, 3, nullptr, global, local, 0, nullptr, nullptr));
-        OCL_RETURN_IF_ERROR(ctx, clFinish(ctx->get_queue()));
         return;
     }
 
@@ -2296,7 +2267,6 @@ void OpenCLBackend::matmul_opencl_f32_f32(const Tensor* dst, const Tensor* w, co
     };
 
     OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), k, 2, nullptr, global, local, 0, nullptr, nullptr));
-    OCL_RETURN_IF_ERROR(ctx, clFinish(ctx->get_queue()));
 }
 
 void OpenCLBackend::matmul(const Tensor *dst, const Tensor *src0, const Tensor *src1) const {
@@ -2684,7 +2654,6 @@ void OpenCLBackend::rmsnorm(
         (size_t)ne03
     };
     OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), kernel, 3, nullptr, global, local, 0, nullptr, nullptr));
-    OCL_RETURN_IF_ERROR(ctx, clFinish(ctx->get_queue()));
 
     if (out_dev != o) {
         detail::cpy_tensor_cl(self, out_dev, o);
@@ -2937,11 +2906,139 @@ void OpenCLBackend::rope(
         nullptr,
         nullptr
     ));
-    OCL_RETURN_IF_ERROR(ctx, clFinish(ctx->get_queue()));
 }
 
 void OpenCLBackend::softmax(const Tensor * /*out*/, const Tensor * /*x*/) const {
     POWERSERVE_ABORT("OpenCLBackend::softmax TODO");
+}
+
+void OpenCLBackend::get_mask(const Tensor *out, const std::vector<int> &pos) const {
+    if (!initialized) {
+        POWERSERVE_LOG_ERROR("OpenCL backend not initialized");
+        return;
+    }
+    if (!out) {
+        POWERSERVE_LOG_ERROR("get_mask: out is null");
+        return;
+    }
+    if (out->m_dtype != DataType::FP32) {
+        POWERSERVE_LOG_ERROR("get_mask: only FP32 is supported");
+        return;
+    }
+    if (out->m_shape[2] != 1 || out->m_shape[3] != 1) {
+        POWERSERVE_LOG_ERROR("get_mask: expected out shape [n_kv, batch, 1, 1], got [{}, {}, {}, {}]",
+                             out->m_shape[0], out->m_shape[1], out->m_shape[2], out->m_shape[3]);
+        return;
+    }
+
+    const int n_kv = static_cast<int>(out->m_shape[0]);
+    const int batch_size = static_cast<int>(out->m_shape[1]);
+    if (batch_size <= 0 || n_kv <= 0) {
+        return;
+    }
+    if ((int)pos.size() != batch_size) {
+        POWERSERVE_LOG_ERROR("get_mask: pos.size() {} != batch_size {}", pos.size(), batch_size);
+        return;
+    }
+
+    auto *self = const_cast<OpenCLBackend *>(this);
+    auto *ctx = self->context.get();
+    if (!ctx || !self->kernel_manager) {
+        POWERSERVE_LOG_ERROR("get_mask: OpenCL context or kernel manager not initialized");
+        return;
+    }
+
+    auto *out_cl = dynamic_cast<OpenCLBuffer *>(&const_cast<Tensor *>(out)->get<BaseBuffer>());
+    if (!out_cl) {
+        POWERSERVE_LOG_ERROR("get_mask: out must be OpenCLBuffer");
+        return;
+    }
+
+    self->ensure_tokens_buffer((size_t)batch_size);
+
+    OpenCLBuffer *pos_cl = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(self->m_tokens_mutex);
+        pos_cl = self->m_tokens_buffer.get();
+    }
+    if (!pos_cl) {
+        POWERSERVE_LOG_ERROR("get_mask: failed to prepare pos buffer");
+        return;
+    }
+
+    cl_mem out_mem = out_cl->get_device_buffer();
+    cl_mem pos_mem = pos_cl->get_device_buffer();
+    if (!out_mem || !pos_mem) {
+        POWERSERVE_LOG_ERROR("get_mask: invalid cl_mem");
+        return;
+    }
+
+    const cl_ulong off_out = static_cast<cl_ulong>(out_cl->get_base_offset());
+    const cl_ulong off_pos = static_cast<cl_ulong>(pos_cl->get_base_offset());
+
+    cl_event write_event = nullptr;
+    const size_t pos_bytes = (size_t)batch_size * sizeof(int32_t);
+    cl_int err = clEnqueueWriteBuffer(
+        ctx->get_queue(),
+        pos_mem,
+        CL_FALSE,
+        off_pos,
+        pos_bytes,
+        pos.data(),
+        0,
+        nullptr,
+        &write_event
+    );
+    if (err != CL_SUCCESS) {
+        POWERSERVE_LOG_ERROR("get_mask: failed to upload pos: {}", ctx->get_error_string(err));
+        return;
+    }
+
+    cl_kernel kernel = self->kernel_manager->get_kernel("kernel_get_mask_f32");
+    if (!kernel) {
+        POWERSERVE_LOG_ERROR("get_mask: kernel_get_mask_f32 not found");
+        clReleaseEvent(write_event);
+        return;
+    }
+
+    auto set_arg_checked = [&](cl_uint idx, size_t sz, const void *ptr) -> bool {
+        cl_int e = clSetKernelArg(kernel, idx, sz, ptr);
+        if (e != CL_SUCCESS) {
+            POWERSERVE_LOG_ERROR("get_mask: clSetKernelArg({}) failed: {}", idx, ctx->get_error_string(e));
+            clReleaseEvent(write_event);
+            return false;
+        }
+        return true;
+    };
+
+    cl_uint arg = 0;
+    if (!set_arg_checked(arg++, sizeof(cl_mem), &out_mem)) return;
+    if (!set_arg_checked(arg++, sizeof(cl_ulong), &off_out)) return;
+    if (!set_arg_checked(arg++, sizeof(cl_mem), &pos_mem)) return;
+    if (!set_arg_checked(arg++, sizeof(cl_ulong), &off_pos)) return;
+    if (!set_arg_checked(arg++, sizeof(int), &n_kv)) return;
+    if (!set_arg_checked(arg++, sizeof(int), &batch_size)) return;
+
+    const size_t global[2] = {
+        static_cast<size_t>(n_kv),
+        static_cast<size_t>(batch_size)
+    };
+    err = clEnqueueNDRangeKernel(
+        ctx->get_queue(),
+        kernel,
+        2,
+        nullptr,
+        global,
+        nullptr,
+        1,
+        &write_event,
+        nullptr
+    );
+    clReleaseEvent(write_event);
+    if (err != CL_SUCCESS) {
+        POWERSERVE_LOG_ERROR("get_mask: kernel launch failed: {}", ctx->get_error_string(err));
+        return;
+    }
 }
 
 void OpenCLBackend::softmax_ext(
@@ -3140,7 +3237,6 @@ void OpenCLBackend::softmax_ext(
         3, nullptr, global, local,
         0, nullptr, nullptr
     ));
-    OCL_RETURN_IF_ERROR(context, clFinish(context->get_queue()));
 }
 
 } // namespace powerserve::opencl

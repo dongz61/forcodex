@@ -37,6 +37,10 @@ void OpenCLBackend::cleanup() {
 
     std::cout << "[DEBUG] 1. Cleaning OpenCL context first..." << std::endl;
     clear_quant_cache();
+    {
+        std::lock_guard<std::mutex> lock(m_resident_buffers_mutex);
+        m_resident_buffers.clear();
+    }
     if (context) {
         context.reset();
         std::cout << "[DEBUG] Context released" << std::endl;
@@ -179,6 +183,54 @@ std::shared_ptr<OpenCLBuffer> OpenCLBackend::create_buffer(Shape shape, DataType
                                static_cast<int>(dtype));
             return nullptr;
     }
+}
+
+std::shared_ptr<OpenCLBuffer> OpenCLBackend::get_or_create_resident_buffer(const Tensor *src) const {
+    if (!src || !src->m_data) {
+        return nullptr;
+    }
+
+    auto *src_cpu = dynamic_cast<CPUBuffer *>(src->m_data.get());
+    if (!src_cpu) {
+        auto *src_cl = dynamic_cast<OpenCLBuffer *>(src->m_data.get());
+        if (!src_cl) {
+            return nullptr;
+        }
+        return std::shared_ptr<OpenCLBuffer>(src->m_data, src_cl);
+    }
+
+    ResidentBufferKey key;
+    key.host_buf = src->m_data.get();
+    key.dtype = src->m_dtype;
+    key.shape = src->m_shape;
+    key.stride = src_cpu->m_stride;
+
+    {
+        std::lock_guard<std::mutex> lock(m_resident_buffers_mutex);
+        auto it = m_resident_buffers.find(key);
+        if (it != m_resident_buffers.end()) {
+            return it->second;
+        }
+    }
+
+    auto uploaded = create_buffer(src->m_shape, src->m_dtype);
+    if (!uploaded) {
+        return nullptr;
+    }
+
+    Tensor tmp_dst(src->m_dtype, src->m_shape);
+    tmp_dst.m_data = std::static_pointer_cast<BaseBuffer>(uploaded);
+    this->copy(&tmp_dst, src);
+
+    {
+        std::lock_guard<std::mutex> lock(m_resident_buffers_mutex);
+        auto [it, inserted] = m_resident_buffers.emplace(key, uploaded);
+        if (!inserted) {
+            return it->second;
+        }
+    }
+
+    return uploaded;
 }
 
 

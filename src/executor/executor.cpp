@@ -204,38 +204,13 @@ void Executor::allocate_buffers() {
                     continue;
                 }
 
-                // 1) clone metadata into tmp tensor (non-view only)
-                Tensor tmp = *tensor;
-                tmp.m_data.reset();
-
-                // 2) allocate OpenCL buffer for tmp
-                switch (tensor->m_dtype) {
-                case DataType::FP32:
-                    create_opencl_buffer_for_tensor<float>(&tmp);
-                    break;
-                case DataType::FP16:
-                    create_opencl_buffer_for_tensor<uint16_t>(&tmp);
-                    break;
-                case DataType::INT32:
-                    create_opencl_buffer_for_tensor<int32_t>(&tmp);
-                    break;
-                case DataType::GGML_Q4_0:
-                    create_opencl_buffer_for_tensor<uint8_t>(&tmp);
-                    break;
-                case DataType::GGML_Q8_0:
-                    create_opencl_buffer_for_tensor<uint8_t>(&tmp);
-                    break;
-                default:
-                    POWERSERVE_ABORT("allocate_buffers migrate: unsupported dtype={} shape=[{}, {}, {}, {}]",
+                auto resident = cl_backend->get_or_create_resident_buffer(tensor);
+                if (!resident) {
+                    POWERSERVE_ABORT("allocate_buffers migrate: failed to get resident OpenCL buffer for dtype={} shape=[{}, {}, {}, {}]",
                                      (int)tensor->m_dtype,
                                      tensor->m_shape[0], tensor->m_shape[1], tensor->m_shape[2], tensor->m_shape[3]);
                 }
-
-                // 3) H2D copy
-                cl_backend->copy(&tmp, tensor);
-
-                // 4) replace original CPU buffer
-                tensor->m_data = std::move(tmp.m_data);
+                tensor->m_data = std::static_pointer_cast<BaseBuffer>(resident);
 
                 continue;
             }
@@ -486,6 +461,7 @@ void Executor::run() {
             auto [mask, pos] = op->get_params<GetMaskParams>();
             auto n_kv        = out->m_shape[0];
             auto batch_size  = out->m_shape[1];
+            (void)mask;
 
             POWERSERVE_ASSERT(out->m_dtype == DataType::FP32);
 
@@ -501,25 +477,10 @@ void Executor::run() {
                 break;
             }
 
-            // ===== OpenCL bring-up fallback path =====
-            // 1) create a temporary CPU tensor
-            Tensor tmp_cpu(DataType::FP32, out->m_shape);
-            tmp_cpu.m_data = powerserve::CPUBuffer::create_buffer<float>(out->m_shape);
-
-            // 2) fill mask on CPU (same logic)
-            auto mask_buf = (float *)tmp_cpu.get<CPUBuffer>().m_data;
-            for (size_t i = 0; i < batch_size; i++) {
-                size_t cur_pos = pos[i];
-                for (size_t j = 0; j < n_kv; j++) {
-                    mask_buf[j + i * n_kv] = (j <= cur_pos) ? 0.f : -INFINITY;
-                }
-            }
-
-            // 3) copy CPU -> OpenCL output tensor
-            // backend is the current backend (OpenCLBackend when use_opencl)
+            // ===== OpenCL path =====
             auto *cl_backend = dynamic_cast<powerserve::opencl::OpenCLBackend *>(backend);
             POWERSERVE_ASSERT(cl_backend && "backend is not OpenCLBackend while use_opencl=true");
-            cl_backend->copy(out, &tmp_cpu);
+            cl_backend->get_mask(out, pos);
 
         } break;
 
