@@ -226,10 +226,18 @@ bool OpenCLMemoryPool::copy_device_to_host(void* dst, cl_mem src, size_t size, s
 }
 
 
-bool OpenCLMemoryPool::copy_device_to_device(cl_mem dst, cl_mem src, size_t size) {
+bool OpenCLMemoryPool::copy_device_to_device(
+    cl_mem dst,
+    cl_mem src,
+    size_t size,
+    size_t dst_offset,
+    size_t src_offset) {
     if (!dst || !src) {
         POWERSERVE_LOG_ERROR("Invalid arguments for copy_device_to_device");
         return false;
+    }
+    if (size == 0) {
+        return true;
     }
 
     size_t src_size = 0, dst_size = 0;
@@ -242,15 +250,15 @@ bool OpenCLMemoryPool::copy_device_to_device(cl_mem dst, cl_mem src, size_t size
         return false;
     }
 
-    if (size > src_size || size > dst_size) {
-        POWERSERVE_LOG_ERROR("D2D OOB: size={} src_size={} dst_size={}",
-                             size, src_size, dst_size);
+    if (src_offset + size > src_size || dst_offset + size > dst_size) {
+        POWERSERVE_LOG_ERROR("D2D OOB: src_off={} dst_off={} size={} src_size={} dst_size={}",
+                             src_offset, dst_offset, size, src_size, dst_size);
         return false;
     }
 
 
     cl_int err = clEnqueueCopyBuffer(context_->get_queue(), src, dst,
-                                     0, 0, size, 0, nullptr, nullptr);
+                                     src_offset, dst_offset, size, 0, nullptr, nullptr);
     return context_->check_error(err, "clEnqueueCopyBuffer");
 }
 

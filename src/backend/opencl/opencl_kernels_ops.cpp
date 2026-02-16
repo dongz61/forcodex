@@ -293,8 +293,8 @@ static inline bool force_softmax_ext_ggml_fallback() {
 }
 
 // Debug switch:
-// set POWERSERVE_SOFTMAX_EXT_GPU_ALIGN=1 to keep softmax_ext on GPU but use 1-lane row path
-// for a reduction order closer to ggml.
+// set POWERSERVE_SOFTMAX_EXT_GPU_ALIGN=1 to force strict scalar softmax_ext kernel
+// (original parity-first behavior).
 static inline bool force_softmax_ext_gpu_align() {
     static int cached = -1;
     if (cached >= 0) {
@@ -2742,24 +2742,14 @@ void OpenCLBackend::rope(
         return;
     }
 
-    Shape pos_shape{pos.size(), 1, 1, 1};
-    Tensor pos_host(DataType::INT32, pos_shape);
-    pos_host.m_data = powerserve::CPUBuffer::create_buffer<int32_t>(pos_shape);
-    auto &pos_cpu = pos_host.get<powerserve::CPUBuffer>();
-    std::memcpy(pos_cpu.m_data, pos.data(), pos.size() * sizeof(int32_t));
-
-    Tensor pos_dev(DataType::INT32, pos_shape);
-    pos_dev.m_data = self->create_buffer(pos_shape, DataType::INT32);
-    if (!pos_dev.m_data) {
-        POWERSERVE_LOG_WARN("OpenCLBackend::rope failed to allocate pos buffer, fallback to CPU");
-        fallback_to_cpu();
-        return;
+    self->ensure_tokens_buffer(pos.size());
+    OpenCLBuffer *pos_cl = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(self->m_tokens_mutex);
+        pos_cl = self->m_tokens_buffer.get();
     }
-    self->copy(&pos_dev, &pos_host);
-
-    auto *pos_cl = dynamic_cast<OpenCLBuffer *>(&pos_dev.get<BaseBuffer>());
     if (!pos_cl) {
-        POWERSERVE_LOG_WARN("OpenCLBackend::rope failed to create pos OpenCLBuffer, fallback to CPU");
+        POWERSERVE_LOG_WARN("OpenCLBackend::rope failed to prepare pos buffer, fallback to CPU");
         fallback_to_cpu();
         return;
     }
@@ -2895,17 +2885,45 @@ void OpenCLBackend::rope(
         static_cast<size_t>(ne03)
     };
 
-    OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(
+    cl_event pos_write_event = nullptr;
+    const size_t pos_bytes = pos.size() * sizeof(int32_t);
+    cl_int pos_write_err = clEnqueueWriteBuffer(
+        ctx->get_queue(),
+        P_cl,
+        CL_FALSE,
+        off1,
+        pos_bytes,
+        pos.data(),
+        0,
+        nullptr,
+        &pos_write_event
+    );
+    if (pos_write_err != CL_SUCCESS) {
+        POWERSERVE_LOG_WARN("OpenCLBackend::rope failed to upload pos buffer, fallback to CPU: {}",
+                            ctx->get_error_string(pos_write_err));
+        fallback_to_cpu();
+        return;
+    }
+
+    const cl_uint wait_count = pos_write_event ? 1u : 0u;
+    const cl_event *wait_list = pos_write_event ? &pos_write_event : nullptr;
+    cl_int rope_launch_err = clEnqueueNDRangeKernel(
         ctx->get_queue(),
         kernel,
         3,
         nullptr,
         global,
         local,
-        0,
-        nullptr,
+        wait_count,
+        wait_list,
         nullptr
-    ));
+    );
+    if (pos_write_event) clReleaseEvent(pos_write_event);
+    if (rope_launch_err != CL_SUCCESS) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::rope kernel launch failed: {}",
+                             ctx->get_error_string(rope_launch_err));
+        return;
+    }
 }
 
 void OpenCLBackend::softmax(const Tensor * /*out*/, const Tensor * /*x*/) const {
@@ -3135,9 +3153,14 @@ void OpenCLBackend::softmax_ext(
         return;
     }
 
-    cl_kernel kernel = self->kernel_manager->get_kernel("kernel_soft_max");
+    const bool use_strict_softmax = force_softmax_ext_gpu_align();
+    const char *softmax_kernel_name = use_strict_softmax
+        ? "kernel_soft_max_strict_backup"
+        : "kernel_soft_max";
+
+    cl_kernel kernel = self->kernel_manager->get_kernel(softmax_kernel_name);
     if (!kernel) {
-        POWERSERVE_LOG_ERROR("softmax_ext: kernel_soft_max not found");
+        POWERSERVE_LOG_ERROR("softmax_ext: {} not found", softmax_kernel_name);
         return;
     }
 
@@ -3209,20 +3232,12 @@ void OpenCLBackend::softmax_ext(
     const int n_head_log2_i = (int)n_head_log2;
     OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(int), &n_head_log2_i));
 
-    const bool want_align = force_softmax_ext_gpu_align();
-    if (want_align) {
-        static bool warned_align_noop = false;
-        if (!warned_align_noop) {
-            warned_align_noop = true;
-            POWERSERVE_LOG_WARN(
-                "POWERSERVE_SOFTMAX_EXT_GPU_ALIGN is now redundant: strict softmax_ext row-order mode is always enabled"
-            );
-        }
+    // Default path uses parallel reduction; strict mode is kept for parity/debug.
+    size_t local_work_size = 1;
+    if (!use_strict_softmax) {
+        const uint32_t cap = std::min<uint32_t>(64u, std::max<uint32_t>(1u, (uint32_t)ne00));
+        local_work_size = (size_t)(1u << floor_log2_u32(cap));
     }
-
-    // The OpenCL softmax kernel runs in strict row-order mode (lid==0),
-    // so use local size 1 to avoid wasted lanes and keep behavior deterministic.
-    const size_t local_work_size = 1;
     const size_t local_mem_size = local_work_size * sizeof(float);
     OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, local_mem_size, nullptr));
 

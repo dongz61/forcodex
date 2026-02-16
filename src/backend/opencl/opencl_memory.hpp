@@ -34,7 +34,12 @@ public:
     // 数据传输
     bool copy_host_to_device(cl_mem dst, const void* src, size_t size, size_t offset = 0);
     bool copy_device_to_host(void* dst, cl_mem src, size_t size, size_t offset = 0);
-    bool copy_device_to_device(cl_mem dst, cl_mem src, size_t size);
+    bool copy_device_to_device(
+        cl_mem dst,
+        cl_mem src,
+        size_t size,
+        size_t dst_offset = 0,
+        size_t src_offset = 0);
     
 private:
     std::shared_ptr<OpenCLContext> context_;

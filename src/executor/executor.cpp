@@ -21,10 +21,28 @@
 #include <cstdint>
 #include <array>
 #include <string>
+#include <cstdlib>
+#include <cstring>
 #include <fmt/core.h>
 
 
 namespace powerserve {
+
+static inline bool force_get_mask_cpu_fallback() {
+    static int cached = -1;
+    if (cached >= 0) {
+        return cached == 1;
+    }
+    const char *v = std::getenv("POWERSERVE_FORCE_GET_MASK_CPU_FALLBACK");
+    cached = (v && (
+        std::strcmp(v, "1") == 0 ||
+        std::strcmp(v, "true") == 0 ||
+        std::strcmp(v, "TRUE") == 0 ||
+        std::strcmp(v, "on") == 0 ||
+        std::strcmp(v, "ON") == 0
+    )) ? 1 : 0;
+    return cached == 1;
+}
 
 // ziqian add: debug hook impl and other debug tools
 // ===== Debug hook impl =====
@@ -477,9 +495,27 @@ void Executor::run() {
                 break;
             }
 
-            // ===== OpenCL path =====
             auto *cl_backend = dynamic_cast<powerserve::opencl::OpenCLBackend *>(backend);
             POWERSERVE_ASSERT(cl_backend && "backend is not OpenCLBackend while use_opencl=true");
+
+            if (force_get_mask_cpu_fallback()) {
+                // ===== OpenCL CPU fallback path =====
+                Tensor tmp_cpu(DataType::FP32, out->m_shape);
+                tmp_cpu.m_data = powerserve::CPUBuffer::create_buffer<float>(out->m_shape);
+
+                auto mask_buf = (float *)tmp_cpu.get<CPUBuffer>().m_data;
+                for (size_t i = 0; i < batch_size; i++) {
+                    size_t cur_pos = pos[i];
+                    for (size_t j = 0; j < n_kv; j++) {
+                        mask_buf[j + i * n_kv] = (j <= cur_pos) ? 0.f : -INFINITY;
+                    }
+                }
+
+                cl_backend->copy(out, &tmp_cpu);
+                break;
+            }
+
+            // ===== OpenCL GPU path =====
             cl_backend->get_mask(out, pos);
 
         } break;

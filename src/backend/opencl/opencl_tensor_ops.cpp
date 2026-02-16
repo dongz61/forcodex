@@ -253,20 +253,8 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
 
             const size_t src_off = src_cl->get_base_offset();
             const size_t dst_off = dst_cl->get_base_offset();
-            if (src_off == 0 && dst_off == 0) {
-                if (!memory_pool->copy_device_to_device(dst_dev, src_dev, src_bytes)) {
-                    POWERSERVE_LOG_ERROR("copy: shape-mismatch D2D copy_device_to_device failed");
-                }
-                return;
-            }
-
-            std::vector<uint8_t> host(src_bytes);
-            if (!memory_pool->copy_device_to_host(host.data(), src_dev, src_bytes, src_off)) {
-                POWERSERVE_LOG_ERROR("copy: shape-mismatch D2H staging failed");
-                return;
-            }
-            if (!memory_pool->copy_host_to_device(dst_dev, host.data(), src_bytes, dst_off)) {
-                POWERSERVE_LOG_ERROR("copy: shape-mismatch H2D staging failed");
+            if (!memory_pool->copy_device_to_device(dst_dev, src_dev, src_bytes, dst_off, src_off)) {
+                POWERSERVE_LOG_ERROR("copy: shape-mismatch D2D copy_device_to_device failed");
             }
             return;
         }
@@ -481,19 +469,8 @@ void OpenCLBackend::cont(const Tensor *out, const Tensor *x) const {
     const size_t src_off = tmp_cl->get_base_offset();
     const size_t dst_off = out_cl->get_base_offset();
 
-    if (src_off == 0 && dst_off == 0) {
-        if (!memory_pool->copy_device_to_device(dst_dev, src_dev, x_bytes)) {
-            POWERSERVE_ABORT("cont: copy_device_to_device failed");
-        }
-        return;
-    }
-
-    std::vector<uint8_t> host(x_bytes);
-    if (!memory_pool->copy_device_to_host(host.data(), src_dev, x_bytes, src_off)) {
-        POWERSERVE_ABORT("cont: copy_device_to_host failed");
-    }
-    if (!memory_pool->copy_host_to_device(dst_dev, host.data(), x_bytes, dst_off)) {
-        POWERSERVE_ABORT("cont: copy_host_to_device failed");
+    if (!memory_pool->copy_device_to_device(dst_dev, src_dev, x_bytes, dst_off, src_off)) {
+        POWERSERVE_ABORT("cont: copy_device_to_device failed");
     }
 }
 
