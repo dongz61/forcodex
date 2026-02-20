@@ -13,7 +13,6 @@
 
 #include "core/config.hpp"
 #include "core/tensor.hpp"
-#include "core/thread_pool.hpp"
 #include "graph/node.hpp"
 
 #include <cstddef>
@@ -29,11 +28,6 @@ namespace powerserve::opencl {
 struct OpenCLBackend final : powerserve::Backend {
 public:
     // ========= Backup carried structs (helpers) =========
-    struct WorkData {
-        std::vector<char> buffer;
-        size_t size = 0;
-    };
-
     // 旧 rope 参数结构：保留给内部 kernel/兼容层使用（不是 Backend 接口）
     struct RopeParams {
         int n_past     = 0;
@@ -56,18 +50,14 @@ public:
 
     // backup (optional, keep if you still use them)
     std::shared_ptr<OpenCLKernelManager> kernel_manager;
-    std::unique_ptr<ThreadPool> thread_pool;
     std::shared_ptr<OpenCLMemoryPool> memory_pool;
     std::shared_ptr<OpenCLContext> context;
 
     // work/config/state (backup)
-    WorkData work_data;
-    std::vector<ThreadConfig> thread_config;
     std::string device_preference;
     bool initialized = false;
 
     // current
-    int num_threads = 1;
 
 public:
     explicit OpenCLBackend(const ModelConfig::LLMConfig &config, const HyperParams &hparams);
@@ -135,7 +125,6 @@ public:
 
     // 张量属性检查 / 并行任务估算（如果还需要）
     bool is_contiguous(const Tensor *tensor, int n) const;
-    enum ggml_type get_vec_dot_type(const Tensor *tensor);
 
     // buffer 创建
     std::shared_ptr<OpenCLBuffer> create_buffer(Shape shape, DataType dtype) const;
@@ -158,20 +147,6 @@ public:
 #endif
 
 private:
-    // ========= Internal helpers =========
-    void setup_default_config();
-
-    // matmul helper
-    void matmul_cpu_ggml_fallback(
-        const Tensor *dst,
-        const Tensor *src0,
-        const Tensor *src1
-    ) const;
-
-private:
-    // Tensor -> OpenCL buffer mapping (legacy path; if you已经把 buffer 放在 Tensor 内部，可逐步淘汰)
-    mutable std::unordered_map<const Tensor *, cl_mem> tensor_buffers_;
-    mutable std::mutex buffer_mutex_;
 
     // ---- GGML reusable fallback executor for CPU ops (matmul etc.) ----
     mutable std::unique_ptr<powerserve::ggml::GGMLBackend> m_ggml_fallback;

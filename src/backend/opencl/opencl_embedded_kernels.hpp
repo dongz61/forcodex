@@ -85,14 +85,6 @@
 #include "mul_mv_f32_f32.cl.h"
 #endif
 
-#ifdef OPENCL_MUL_MAT_Q4_0_F32_SIMPLE_CL_AVAILABLE
-#include "mul_mat_q4_0_f32_simple.cl.h"
-#endif
-
-#ifdef OPENCL_MUL_MAT_Q8_0_F32_SIMPLE_CL_AVAILABLE
-#include "mul_mat_q8_0_f32_simple.cl.h"
-#endif
-
 #ifdef OPENCL_Q8_ALIGN_X_F32_CL_AVAILABLE
 #include "q8_align_x_f32.cl.h"
 #endif

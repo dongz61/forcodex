@@ -120,33 +120,6 @@ kernel void kernel_mul_mat_f16_f32(
     }
 }
 
-kernel void kernel_mul_mat_f16_f32_simple(
-    __global const half * w,
-    ulong off_w,
-    __global const float * x,
-    ulong off_x,
-    __global float * dst,
-    ulong off_dst,
-    int K, int N, int M,
-    ulong nb_w1,
-    ulong nb_x1,
-    ulong nb_dst1
-) {
-    const int n = (int)get_global_id(0);
-    const int m = (int)get_global_id(1);
-    if (n >= N || m >= M) return;
-
-    __global const half * w_row = (__global const half *)((__global const char *)w + off_w + (ulong)n * nb_w1);
-    __global const float * x_row = (__global const float *)((__global const char *)x + off_x + (ulong)m * nb_x1);
-    __global float * out_ptr     = (__global float *)((__global char *)dst + off_dst + (ulong)n * (ulong)sizeof(float) + (ulong)m * nb_dst1);
-
-    float sumf = 0.0f;
-    for (int k = 0; k < K; ++k) {
-        sumf += (float)w_row[k] * x_row[k];
-    }
-    *out_ptr = sumf;
-}
-
 kernel void kernel_matmul_contig_f32(
     __global const float * A,   // [M,K] as row-major with cols=K
     __global const float * B,   // [K,N] as row-major with cols=N
@@ -171,29 +144,3 @@ kernel void kernel_matmul_contig_f32(
     }
 }
 
-kernel void kernel_mul_mat_f32_f32_simple(
-    __global const float * w,
-    ulong off_w,
-    __global const float * x,
-    ulong off_x,
-    __global float * dst,
-    ulong off_dst,
-    int K, int N, int M,
-    ulong nb_w1,
-    ulong nb_x1,
-    ulong nb_dst1
-) {
-    const int n = (int)get_global_id(0);
-    const int m = (int)get_global_id(1);
-    if (n >= N || m >= M) return;
-
-    __global const float * w_row = (__global const float *)((__global const char *)w + off_w + (ulong)n * nb_w1);
-    __global const float * x_row = (__global const float *)((__global const char *)x + off_x + (ulong)m * nb_x1);
-    __global float * out_ptr     = (__global float *)((__global char *)dst + off_dst + (ulong)n * (ulong)sizeof(float) + (ulong)m * nb_dst1);
-
-    float sumf = 0.0f;
-    for (int k = 0; k < K; ++k) {
-        sumf += w_row[k] * x_row[k];
-    }
-    *out_ptr = sumf;
-}

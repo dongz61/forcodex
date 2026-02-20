@@ -61,301 +61,12 @@ static inline int preferred_subgroup_width(cl_device_id dev) {
     return 64;
 }
 
-static inline bool env_flag_enabled(const char *name) {
-    const char *v = std::getenv(name);
-    return v && (
-        std::strcmp(v, "1") == 0 ||
-        std::strcmp(v, "true") == 0 ||
-        std::strcmp(v, "TRUE") == 0 ||
-        std::strcmp(v, "on") == 0 ||
-        std::strcmp(v, "ON") == 0
-    );
-}
-
-// Testing mode: disallow silently falling back to *_simple matmul kernels.
-static inline bool disable_simple_matmul_fallback() {
-    static int cached = -1;
-    if (cached >= 0) {
-        return cached == 1;
-    }
-    const char *v = std::getenv("POWERSERVE_DISABLE_SIMPLE_MATMUL_FALLBACK");
-    if (!v) {
-        // Preserve previous behavior in this branch: simple fallback disabled by default.
-        cached = 1;
-        return true;
-    }
-    const bool enabled = (
-        std::strcmp(v, "1") == 0 ||
-        std::strcmp(v, "true") == 0 ||
-        std::strcmp(v, "TRUE") == 0 ||
-        std::strcmp(v, "on") == 0 ||
-        std::strcmp(v, "ON") == 0
-    );
-    cached = enabled ? 1 : 0;
-    return cached == 1;
-}
-
-// Debug/parity switch:
-// set POWERSERVE_FORCE_MATMUL_OPENCL_SIMPLE=1 to force OpenCL simple matmul
-// kernels (q4/q8) for better ggml-alignment without ggml fallback.
-static inline bool force_opencl_simple_matmul() {
-    static int cached = -1;
-    if (cached >= 0) {
-        return cached == 1;
-    }
-    const char *v = std::getenv("POWERSERVE_FORCE_MATMUL_OPENCL_SIMPLE");
-    cached = (v && (
-        std::strcmp(v, "1") == 0 ||
-        std::strcmp(v, "true") == 0 ||
-        std::strcmp(v, "TRUE") == 0 ||
-        std::strcmp(v, "on") == 0 ||
-        std::strcmp(v, "ON") == 0
-    )) ? 1 : 0;
-    return cached == 1;
-}
-
-// Fast-path debug switches (OpenCL only, no ggml fallback):
-//  - POWERSERVE_DISABLE_MATMUL_FAST_Q4_0_8X=1
-//  - POWERSERVE_DISABLE_MATMUL_FAST_Q8_0_GEMM=1
-//  - POWERSERVE_DISABLE_MATMUL_FAST_Q8_0_MV=1
-//  - POWERSERVE_DISABLE_MATMUL_FAST_F16_GEMM=1
-//  - POWERSERVE_DISABLE_MATMUL_FAST_F32_GEMM=1
-static inline bool disable_matmul_fast_q4_0_8x() {
-    static int cached = -1;
-    if (cached >= 0) return cached == 1;
-    cached = env_flag_enabled("POWERSERVE_DISABLE_MATMUL_FAST_Q4_0_8X") ? 1 : 0;
-    return cached == 1;
-}
-
-static inline bool disable_matmul_fast_q8_0_gemm() {
-    static int cached = -1;
-    if (cached >= 0) return cached == 1;
-    cached = env_flag_enabled("POWERSERVE_DISABLE_MATMUL_FAST_Q8_0_GEMM") ? 1 : 0;
-    return cached == 1;
-}
-
-static inline bool disable_matmul_fast_q8_0_mv() {
-    static int cached = -1;
-    if (cached >= 0) return cached == 1;
-    cached = env_flag_enabled("POWERSERVE_DISABLE_MATMUL_FAST_Q8_0_MV") ? 1 : 0;
-    return cached == 1;
-}
-
-static inline bool disable_matmul_fast_f16_gemm() {
-    static int cached = -1;
-    if (cached >= 0) return cached == 1;
-    cached = env_flag_enabled("POWERSERVE_DISABLE_MATMUL_FAST_F16_GEMM") ? 1 : 0;
-    return cached == 1;
-}
-
-static inline bool disable_matmul_fast_f32_gemm() {
-    static int cached = -1;
-    if (cached >= 0) return cached == 1;
-    cached = env_flag_enabled("POWERSERVE_DISABLE_MATMUL_FAST_F32_GEMM") ? 1 : 0;
-    return cached == 1;
-}
-
-// Q8 fast parity switch:
-// apply ggml-like q8 quantize-dequantize to activation x before q8 fast kernels.
-// This keeps fast kernels but aligns the numeric path much closer to ggml.
-//   POWERSERVE_Q8_FAST_ALIGN_X=1
-static inline bool align_q8_fast_input_x() {
-    static int cached = -1;
-    if (cached >= 0) return cached == 1;
-    cached = env_flag_enabled("POWERSERVE_Q8_FAST_ALIGN_X") ? 1 : 0;
-    return cached == 1;
-}
-
-// Debug switch:
-// set POWERSERVE_FORCE_MATMUL_GGML_FALLBACK=1 to bypass OpenCL matmul kernels.
-static inline bool force_matmul_ggml_fallback() {
-    static int cached = -1;
-    if (cached >= 0) {
-        return cached == 1;
-    }
-    const char *v = std::getenv("POWERSERVE_FORCE_MATMUL_GGML_FALLBACK");
-    cached = (v && (
-        std::strcmp(v, "1") == 0 ||
-        std::strcmp(v, "true") == 0 ||
-        std::strcmp(v, "TRUE") == 0 ||
-        std::strcmp(v, "on") == 0 ||
-        std::strcmp(v, "ON") == 0
-    )) ? 1 : 0;
-    return cached == 1;
-}
-
-// Debug switch:
-// set POWERSERVE_FORCE_RMSNORM_GGML_FALLBACK=1 to bypass OpenCL rmsnorm kernel.
-static inline bool force_rmsnorm_ggml_fallback() {
-    static int cached = -1;
-    if (cached >= 0) {
-        return cached == 1;
-    }
-    const char *v = std::getenv("POWERSERVE_FORCE_RMSNORM_GGML_FALLBACK");
-    cached = (v && (
-        std::strcmp(v, "1") == 0 ||
-        std::strcmp(v, "true") == 0 ||
-        std::strcmp(v, "TRUE") == 0 ||
-        std::strcmp(v, "on") == 0 ||
-        std::strcmp(v, "ON") == 0
-    )) ? 1 : 0;
-    return cached == 1;
-}
-
-// Debug switch:
-// set POWERSERVE_FORCE_SILU_GGML_FALLBACK=1 to bypass OpenCL silu_hadamard kernel.
-static inline bool force_silu_ggml_fallback() {
-    static int cached = -1;
-    if (cached >= 0) {
-        return cached == 1;
-    }
-    const char *v = std::getenv("POWERSERVE_FORCE_SILU_GGML_FALLBACK");
-    cached = (v && (
-        std::strcmp(v, "1") == 0 ||
-        std::strcmp(v, "true") == 0 ||
-        std::strcmp(v, "TRUE") == 0 ||
-        std::strcmp(v, "on") == 0 ||
-        std::strcmp(v, "ON") == 0
-    )) ? 1 : 0;
-    return cached == 1;
-}
-
-// Debug switch:
-// set POWERSERVE_FORCE_ADD_GGML_FALLBACK=1 to bypass OpenCL add kernels.
-static inline bool force_add_ggml_fallback() {
-    static int cached = -1;
-    if (cached >= 0) {
-        return cached == 1;
-    }
-    const char *v = std::getenv("POWERSERVE_FORCE_ADD_GGML_FALLBACK");
-    cached = (v && (
-        std::strcmp(v, "1") == 0 ||
-        std::strcmp(v, "true") == 0 ||
-        std::strcmp(v, "TRUE") == 0 ||
-        std::strcmp(v, "on") == 0 ||
-        std::strcmp(v, "ON") == 0
-    )) ? 1 : 0;
-    return cached == 1;
-}
-
-// Debug switch:
-// set POWERSERVE_FORCE_GET_EMBEDDING_GGML_FALLBACK=1 to bypass OpenCL get_embedding kernels.
-static inline bool force_get_embedding_ggml_fallback() {
-    static int cached = -1;
-    if (cached >= 0) {
-        return cached == 1;
-    }
-    const char *v = std::getenv("POWERSERVE_FORCE_GET_EMBEDDING_GGML_FALLBACK");
-    cached = (v && (
-        std::strcmp(v, "1") == 0 ||
-        std::strcmp(v, "true") == 0 ||
-        std::strcmp(v, "TRUE") == 0 ||
-        std::strcmp(v, "on") == 0 ||
-        std::strcmp(v, "ON") == 0
-    )) ? 1 : 0;
-    return cached == 1;
-}
-
-// Debug switch:
-// set POWERSERVE_FORCE_ROPE_GGML_FALLBACK=1 to bypass OpenCL rope kernels.
-static inline bool force_rope_ggml_fallback() {
-    static int cached = -1;
-    if (cached >= 0) {
-        return cached == 1;
-    }
-    const char *v = std::getenv("POWERSERVE_FORCE_ROPE_GGML_FALLBACK");
-    cached = (v && (
-        std::strcmp(v, "1") == 0 ||
-        std::strcmp(v, "true") == 0 ||
-        std::strcmp(v, "TRUE") == 0 ||
-        std::strcmp(v, "on") == 0 ||
-        std::strcmp(v, "ON") == 0
-    )) ? 1 : 0;
-    return cached == 1;
-}
-
-// Debug switch:
-// set POWERSERVE_FORCE_SOFTMAX_EXT_GGML_FALLBACK=1 to bypass OpenCL softmax_ext kernel.
-static inline bool force_softmax_ext_ggml_fallback() {
-    static int cached = -1;
-    if (cached >= 0) {
-        return cached == 1;
-    }
-    const char *v = std::getenv("POWERSERVE_FORCE_SOFTMAX_EXT_GGML_FALLBACK");
-    cached = (v && (
-        std::strcmp(v, "1") == 0 ||
-        std::strcmp(v, "true") == 0 ||
-        std::strcmp(v, "TRUE") == 0 ||
-        std::strcmp(v, "on") == 0 ||
-        std::strcmp(v, "ON") == 0
-    )) ? 1 : 0;
-    return cached == 1;
-}
-
-// Debug switch:
-// set POWERSERVE_SOFTMAX_EXT_GPU_ALIGN=1 to force strict scalar softmax_ext kernel
-// (original parity-first behavior).
-static inline bool force_softmax_ext_gpu_align() {
-    static int cached = -1;
-    if (cached >= 0) {
-        return cached == 1;
-    }
-    const char *v = std::getenv("POWERSERVE_SOFTMAX_EXT_GPU_ALIGN");
-    cached = (v && (
-        std::strcmp(v, "1") == 0 ||
-        std::strcmp(v, "true") == 0 ||
-        std::strcmp(v, "TRUE") == 0 ||
-        std::strcmp(v, "on") == 0 ||
-        std::strcmp(v, "ON") == 0
-    )) ? 1 : 0;
-    return cached == 1;
-}
-
-static inline uint64_t fnv1a64_bytes(const uint8_t *data, size_t n) {
-    uint64_t h = 1469598103934665603ull;
-    for (size_t i = 0; i < n; ++i) {
-        h ^= (uint64_t)data[i];
-        h *= 1099511628211ull;
-    }
-    return h;
-}
-
-static inline powerserve::BufferPtr create_cpu_buffer_for_dtype(powerserve::DataType dt,
-                                                                const powerserve::Shape &shape) {
-    using powerserve::CPUBuffer;
-
-    switch (dt) {
-    case powerserve::DataType::FP32:
-        return CPUBuffer::create_buffer<float>(shape);
-    case powerserve::DataType::FP16:
-        return CPUBuffer::create_buffer<uint16_t>(shape);
-    case powerserve::DataType::INT32:
-        return CPUBuffer::create_buffer<int32_t>(shape);
-    case powerserve::DataType::INT64:
-        return CPUBuffer::create_buffer<int64_t>(shape);
-
-    // ===== Quantized GGML buffers (match ggml nb[] layout) =====
-    case powerserve::DataType::GGML_Q4_0:
-    case powerserve::DataType::GGML_Q8_0: {
-        const ggml_type gt = powerserve::ggml::convert_datatype_to_ggml(dt);
-
-        powerserve::Stride stride{};
-        stride[0] = (size_t) ggml_type_size(gt);
-        stride[1] = (size_t) ggml_row_size(gt, (int64_t) shape[0]);
-        stride[2] = stride[1] * (size_t) shape[1];
-        stride[3] = stride[2] * (size_t) shape[2];
-
-        const size_t bytes = stride[3] * (size_t) shape[3];
-        void *ptr = malloc(bytes);
-        POWERSERVE_ASSERT(ptr && "malloc failed for quant CPU buffer");
-
-        return std::make_shared<CPUBuffer>(stride, ptr, /*allocated_by_malloc=*/true);
-    }
-
-    default:
-        POWERSERVE_ABORT("create_cpu_buffer_for_dtype: unsupported dtype {}", (int)dt);
-    }
-}
+constexpr bool kDisableMatmulFastQ4_0_8x = false;
+constexpr bool kDisableMatmulFastQ8_0Gemm = false;
+constexpr bool kDisableMatmulFastQ8_0Mv = false;
+constexpr bool kDisableMatmulFastF16Gemm = false;
+constexpr bool kDisableMatmulFastF32Gemm = false;
+constexpr bool kAlignQ8FastInputX = true;
 
 void OpenCLBackend::add_minimal(Tensor * dst, const Tensor * src0, const Tensor * src1) const {
     if (!initialized) {
@@ -700,37 +411,6 @@ void OpenCLBackend::add(const Tensor *dst, const Tensor *src0, const Tensor *src
         return;
     }
 
-    if (force_add_ggml_fallback()) {
-        POWERSERVE_ASSERT(m_ggml_fallback && "OpenCLBackend::add: ggml fallback not initialized");
-
-        auto is_cpu_tensor = [](const Tensor *t) -> bool {
-            return dynamic_cast<powerserve::CPUBuffer *>(t->m_data.get()) != nullptr;
-        };
-
-        Tensor host0;
-        Tensor host1;
-        const Tensor *src0_host = src0;
-        const Tensor *src1_host = src1;
-        if (!is_cpu_tensor(src0)) {
-            host0 = Tensor(DataType::FP32, src0->m_shape);
-            host0.m_data = powerserve::CPUBuffer::create_buffer<float>(src0->m_shape);
-            this->copy(&host0, src0);
-            src0_host = &host0;
-        }
-        if (!is_cpu_tensor(src1)) {
-            host1 = Tensor(DataType::FP32, src1->m_shape);
-            host1.m_data = powerserve::CPUBuffer::create_buffer<float>(src1->m_shape);
-            this->copy(&host1, src1);
-            src1_host = &host1;
-        }
-
-        Tensor host_out(DataType::FP32, dst->m_shape);
-        host_out.m_data = powerserve::CPUBuffer::create_buffer<float>(dst->m_shape);
-        m_ggml_fallback->add(&host_out, src0_host, src1_host);
-        this->copy(dst, &host_out);
-        return;
-    }
-
     auto *self = const_cast<OpenCLBackend*>(this);
 
     if (dst->m_shape == src0->m_shape && dst->m_shape == src1->m_shape) {
@@ -861,38 +541,6 @@ void OpenCLBackend::silu_hadamard(const Tensor * out,
         POWERSERVE_ABORT("silu_hadamard requires same shape");
     }
 
-    if (force_silu_ggml_fallback()) {
-        POWERSERVE_ASSERT(m_ggml_fallback && "OpenCLBackend::silu_hadamard: ggml fallback not initialized");
-
-        auto is_cpu_tensor = [](const Tensor *t) -> bool {
-            return dynamic_cast<powerserve::CPUBuffer *>(t->m_data.get()) != nullptr;
-        };
-
-        Tensor host_hb;
-        Tensor host_hb2;
-        const Tensor *hb_host = hb;
-        const Tensor *hb2_host = hb2;
-        if (!is_cpu_tensor(hb)) {
-            host_hb = Tensor(DataType::FP32, hb->m_shape);
-            host_hb.m_data = powerserve::CPUBuffer::create_buffer<float>(hb->m_shape);
-            this->copy(&host_hb, hb);
-            hb_host = &host_hb;
-        }
-        if (!is_cpu_tensor(hb2)) {
-            host_hb2 = Tensor(DataType::FP32, hb2->m_shape);
-            host_hb2.m_data = powerserve::CPUBuffer::create_buffer<float>(hb2->m_shape);
-            this->copy(&host_hb2, hb2);
-            hb2_host = &host_hb2;
-        }
-
-        Tensor host_out(DataType::FP32, out->m_shape);
-        host_out.m_data = powerserve::CPUBuffer::create_buffer<float>(out->m_shape);
-
-        m_ggml_fallback->silu_hadamard(&host_out, hb_host, hb2_host);
-        this->copy(out, &host_out);
-        return;
-    }
-
     POWERSERVE_ASSERT(is_contiguous(out, 0));
     POWERSERVE_ASSERT(is_contiguous(hb, 0));
     POWERSERVE_ASSERT(is_contiguous(hb2, 0));
@@ -962,30 +610,6 @@ void OpenCLBackend::get_embedding(const Tensor *dst,
     }
     if (dst->m_shape[1] != tokens.size()) {
         POWERSERVE_LOG_ERROR("OpenCLBackend::get_embedding dst batch {} != tokens {}", dst->m_shape[1], tokens.size());
-        return;
-    }
-
-    if (force_get_embedding_ggml_fallback()) {
-        POWERSERVE_ASSERT(m_ggml_fallback && "OpenCLBackend::get_embedding: ggml fallback not initialized");
-
-        auto is_cpu_tensor = [](const Tensor *t) -> bool {
-            return dynamic_cast<powerserve::CPUBuffer *>(t->m_data.get()) != nullptr;
-        };
-
-        Tensor host_weight;
-        const Tensor *weight_host = weight;
-        if (!is_cpu_tensor(weight)) {
-            host_weight = Tensor(weight->m_dtype, weight->m_shape);
-            host_weight.m_data = create_cpu_buffer_for_dtype(weight->m_dtype, weight->m_shape);
-            this->copy(&host_weight, weight);
-            weight_host = &host_weight;
-        }
-
-        Tensor host_out(DataType::FP32, dst->m_shape);
-        host_out.m_data = powerserve::CPUBuffer::create_buffer<float>(dst->m_shape);
-
-        m_ggml_fallback->get_embedding(&host_out, weight_host, tokens);
-        this->copy(dst, &host_out);
         return;
     }
 
@@ -1137,84 +761,6 @@ void OpenCLBackend::get_embedding(const Tensor *dst,
         return;
     }
     clReleaseEvent(write_event);
-}
-
-void OpenCLBackend::matmul_cpu_ggml_fallback(
-    const Tensor *dst,
-    const Tensor *src0,
-    const Tensor *src1
-) const {
-    auto is_cpu_tensor = [](const Tensor *t) -> bool {
-        return dynamic_cast<powerserve::CPUBuffer *>(t->m_data.get()) != nullptr;
-    };
-
-    const Tensor *a_host = src0;
-    const Tensor *b_host = src1;
-
-    Tensor host_a;
-    Tensor host_b;
-
-    if (!is_cpu_tensor(src0)) {
-        host_a = Tensor(src0->m_dtype, src0->m_shape);
-        host_a.m_data = create_cpu_buffer_for_dtype(src0->m_dtype, src0->m_shape);
-        this->copy(&host_a, src0);
-        a_host = &host_a;
-    }
-
-    if (!is_cpu_tensor(src1)) {
-        host_b = Tensor(src1->m_dtype, src1->m_shape);
-        host_b.m_data = create_cpu_buffer_for_dtype(src1->m_dtype, src1->m_shape);
-        this->copy(&host_b, src1);   // supports quant bytes via ggml_compat_nbytes in opencl_tensor_ops.cpp
-        b_host = &host_b;
-    }
-
-    Tensor host_c(dst->m_dtype, dst->m_shape);
-    host_c.m_data = create_cpu_buffer_for_dtype(dst->m_dtype, dst->m_shape);
-
-    POWERSERVE_ASSERT(m_ggml_fallback && "m_ggml_fallback must be initialized in OpenCLBackend::initialize()");
-
-    const Tensor *w_host = a_host;
-    const Tensor *x_host = b_host;
-
-    const int64_t K_w = (int64_t)w_host->m_shape[0];
-    const int64_t N_w = (int64_t)w_host->m_shape[1];
-    const int64_t K_x = (int64_t)x_host->m_shape[0];
-    const int64_t M_x = (int64_t)x_host->m_shape[1];
-
-    const int64_t N_dst = (int64_t)dst->m_shape[0];
-    const int64_t M_dst = (int64_t)dst->m_shape[1];
-
-    if (!(K_w == K_x && N_w == N_dst && M_x == M_dst)) {
-        POWERSERVE_LOG_ERROR(
-            "matmul_cpu_ggml_fallback shape mismatch: "
-            "w=[K={},N={}] x=[K={},M={}] dst=[N={},M={}]",
-            (long long)K_w, (long long)N_w,
-            (long long)K_x, (long long)M_x,
-            (long long)N_dst, (long long)M_dst
-        );
-        POWERSERVE_ABORT("matmul_cpu_ggml_fallback: abort due to incompatible shapes (would trigger ggml assert)");
-    }
-
-    const size_t n_threads = (size_t)m_hparams.n_threads;
-    size_t required_wsize = sizeof(float) * (size_t)(K_w + 64) * n_threads;
-
-    {
-        const enum ggml_type vec_dot_type = m_ggml_fallback->get_vec_dot_type(x_host);
-        const enum ggml_type w_type       = powerserve::ggml::convert_datatype_to_ggml(w_host->m_dtype);
-        if (w_type != vec_dot_type) {
-            const size_t extra = (size_t)ggml_row_size(vec_dot_type, (int64_t)w_host->n_elements());
-            required_wsize = std::max(required_wsize, extra);
-        }
-    }
-
-    if (required_wsize > m_ggml_fallback_wsize) {
-        m_ggml_fallback->setup_work_data(required_wsize);
-        m_ggml_fallback_wsize = required_wsize;
-    }
-
-    m_ggml_fallback->matmul(&host_c, w_host, x_host);
-
-    this->copy(dst, &host_c);
 }
 
 OpenCLBackend::QuantSplitBuffers OpenCLBackend::get_or_create_split_q4_0(const Tensor* w) const {
@@ -1404,8 +950,6 @@ void OpenCLBackend::matmul_opencl_f16_f32(const Tensor* dst, const Tensor* w, co
     const cl_ulong nb12 = (cl_ulong)x_stride[2];
     const cl_ulong nb13 = (cl_ulong)x_stride[3];
 
-    const cl_ulong nb_dst1 = (cl_ulong)d_stride[1];
-
     const int r2 = std::max(1, ne12 / std::max(1, ne02));
     const int r3 = std::max(1, ne13 / std::max(1, ne03));
 
@@ -1418,7 +962,7 @@ void OpenCLBackend::matmul_opencl_f16_f32(const Tensor* dst, const Tensor* w, co
     const cl_ulong off_d  = (cl_ulong)d_cl->get_base_offset();
 
     // 1) GEMM local-memory kernel.
-    if (!disable_matmul_fast_f16_gemm() &&
+    if (!kDisableMatmulFastF16Gemm &&
         is_contiguous(w, 4) && is_contiguous(x, 4) && ne00 % 16 == 0 && ne11 > 1) {
         if (cl_kernel k = kernel_manager->get_kernel("kernel_mul_mm_f16_f32_l4_lm")) {
             const int stride_a = ne10;
@@ -1540,34 +1084,7 @@ void OpenCLBackend::matmul_opencl_f16_f32(const Tensor* dst, const Tensor* w, co
         return;
     }
 
-    if (disable_simple_matmul_fallback()) {
-        POWERSERVE_ABORT("matmul_opencl_f16_f32: non-simple path unavailable; simple fallback disabled");
-    }
-
-    // 4) Legacy simple fallback.
-    cl_kernel k = kernel_manager->get_kernel("kernel_mul_mat_f16_f32_simple");
-    POWERSERVE_ASSERT(k && "kernel_mul_mat_f16_f32_simple not found");
-
-    cl_uint arg = 0;
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &wmem));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_w));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &xmem));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_x));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &out));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_d));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne00));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne01));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne11));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb01));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb11));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb_dst1));
-
-    const size_t local[2]  = { 16, 16 };
-    const size_t global[2] = {
-        ((size_t)ne01 + local[0] - 1) / local[0] * local[0],
-        ((size_t)ne11 + local[1] - 1) / local[1] * local[1],
-    };
-    OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), k, 2, nullptr, global, local, 0, nullptr, nullptr));
+    POWERSERVE_ABORT("matmul_opencl_f16_f32: no available fast kernel path");
 }
 
 void OpenCLBackend::matmul_opencl_q4_0_f32(const Tensor* dst, const Tensor* w, const Tensor* x) const {
@@ -1603,7 +1120,7 @@ void OpenCLBackend::matmul_opencl_q4_0_f32(const Tensor* dst, const Tensor* w, c
     // Optional parity mode: force x into ggml-like q8 quantize-dequantize path
     // on GPU before entering q4 fast kernel.
     Tensor x_qdq_dev;
-    if (align_q8_fast_input_x()) {
+    if (kAlignQ8FastInputX) {
         x_qdq_dev = Tensor(DataType::FP32, x->m_shape);
         x_qdq_dev.m_data = this->create_buffer(x->m_shape, DataType::FP32);
         POWERSERVE_ASSERT(x_qdq_dev.m_data);
@@ -1644,20 +1161,10 @@ void OpenCLBackend::matmul_opencl_q4_0_f32(const Tensor* dst, const Tensor* w, c
         off_x = (cl_ulong)x_cl->get_base_offset();
     }
 
-    const bool force_simple = force_opencl_simple_matmul();
-
-    // Prefer ggml-style split-q + flat kernel unless explicitly forcing simple path.
-    if (!force_simple && !disable_matmul_fast_q4_0_8x()) {
+    // Prefer ggml-style split-q + flat kernel.
+    if (!kDisableMatmulFastQ4_0_8x) {
         cl_kernel k = kernel_manager->get_kernel("kernel_mul_mat_q4_0_f32_8x_flat");
         if (k) {
-        static int s_q4_fast_log_count = 0;
-        if (s_q4_fast_log_count < 4) {
-            POWERSERVE_LOG_INFO(
-                "[OCL-MATMUL] q4 fast path: kernel_mul_mat_q4_0_f32_8x_flat (K={}, N={}, M={}, B2={}, B3={})",
-                ne00, ne01, ne11, ne12, ne13
-            );
-            ++s_q4_fast_log_count;
-        }
         const auto split = get_or_create_split_q4_0(w);
         POWERSERVE_ASSERT(split.q && split.d);
 
@@ -1701,54 +1208,7 @@ void OpenCLBackend::matmul_opencl_q4_0_f32(const Tensor* dst, const Tensor* w, c
         }
     }
 
-    // Fallback to simple interleaved kernel.
-    if (!force_simple && disable_simple_matmul_fallback()) {
-        POWERSERVE_ABORT("matmul_opencl_q4_0_f32: non-simple path unavailable; simple fallback disabled");
-    }
-
-    const int K = ne00;
-    const int N = ne01;
-    const int M = ne11;
-    cl_kernel k = kernel_manager->get_kernel("kernel_mul_mat_q4_0_f32_simple");
-    POWERSERVE_ASSERT(k && "kernel_mul_mat_q4_0_f32_simple not found");
-    static int s_q4_simple_log_count = 0;
-    if (s_q4_simple_log_count < 4) {
-        POWERSERVE_LOG_INFO(
-            "[OCL-MATMUL] q4 simple path: kernel_mul_mat_q4_0_f32_simple (K={}, N={}, M={}, B2={}, B3={})",
-            ne00, ne01, ne11, ne12, ne13
-        );
-        ++s_q4_simple_log_count;
-    }
-
-    cl_mem wmem  = w_cl->get_device_buffer();
-    cl_mem xmem  = x_cl->get_device_buffer();
-    cl_mem out   = d_cl->get_device_buffer();
-    const cl_ulong off_w  = (cl_ulong)w_cl->get_base_offset();
-
-    const cl_ulong nb_w1   = (cl_ulong)w_cl->get_stride()[1];
-    const cl_ulong nb_x1   = (cl_ulong)x_cl->get_stride()[1];
-    const cl_ulong nb_dst1 = (cl_ulong)d_cl->get_stride()[1];
-
-    cl_uint arg = 0;
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &wmem));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_w));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &xmem));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_x));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &out));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_d));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &K));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &N));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &M));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb_w1));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb_x1));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb_dst1));
-
-    const size_t local[2]  = { 16, 16 };
-    const size_t global[2] = {
-        ((size_t)N + local[0] - 1) / local[0] * local[0],
-        ((size_t)M + local[1] - 1) / local[1] * local[1],
-    };
-    OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), k, 2, nullptr, global, local, 0, nullptr, nullptr));
+    POWERSERVE_ABORT("matmul_opencl_q4_0_f32: no available fast kernel path");
 }
 
 void OpenCLBackend::matmul_opencl_q8_0_f32(const Tensor* dst, const Tensor* w, const Tensor* x) const {
@@ -1790,21 +1250,12 @@ void OpenCLBackend::matmul_opencl_q8_0_f32(const Tensor* dst, const Tensor* w, c
     cl_mem out  = d_cl->get_device_buffer();
     POWERSERVE_ASSERT(qmem && dmem && xmem && out);
 
-    const bool force_simple = force_opencl_simple_matmul();
-    const bool want_align = align_q8_fast_input_x();
+    const bool want_align = kAlignQ8FastInputX;
     cl_kernel k_q8_intx = nullptr;
     cl_kernel k_q8_quant = nullptr;
-    if (!force_simple && want_align) {
+    if (want_align) {
         k_q8_intx = kernel_manager->get_kernel("kernel_mul_mv_q8_0_f32_intx_flat");
         k_q8_quant = kernel_manager->get_kernel("kernel_q8_quantize_x_f32");
-        static int s_q8_probe_log_count = 0;
-        if (s_q8_probe_log_count < 4) {
-            POWERSERVE_LOG_INFO(
-                "[OCL-MATMUL] q8 probe: want_align=1 intx_kernel={} quant_kernel={}",
-                k_q8_intx ? 1 : 0, k_q8_quant ? 1 : 0
-            );
-            ++s_q8_probe_log_count;
-        }
     }
 
     // Optional parity mode: force x into ggml-like q8 quantize-dequantize path
@@ -1855,15 +1306,7 @@ void OpenCLBackend::matmul_opencl_q8_0_f32(const Tensor* dst, const Tensor* w, c
 
     // New parity-first fast path:
     // x(fp32) -> q8 (x_q, x_d) once, then int-dot q8xq8 subgroup kernel.
-    if (!force_simple && want_align && k_q8_intx && k_q8_quant) {
-        static int s_q8_intx_log_count = 0;
-        if (s_q8_intx_log_count < 4) {
-            POWERSERVE_LOG_INFO(
-                "[OCL-MATMUL] q8 intx path: kernel_mul_mv_q8_0_f32_intx_flat (K={}, N={}, M={}, B2={}, B3={})",
-                ne00, ne01, ne11, ne12, ne13
-            );
-            ++s_q8_intx_log_count;
-        }
+    if (want_align && k_q8_intx && k_q8_quant) {
         auto x_q_buf = OpenCLBuffer::create_buffer<int8_t>(x->m_shape, memory_pool);
         POWERSERVE_ASSERT(x_q_buf && x_q_buf->get_device_buffer());
 
@@ -1951,18 +1394,10 @@ void OpenCLBackend::matmul_opencl_q8_0_f32(const Tensor* dst, const Tensor* w, c
         }
     }
 
-    // 1) Prefer ggml-style flat mv kernel for better numeric parity, unless explicitly forcing simple path.
-    if (!force_simple && !disable_matmul_fast_q8_0_mv()) {
+    // 1) Prefer ggml-style flat mv kernel for better numeric parity.
+    if (!kDisableMatmulFastQ8_0Mv) {
         cl_kernel k = kernel_manager->get_kernel("kernel_mul_mv_q8_0_f32_flat");
         if (k) {
-        static int s_q8_mv_log_count = 0;
-        if (s_q8_mv_log_count < 4) {
-            POWERSERVE_LOG_INFO(
-                "[OCL-MATMUL] q8 mv path: kernel_mul_mv_q8_0_f32_flat (K={}, N={}, M={}, B2={}, B3={})",
-                ne00, ne01, ne11, ne12, ne13
-            );
-            ++s_q8_mv_log_count;
-        }
         const auto w_stride = w_cl->get_stride();
         const auto x_stride = x_cl->get_stride();
         const cl_ulong nb01 = (cl_ulong)w_stride[1];
@@ -2007,16 +1442,8 @@ void OpenCLBackend::matmul_opencl_q8_0_f32(const Tensor* dst, const Tensor* w, c
     }
 
     // 2) GEMM-localmem kernel as secondary fast path.
-    if (!force_simple && !disable_matmul_fast_q8_0_gemm() && ne11 >= 32 && ne00 % 32 == 0) {
+    if (!kDisableMatmulFastQ8_0Gemm && ne11 >= 32 && ne00 % 32 == 0) {
         if (cl_kernel k = kernel_manager->get_kernel("kernel_mul_mm_q8_0_f32_l4_lm")) {
-            static int s_q8_gemm_log_count = 0;
-            if (s_q8_gemm_log_count < 4) {
-                POWERSERVE_LOG_INFO(
-                    "[OCL-MATMUL] q8 gemm path: kernel_mul_mm_q8_0_f32_l4_lm (K={}, N={}, M={}, B2={}, B3={})",
-                    ne00, ne01, ne11, ne12, ne13
-                );
-                ++s_q8_gemm_log_count;
-            }
             const int stride_a = ne10; // K
             const int stride_b = ne10; // K
             const int stride_d = ne01; // N
@@ -2055,51 +1482,7 @@ void OpenCLBackend::matmul_opencl_q8_0_f32(const Tensor* dst, const Tensor* w, c
         }
     }
 
-    // 3) Fallback to simple interleaved kernel.
-    if (!force_simple && disable_simple_matmul_fallback()) {
-        POWERSERVE_ABORT("matmul_opencl_q8_0_f32: non-simple path unavailable; simple fallback disabled");
-    }
-
-    const int K = ne00;
-    const int N = ne01;
-    const int M = ne11;
-    cl_kernel k = kernel_manager->get_kernel("kernel_mul_mat_q8_0_f32_simple");
-    POWERSERVE_ASSERT(k && "kernel_mul_mat_q8_0_f32_simple not found");
-    static int s_q8_simple_log_count = 0;
-    if (s_q8_simple_log_count < 4) {
-        POWERSERVE_LOG_INFO(
-            "[OCL-MATMUL] q8 simple path: kernel_mul_mat_q8_0_f32_simple (K={}, N={}, M={}, B2={}, B3={})",
-            ne00, ne01, ne11, ne12, ne13
-        );
-        ++s_q8_simple_log_count;
-    }
-
-    cl_mem wmem  = w_cl->get_device_buffer();
-    const cl_ulong off_w  = (cl_ulong)w_cl->get_base_offset();
-    const cl_ulong nb_w1   = (cl_ulong)w_cl->get_stride()[1];
-    const cl_ulong nb_x1   = (cl_ulong)x_cl->get_stride()[1];
-    const cl_ulong nb_dst1 = (cl_ulong)d_cl->get_stride()[1];
-
-    cl_uint arg = 0;
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &wmem));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_w));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &xmem));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_x));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &out));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_d));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &K));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &N));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &M));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb_w1));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb_x1));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb_dst1));
-
-    const size_t local[2]  = { 16, 16 };
-    const size_t global[2] = {
-        ((size_t)N + local[0] - 1) / local[0] * local[0],
-        ((size_t)M + local[1] - 1) / local[1] * local[1],
-    };
-    OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), k, 2, nullptr, global, local, 0, nullptr, nullptr));
+    POWERSERVE_ABORT("matmul_opencl_q8_0_f32: no available fast kernel path");
 }
 
 void OpenCLBackend::matmul_opencl_f32_f32(const Tensor* dst, const Tensor* w, const Tensor* x) const {
@@ -2138,8 +1521,6 @@ void OpenCLBackend::matmul_opencl_f32_f32(const Tensor* dst, const Tensor* w, co
     const cl_ulong nb12 = (cl_ulong)x_stride[2];
     const cl_ulong nb13 = (cl_ulong)x_stride[3];
 
-    const cl_ulong nb_dst1 = (cl_ulong)d_stride[1];
-
     const int r2 = std::max(1, ne12 / std::max(1, ne02));
     const int r3 = std::max(1, ne13 / std::max(1, ne03));
 
@@ -2152,7 +1533,7 @@ void OpenCLBackend::matmul_opencl_f32_f32(const Tensor* dst, const Tensor* w, co
     const cl_ulong off_d  = (cl_ulong)d_cl->get_base_offset();
 
     // 1) GEMM local-memory kernel.
-    if (!disable_matmul_fast_f32_gemm() &&
+    if (!kDisableMatmulFastF32Gemm &&
         is_contiguous(w, 4) && is_contiguous(x, 4) && ne00 % 16 == 0 && ne11 > 1) {
         if (cl_kernel k = kernel_manager->get_kernel("kernel_mul_mm_f32_f32_l4_lm")) {
             const int stride_a = ne10;
@@ -2238,35 +1619,7 @@ void OpenCLBackend::matmul_opencl_f32_f32(const Tensor* dst, const Tensor* w, co
         return;
     }
 
-    if (disable_simple_matmul_fallback()) {
-        POWERSERVE_ABORT("matmul_opencl_f32_f32: non-simple path unavailable; simple fallback disabled");
-    }
-
-    // 3) Legacy simple fallback.
-    cl_kernel k = kernel_manager->get_kernel("kernel_mul_mat_f32_f32_simple");
-    POWERSERVE_ASSERT(k && "kernel_mul_mat_f32_f32_simple not found");
-
-    cl_uint arg = 0;
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &wmem));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_w));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &xmem));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_x));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_mem), &out));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &off_d));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne00));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne01));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(int), &ne11));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb01));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb11));
-    OCL_RETURN_IF_ERROR(ctx, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb_dst1));
-
-    const size_t local[2]  = { 16, 16 };
-    const size_t global[2] = {
-        ((size_t)ne01 + local[0] - 1) / local[0] * local[0],
-        ((size_t)ne11 + local[1] - 1) / local[1] * local[1],
-    };
-
-    OCL_RETURN_IF_ERROR(ctx, clEnqueueNDRangeKernel(ctx->get_queue(), k, 2, nullptr, global, local, 0, nullptr, nullptr));
+    POWERSERVE_ABORT("matmul_opencl_f32_f32: no available fast kernel path");
 }
 
 void OpenCLBackend::matmul(const Tensor *dst, const Tensor *src0, const Tensor *src1) const {
@@ -2281,14 +1634,6 @@ void OpenCLBackend::matmul(const Tensor *dst, const Tensor *src0, const Tensor *
     if (!(src0->m_dtype == DataType::FP16 || src0->m_dtype == DataType::FP32 ||
           src0->m_dtype == DataType::GGML_Q4_0 || src0->m_dtype == DataType::GGML_Q8_0)) {
         POWERSERVE_ABORT("OpenCLBackend::matmul: unsupported weight dtype {} (no ggml fallback)", (int)src0->m_dtype);
-    }
-
-    if (force_matmul_ggml_fallback()) {
-        if (!m_ggml_fallback) {
-            POWERSERVE_ABORT("OpenCLBackend::matmul: ggml fallback not initialized");
-        }
-        matmul_cpu_ggml_fallback(dst, src0, src1);
-        return;
     }
 
     // Shapes: w=[K,N], x=[K,M], dst=[N,M]
@@ -2484,40 +1829,6 @@ void OpenCLBackend::rmsnorm(
         return;
     }
 
-    if (force_rmsnorm_ggml_fallback()) {
-        if (!m_ggml_fallback) {
-            POWERSERVE_ABORT("OpenCLBackend::rmsnorm: ggml fallback not initialized");
-        }
-
-        auto is_cpu_tensor = [](const Tensor *t) -> bool {
-            return dynamic_cast<powerserve::CPUBuffer *>(t->m_data.get()) != nullptr;
-        };
-
-        Tensor host_x;
-        Tensor host_w;
-        const Tensor *x_host = x;
-        const Tensor *w_host = weight;
-        if (!is_cpu_tensor(x)) {
-            host_x = Tensor(DataType::FP32, x->m_shape);
-            host_x.m_data = powerserve::CPUBuffer::create_buffer<float>(x->m_shape);
-            this->copy(&host_x, x);
-            x_host = &host_x;
-        }
-        if (!is_cpu_tensor(weight)) {
-            host_w = Tensor(DataType::FP32, weight->m_shape);
-            host_w.m_data = powerserve::CPUBuffer::create_buffer<float>(weight->m_shape);
-            this->copy(&host_w, weight);
-            w_host = &host_w;
-        }
-
-        Tensor host_o(DataType::FP32, o->m_shape);
-        host_o.m_data = powerserve::CPUBuffer::create_buffer<float>(o->m_shape);
-
-        m_ggml_fallback->rmsnorm(&host_o, x_host, w_host, eps);
-        this->copy(o, &host_o);
-        return;
-    }
-
     auto *self = const_cast<OpenCLBackend *>(this);
     auto *ctx = self->context.get();
     if (!ctx || !self->kernel_manager) {
@@ -2704,11 +2015,6 @@ void OpenCLBackend::rope(
 
     if (out->m_shape != src->m_shape) {
         POWERSERVE_LOG_ERROR("OpenCLBackend::rope requires out.shape == src.shape");
-        return;
-    }
-
-    if (force_rope_ggml_fallback()) {
-        fallback_to_cpu();
         return;
     }
 
@@ -3077,38 +2383,6 @@ void OpenCLBackend::softmax_ext(
         return;
     }
 
-    if (force_softmax_ext_ggml_fallback()) {
-        POWERSERVE_ASSERT(m_ggml_fallback && "OpenCLBackend::softmax_ext: ggml fallback not initialized");
-
-        auto is_cpu_tensor = [](const Tensor *t) -> bool {
-            return dynamic_cast<powerserve::CPUBuffer *>(t->m_data.get()) != nullptr;
-        };
-
-        Tensor host_x;
-        Tensor host_m;
-        const Tensor *x_host = x;
-        const Tensor *m_host = mask;
-        if (!is_cpu_tensor(x)) {
-            host_x = Tensor(DataType::FP32, x->m_shape);
-            host_x.m_data = powerserve::CPUBuffer::create_buffer<float>(x->m_shape);
-            this->copy(&host_x, x);
-            x_host = &host_x;
-        }
-        if (!is_cpu_tensor(mask)) {
-            host_m = Tensor(DataType::FP32, mask->m_shape);
-            host_m.m_data = powerserve::CPUBuffer::create_buffer<float>(mask->m_shape);
-            this->copy(&host_m, mask);
-            m_host = &host_m;
-        }
-
-        Tensor host_out(DataType::FP32, out->m_shape);
-        host_out.m_data = powerserve::CPUBuffer::create_buffer<float>(out->m_shape);
-
-        m_ggml_fallback->softmax_ext(&host_out, x_host, m_host, scale, max_bias);
-        this->copy(out, &host_out);
-        return;
-    }
-
     auto *self = const_cast<OpenCLBackend *>(this);
 
     const int n_dims_check = 4;
@@ -3153,7 +2427,7 @@ void OpenCLBackend::softmax_ext(
         return;
     }
 
-    const bool use_strict_softmax = force_softmax_ext_gpu_align();
+    const bool use_strict_softmax = false;
     const char *softmax_kernel_name = use_strict_softmax
         ? "kernel_soft_max_strict_backup"
         : "kernel_soft_max";
@@ -3255,3 +2529,4 @@ void OpenCLBackend::softmax_ext(
 }
 
 } // namespace powerserve::opencl
+

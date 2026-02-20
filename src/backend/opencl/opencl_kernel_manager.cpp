@@ -100,36 +100,6 @@ bool OpenCLKernelManager::compile_embedded_kernels() {
     }
 #endif // OPENCL_MATMUL_CL_AVAILABLE
 
-#ifdef OPENCL_MUL_MAT_Q4_0_F32_SIMPLE_CL_AVAILABLE
-    {
-        const std::string& src = ::powerserve::opencl::embedded::mul_mat_q4_0_f32_simple_cl_source;
-        if (!src.empty()) {
-            if (!compile_program("mul_mat_q4_0_f32_simple_kernels", src)) {
-                POWERSERVE_LOG_ERROR("Failed to compile mul_mat_q4_0_f32_simple kernels");
-                all_success = false;
-            }
-        } else {
-            POWERSERVE_LOG_ERROR("mul_mat_q4_0_f32_simple kernel source is empty!");
-            all_success = false;
-        }
-    }
-#endif
-
-#ifdef OPENCL_MUL_MAT_Q8_0_F32_SIMPLE_CL_AVAILABLE
-    {
-        const std::string& src = ::powerserve::opencl::embedded::mul_mat_q8_0_f32_simple_cl_source;
-        if (!src.empty()) {
-            if (!compile_program("mul_mat_q8_0_f32_simple_kernels", src)) {
-                POWERSERVE_LOG_ERROR("Failed to compile mul_mat_q8_0_f32_simple kernels");
-                all_success = false;
-            }
-        } else {
-            POWERSERVE_LOG_ERROR("mul_mat_q8_0_f32_simple kernel source is empty!");
-            all_success = false;
-        }
-    }
-#endif
-
 #ifdef OPENCL_Q8_ALIGN_X_F32_CL_AVAILABLE
     {
         const std::string& src = ::powerserve::opencl::embedded::q8_align_x_f32_cl_source;
@@ -456,12 +426,6 @@ bool OpenCLKernelManager::compile_program(const std::string& program_name,
     return true;
 }
 
-bool OpenCLKernelManager::extract_kernels_from_program(cl_program program,
-                                                      const std::string& program_name) {
-    
-    return true;
-}
-
 cl_kernel OpenCLKernelManager::get_kernel(const std::string& kernel_name) const {
     std::lock_guard<std::mutex> lock(mutex_);
     
@@ -559,24 +523,6 @@ cl_program OpenCLKernelManager::compile_program_impl(const std::string& source_c
 std::string OpenCLKernelManager::compute_source_hash(const std::string& source) {
     std::hash<std::string> hasher;
     return std::to_string(hasher(source));
-}
-
-bool OpenCLKernelManager::check_build_error(cl_program program, cl_device_id device) const {
-    cl_build_status status;
-    cl_int err = clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_STATUS,
-                                      sizeof(status), &status, nullptr);
-    return (err == CL_SUCCESS && status == CL_BUILD_SUCCESS);
-}
-
-std::string OpenCLKernelManager::get_program_build_log(cl_program program) const {
-    cl_device_id device = context_->get_device();
-    size_t log_size;
-    clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, nullptr, &log_size);
-    
-    std::vector<char> log(log_size);
-    clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, log_size, log.data(), nullptr);
-    
-    return std::string(log.data());
 }
 
 std::vector<std::string> OpenCLKernelManager::split_kernel_names(const std::string& source) {
@@ -679,4 +625,3 @@ std::vector<std::string> OpenCLKernelManager::split_kernel_names(const std::stri
 }
 
 } // namespace powerserve::opencl
-

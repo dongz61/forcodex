@@ -10,8 +10,8 @@ Output JSON only with this exact key order and labels from {positive,negative,ne
 Output exactly this token and nothing else: ACK
 
 # STRESS (5)
-In recent years, the landscape of artificial intelligence has been significantly transformed by the advent of large language models (LLMs). Traditionally, these models have been deployed in cloud environments due to their computational demands. However, the emergence of on-edge LLMs is reshaping how AI can be utilized at the edge of networks, offering numerous advantages in terms of latency, privacy, and accessibility.
-Write a concise abstract about deploying LLMs on edge devices, including latency, privacy, and energy tradeoffs.
-Summarize the pros and cons of cloud AI vs edge AI in 8 bullet points.
-You are a strict reviewer. Critique the following claim: "Bigger models are always better in production."
-Describe one failure mode where a model keeps repeating and never emits EOS, and suggest mitigations.
+Based on this passage, write a 3-sentence abstract (90-120 words) that explicitly covers latency, privacy, and energy tradeoffs: "In recent years, the landscape of artificial intelligence has been significantly transformed by the advent of large language models (LLMs). Traditionally, these models have been deployed in cloud environments due to their computational demands. However, the emergence of on-edge LLMs is reshaping how AI can be utilized at the edge of networks, offering numerous advantages in terms of latency, privacy, and accessibility."
+Provide exactly 8 bullet points comparing cloud AI vs edge AI; each bullet must start with either "Pro:" or "Con:" and include one concrete production example.
+You are a strict reviewer. Evaluate the claim "Bigger models are always better in production." Output exactly 4 sections with these headings: Verdict, Strongest Argument, Strongest Counterargument, Practical Recommendation.
+请用中文写一段 120-150 字分析：在手机端部署 LLM 的两个收益与两个风险，并给出一个可执行的折中方案。
+Given this incident timeline: 09:00 deploy v2.1, 09:07 error rate rises to 12%, 09:15 rollback starts, 09:22 error rate returns to 1.1%. Write a concise postmortem including root cause hypothesis, missing evidence, and exactly 3 follow-up actions.

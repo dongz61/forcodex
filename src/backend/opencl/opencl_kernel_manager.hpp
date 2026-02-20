@@ -130,14 +130,6 @@ private:
     std::string build_compile_options(const std::string& extra_options) const;
     cl_program compile_program_impl(const std::string& source_code, 
                                    const std::string& options);
-    bool extract_kernels_from_program(cl_program program, 
-                                     const std::string& program_name);
-    
-    // 错误处理
-    bool check_build_error(cl_program program, cl_device_id device) const;
-    std::string get_program_build_log(cl_program program) const;
-    
-    // 工具函数
     static std::string compute_source_hash(const std::string& source);
     static std::vector<std::string> split_kernel_names(const std::string& source);
     

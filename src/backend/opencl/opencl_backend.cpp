@@ -4,7 +4,6 @@
 #include "core/logger.hpp"
 #include "ggml.h"
 
-#include <iostream>
 #include <mutex>
 
 namespace powerserve::opencl {
@@ -32,10 +31,6 @@ OpenCLBackend::~OpenCLBackend() {
 
 void OpenCLBackend::cleanup() {
     if (!initialized) return;
-
-    std::cout << "[DEBUG] === CLEANUP TEST VERSION ===" << std::endl;
-
-    std::cout << "[DEBUG] 1. Cleaning OpenCL context first..." << std::endl;
     clear_quant_cache();
     {
         std::lock_guard<std::mutex> lock(m_resident_buffers_mutex);
@@ -43,19 +38,10 @@ void OpenCLBackend::cleanup() {
     }
     if (context) {
         context.reset();
-        std::cout << "[DEBUG] Context released" << std::endl;
     }
 
-    std::cout << "[DEBUG] 2. Cleaning memory pool..." << std::endl;
     if (memory_pool) {
         memory_pool.reset();
-        std::cout << "[DEBUG] Memory pool released" << std::endl;
-    }
-
-    std::cout << "[DEBUG] 3. Now cleaning thread pool..." << std::endl;
-    if (thread_pool) {
-        thread_pool.reset();
-        std::cout << "[DEBUG] Thread pool released" << std::endl;
     }
 
     m_ggml_fallback.reset();
@@ -64,7 +50,6 @@ void OpenCLBackend::cleanup() {
     m_tokens_capacity = 0;
 
     initialized = false;
-    std::cout << "[DEBUG] === CLEANUP DONE ===" << std::endl;
 }
 
 void OpenCLBackend::ensure_tokens_buffer(size_t token_count) const {
