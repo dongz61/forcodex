@@ -25,6 +25,8 @@
 #include "sampler/sampler.hpp"
 #include "tokenizer/tokenizer.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -56,6 +58,17 @@ Qwen2Model::~Qwen2Model() {
 auto Qwen2Model::forward(
     const std::vector<int> &tokens, const std::vector<int> &pos, const CausalAttentionMask &mask, bool lm_head
 ) -> LogitsVector {
+    struct LayerProfileAccum {
+        int64_t forwards = 0;
+        double sum_mean_layer_ms = 0.0;
+        double sum_mad_layer_ms = 0.0;
+        double sum_span_layer_ms = 0.0;
+    };
+
+    static LayerProfileAccum prefill_accum;
+    static LayerProfileAccum decode_accum;
+    static constexpr int64_t kDecodePrintInterval = 16;
+
     Graph g(m_config->model_id);
     // input embedding
     size_t batch_size  = tokens.size();
@@ -130,11 +143,24 @@ auto Qwen2Model::forward(
 
     Timer op_timer;
     size_t current_layer_idx = 0;
+    bool first_profiled_op = true;
     if (enable_ggml_layer_profile && !layer_op_ranges.empty()) {
         prev_hook = get_op_after_exec_hook();
         op_timer.reset();
         set_op_after_exec_hook(
-            [prev_hook, &op_timer, &layer_op_ranges, &layer_time_ns, &current_layer_idx](int op_idx, const OpNode *op) {
+            [prev_hook, &op_timer, &layer_op_ranges, &layer_time_ns, &current_layer_idx, &first_profiled_op](
+                int op_idx, const OpNode *op
+            ) {
+                // Ignore the first tick to avoid mixing Executor::plan() into layer-0 timing.
+                if (first_profiled_op) {
+                    first_profiled_op = false;
+                    op_timer.reset();
+                    if (prev_hook) {
+                        prev_hook(op_idx, op);
+                    }
+                    return;
+                }
+
                 const int64_t op_time_ns = op_timer.tick_ns();
                 while (current_layer_idx < layer_op_ranges.size() &&
                        op_idx >= layer_op_ranges[current_layer_idx].second) {
@@ -155,12 +181,51 @@ auto Qwen2Model::forward(
     executor.run();
     if (enable_ggml_layer_profile && !layer_op_ranges.empty()) {
         set_op_after_exec_hook(prev_hook);
-        int64_t layers_total_ns = 0;
-        for (size_t L = 0; L < layer_time_ns.size(); L++) {
-            layers_total_ns += layer_time_ns[L];
-            POWERSERVE_LOG_INFO("[GGML layer profile] layer {}: {:.3f} ms", L, layer_time_ns[L] / 1e6);
+
+        double mean_layer_ms = 0.0;
+        double mad_layer_ms = 0.0;
+        double min_layer_ms = 1e30;
+        double max_layer_ms = 0.0;
+        for (size_t L = 0; L < layer_time_ns.size(); ++L) {
+            const double layer_ms = layer_time_ns[L] / 1e6;
+            mean_layer_ms += layer_ms;
+            min_layer_ms = std::min(min_layer_ms, layer_ms);
+            max_layer_ms = std::max(max_layer_ms, layer_ms);
         }
-        POWERSERVE_LOG_INFO("[GGML layer profile] layers total: {:.3f} ms", layers_total_ns / 1e6);
+        mean_layer_ms /= std::max<size_t>(1, layer_time_ns.size());
+        for (size_t L = 0; L < layer_time_ns.size(); ++L) {
+            const double layer_ms = layer_time_ns[L] / 1e6;
+            mad_layer_ms += std::fabs(layer_ms - mean_layer_ms);
+        }
+        mad_layer_ms /= std::max<size_t>(1, layer_time_ns.size());
+        const double span_layer_ms = max_layer_ms - min_layer_ms;
+
+        const bool is_decode = tokens.size() == 1;
+        auto &accum = is_decode ? decode_accum : prefill_accum;
+        accum.forwards += 1;
+        accum.sum_mean_layer_ms += mean_layer_ms;
+        accum.sum_mad_layer_ms += mad_layer_ms;
+        accum.sum_span_layer_ms += span_layer_ms;
+
+        const bool should_print_decode = is_decode && (accum.forwards % kDecodePrintInterval == 0);
+        const bool should_print_prefill = !is_decode;
+        if (should_print_decode || should_print_prefill) {
+            const double avg_mean_layer_ms = accum.sum_mean_layer_ms / accum.forwards;
+            const double avg_mad_layer_ms = accum.sum_mad_layer_ms / accum.forwards;
+            const double avg_span_layer_ms = accum.sum_span_layer_ms / accum.forwards;
+            POWERSERVE_LOG_INFO(
+                "[GGML layer profile][{}] fwds={} cur(mean={:.3f} ms, mad={:.3f} ms, span={:.3f} ms) "
+                "avg(mean={:.3f} ms, mad={:.3f} ms, span={:.3f} ms)",
+                is_decode ? "decode" : "prefill",
+                accum.forwards,
+                mean_layer_ms,
+                mad_layer_ms,
+                span_layer_ms,
+                avg_mean_layer_ms,
+                avg_mad_layer_ms,
+                avg_span_layer_ms
+            );
+        }
     }
 #if defined(POWERSERVE_WITH_QNN)
     if (!m_platform->qnn_backend)

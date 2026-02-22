@@ -1,26 +1,26 @@
 add_executable(quant_mul_mat "quant_mul_mat.cpp")
 target_link_libraries(quant_mul_mat PRIVATE powerserve ggml)
 
-add_executable(decode_layer_profile_test "decode_layer_profile_test.cpp")
-target_link_libraries(decode_layer_profile_test PRIVATE powerserve ggml)
+add_executable(kv_cache_persist_test "kv_cache_persist_test.cpp")
+target_link_libraries(kv_cache_persist_test PRIVATE powerserve)
 
 if (NOT MSVC)
-    target_compile_options(decode_layer_profile_test PRIVATE
+    target_compile_options(kv_cache_persist_test PRIVATE
         -Wall
         -Wextra
         -Wno-unused-parameter
     )
 endif()
 
-target_include_directories(decode_layer_profile_test PRIVATE
+target_include_directories(kv_cache_persist_test PRIVATE
     ${CMAKE_SOURCE_DIR}
 )
 
-add_custom_target(run_decode_layer_profile_test
-    COMMAND ./decode_layer_profile_test
-    DEPENDS decode_layer_profile_test
+add_custom_target(run_kv_cache_persist_test
+    COMMAND ./kv_cache_persist_test
+    DEPENDS kv_cache_persist_test
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
-    COMMENT "Running GGML decode-first-step layer profile test..."
+    COMMENT "Running KV cache persist test..."
 )
 
 if (POWERSERVE_WITH_QNN)
