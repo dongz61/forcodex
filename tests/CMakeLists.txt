@@ -1,6 +1,28 @@
 add_executable(quant_mul_mat "quant_mul_mat.cpp")
 target_link_libraries(quant_mul_mat PRIVATE powerserve ggml)
 
+add_executable(decode_layer_profile_test "decode_layer_profile_test.cpp")
+target_link_libraries(decode_layer_profile_test PRIVATE powerserve ggml)
+
+if (NOT MSVC)
+    target_compile_options(decode_layer_profile_test PRIVATE
+        -Wall
+        -Wextra
+        -Wno-unused-parameter
+    )
+endif()
+
+target_include_directories(decode_layer_profile_test PRIVATE
+    ${CMAKE_SOURCE_DIR}
+)
+
+add_custom_target(run_decode_layer_profile_test
+    COMMAND ./decode_layer_profile_test
+    DEPENDS decode_layer_profile_test
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+    COMMENT "Running GGML decode-first-step layer profile test..."
+)
+
 if (POWERSERVE_WITH_QNN)
     add_executable(qnn_test qnn_test.cpp)
     target_link_libraries(qnn_test PRIVATE powerserve CLI11::CLI11)
