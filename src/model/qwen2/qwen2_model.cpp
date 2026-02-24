@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -34,6 +35,15 @@
 #include <vector>
 
 namespace powerserve {
+
+static int get_ggml_segment_layers() {
+    const char *v = std::getenv("POWERSERVE_GGML_SEGMENT_LAYERS");
+    if (!v) {
+        return 0;
+    }
+    const int n = std::atoi(v);
+    return n > 0 ? n : 0;
+}
 
 Qwen2Model::Qwen2Model(const std::string &filename, const std::shared_ptr<ModelConfig> &config) : Model(filename) {
     {
@@ -69,14 +79,88 @@ auto Qwen2Model::forward(
     static LayerProfileAccum decode_accum;
     static constexpr int64_t kDecodePrintInterval = 16;
 
+    const size_t batch_size = tokens.size();
+    auto &llm_config = m_config->llm;
+
+    bool has_qnn_backend = false;
+#if defined(POWERSERVE_WITH_QNN)
+    has_qnn_backend = (m_platform->qnn_backend != nullptr);
+#endif
+
+    const bool use_opencl = m_platform->using_opencl(m_config->model_id);
+    const int segment_layers = get_ggml_segment_layers();
+    const bool use_segmented_ggml =
+        !lazy_load &&
+        !use_opencl &&
+        !has_qnn_backend &&
+        segment_layers > 0 &&
+        static_cast<size_t>(segment_layers) < llm_config.n_layers;
+
+    if (use_segmented_ggml) {
+        auto *ggml_backend = m_platform->ggml_backends[m_config->model_id].get();
+        ggml_backend->reset_kv_batch_size(batch_size);
+
+        Tensor segment_x;
+        bool has_segment_x = false;
+        Tensor detached_logits;
+
+        for (size_t begin = 0; begin < llm_config.n_layers; begin += static_cast<size_t>(segment_layers)) {
+            const size_t end = std::min(begin + static_cast<size_t>(segment_layers), llm_config.n_layers);
+            const bool is_last_segment = end == llm_config.n_layers;
+
+            Graph g(m_config->model_id);
+            TensorNode *x = nullptr;
+
+            if (!has_segment_x) {
+                auto embd_tb = g.add_tensor(m_weights->token_embedding_table);
+                x = g.get_embedding(embd_tb, tokens);
+            } else {
+                x = g.add_tensor(segment_x);
+            }
+
+            for (size_t L = begin; L < end; ++L) {
+                auto [k_cache, v_cache] = ggml_backend->m_kv->get_cache(L);
+                auto att_o = m_attn->build(g, x, L, g.add_tensor(k_cache), g.add_tensor(v_cache), pos, mask, true);
+                auto ffn_o = m_ffn->build(g, att_o, L);
+                x = ffn_o;
+            }
+
+            TensorNode *logits = nullptr;
+            if (is_last_segment && lm_head) {
+                auto rms_final_w = g.add_tensor(m_weights->rms_final_weight);
+                auto final_rms_norm = g.rms_norm(x, rms_final_w, llm_config.norm_eps);
+                auto output_w = g.add_tensor(m_weights->output_weight);
+                logits = g.mat_mul(output_w, final_rms_norm);
+            }
+
+            Executor executor(*m_platform, g);
+            executor.allocate_buffers();
+            executor.run();
+
+            if (is_last_segment) {
+                if (lm_head) {
+                    detached_logits = *logits;
+                }
+            } else {
+                segment_x = *x;
+                has_segment_x = true;
+            }
+        }
+
+        ggml_backend->m_kv->advance(batch_size);
+
+        if (!lm_head) {
+            return LogitsVector();
+        }
+
+        return LogitsVector(detached_logits.m_data, m_config->llm.vocab_size, batch_size);
+    }
+
     Graph g(m_config->model_id);
     // input embedding
-    size_t batch_size  = tokens.size();
     auto embd_tb       = g.add_tensor(m_weights->token_embedding_table);
     auto x             = g.get_embedding(embd_tb, tokens);
     TensorNode *logits = nullptr;
-
-    auto &llm_config = m_config->llm;
     bool enable_ggml_layer_profile = false;
     std::vector<std::pair<int, int>> layer_op_ranges;
     std::vector<int64_t> layer_time_ns;
