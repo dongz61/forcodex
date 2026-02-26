@@ -19,10 +19,14 @@
 #include "tokenizer/tokenizer.hpp"
 
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace powerserve {
+namespace ggml {
+struct GGMLKVPager;
+}
 
 struct Qwen2Model : Model {
 public:
@@ -30,6 +34,7 @@ public:
     ggml_context *ggml_ctx;
     gguf_context *gguf_ctx;
     bool lazy_load;
+    std::unique_ptr<ggml::GGMLKVPager> m_kv_pager;
 
 public:
     explicit Qwen2Model(const std::string &filename, const std::shared_ptr<ModelConfig> &config);

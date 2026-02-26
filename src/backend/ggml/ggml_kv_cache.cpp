@@ -42,8 +42,8 @@ void GGMLKV::prepare_model_chunk() {
     value_buffer.resize(m_n_layers);
     size_t layer_size = m_kv_dim * m_n_ctx;
     for (size_t L = 0; L < m_n_layers; L++) {
-        key_buffer[L].reserve(layer_size);
-        value_buffer[L].reserve(layer_size);
+        key_buffer[L].resize(layer_size);
+        value_buffer[L].resize(layer_size);
 
         chunk.key_tensors.emplace_back(Tensor(DataType::FP32, {m_n_ctx, m_kv_dim, 1, 1}));
         chunk.value_tensors.emplace_back(Tensor(DataType::FP32, {m_n_ctx, m_kv_dim, 1, 1}));
@@ -60,12 +60,12 @@ void GGMLKV::prepare_model_chunk() {
     k.resize(m_n_layers);
     v.resize(m_n_layers);
     for (size_t L = 0; L < m_n_layers; L++) {
-        k[L].reserve(m_batch_size * m_kv_dim);
-        v[L].reserve(m_batch_size * m_kv_dim);
+        k[L].resize(m_batch_size * m_kv_dim);
+        v[L].resize(m_batch_size * m_kv_dim);
     }
 
     auto &attn_bias = chunk.attn_bias;
-    attn_bias.reserve(m_batch_size * m_n_ctx);
+    attn_bias.resize(m_batch_size * m_n_ctx);
 }
 
 } // namespace powerserve::ggml

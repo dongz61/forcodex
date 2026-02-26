@@ -15,6 +15,7 @@
 #include "qwen2_model.hpp"
 
 #include "backend/cpu_buffer.hpp"
+#include "backend/ggml/ggml_kv_pager.hpp"
 #include "core/logger.hpp"
 #include "core/perfetto_trace.hpp"
 #include "core/timer.hpp"
@@ -43,6 +44,50 @@ static int get_ggml_segment_layers() {
     }
     const int n = std::atoi(v);
     return n > 0 ? n : 0;
+}
+
+static bool is_ggml_layer_profile_enabled() {
+    const char *v = std::getenv("POWERSERVE_GGML_LAYER_PROFILE");
+    if (!v) {
+        return false;
+    }
+    return std::strcmp(v, "1") == 0 ||
+           std::strcmp(v, "true") == 0 ||
+           std::strcmp(v, "TRUE") == 0 ||
+           std::strcmp(v, "on") == 0 ||
+           std::strcmp(v, "ON") == 0;
+}
+
+static bool is_kv_pager_enabled() {
+    const char *v = std::getenv("POWERSERVE_KV_PAGER");
+    if (!v) {
+        return false;
+    }
+    return std::strcmp(v, "1") == 0 ||
+           std::strcmp(v, "true") == 0 ||
+           std::strcmp(v, "TRUE") == 0 ||
+           std::strcmp(v, "on") == 0 ||
+           std::strcmp(v, "ON") == 0;
+}
+
+static bool is_kv_pager_sync_enabled() {
+    const char *v = std::getenv("POWERSERVE_KV_PAGER_SYNC_EACH_STEP");
+    if (!v) {
+        return false;
+    }
+    return std::strcmp(v, "1") == 0 ||
+           std::strcmp(v, "true") == 0 ||
+           std::strcmp(v, "TRUE") == 0 ||
+           std::strcmp(v, "on") == 0 ||
+           std::strcmp(v, "ON") == 0;
+}
+
+static std::string get_kv_pager_file_path(const std::string &weights_path, const std::string &model_id) {
+    const char *env = std::getenv("POWERSERVE_KV_PAGER_FILE");
+    if (env && env[0] != '\0') {
+        return env;
+    }
+    return weights_path + "." + model_id + ".kvpager.bin";
 }
 
 Qwen2Model::Qwen2Model(const std::string &filename, const std::shared_ptr<ModelConfig> &config) : Model(filename) {
@@ -99,14 +144,50 @@ auto Qwen2Model::forward(
     if (use_segmented_ggml) {
         auto *ggml_backend = m_platform->ggml_backends[m_config->model_id].get();
         ggml_backend->reset_kv_batch_size(batch_size);
+        const bool is_decode = tokens.size() == 1 && pos.size() == 1;
+        const bool use_kv_pager = is_decode && is_kv_pager_enabled();
+        const bool pager_do_sync = is_kv_pager_sync_enabled();
+
+        if (use_kv_pager) {
+            if (!m_kv_pager) {
+                m_kv_pager = std::make_unique<ggml::GGMLKVPager>(
+                    *ggml_backend->m_kv,
+                    get_kv_pager_file_path(m_filename, m_config->model_id)
+                );
+            }
+            if (!m_kv_pager->valid()) {
+                POWERSERVE_LOG_WARN("KV pager is not valid. pager is disabled for this forward.");
+            } else if (pos[0] == 0) {
+                m_kv_pager->reset_runtime_state();
+            }
+        }
+        const bool pager_active =
+            use_kv_pager &&
+            m_kv_pager &&
+            m_kv_pager->valid();
 
         Tensor segment_x;
         bool has_segment_x = false;
         Tensor detached_logits;
 
         for (size_t begin = 0; begin < llm_config.n_layers; begin += static_cast<size_t>(segment_layers)) {
-            const size_t end = std::min(begin + static_cast<size_t>(segment_layers), llm_config.n_layers);
+            const size_t end = std::min(
+                begin + static_cast<size_t>(segment_layers),
+                static_cast<size_t>(llm_config.n_layers)
+            );
             const bool is_last_segment = end == llm_config.n_layers;
+            const size_t cur_pos = static_cast<size_t>(pos.back());
+            const size_t tokens_before_step = cur_pos;
+            const size_t tokens_after_step = cur_pos + 1;
+
+            if (pager_active) {
+                for (size_t L = begin; L < end; ++L) {
+                    if (!m_kv_pager->acquire_layer(L, tokens_before_step)) {
+                        POWERSERVE_LOG_ERROR("KV pager acquire failed at layer {}", L);
+                        POWERSERVE_ABORT("KV pager acquire failure");
+                    }
+                }
+            }
 
             Graph g(m_config->model_id);
             TensorNode *x = nullptr;
@@ -137,6 +218,18 @@ auto Qwen2Model::forward(
             executor.allocate_buffers();
             executor.run();
 
+            if (pager_active) {
+                for (size_t L = begin; L < end; ++L) {
+                    m_kv_pager->mark_dirty_layer(L);
+                    if (L > 0) {
+                        if (!m_kv_pager->evict_layer(L - 1, tokens_after_step, false)) {
+                            POWERSERVE_LOG_ERROR("KV pager evict failed at layer {}", L - 1);
+                            POWERSERVE_ABORT("KV pager evict failure");
+                        }
+                    }
+                }
+            }
+
             if (is_last_segment) {
                 if (lm_head) {
                     detached_logits = *logits;
@@ -144,6 +237,12 @@ auto Qwen2Model::forward(
             } else {
                 segment_x = *x;
                 has_segment_x = true;
+            }
+        }
+
+        if (pager_active && pager_do_sync) {
+            if (!m_kv_pager->sync()) {
+                POWERSERVE_LOG_WARN("KV pager sync failed");
             }
         }
 
@@ -161,7 +260,7 @@ auto Qwen2Model::forward(
     auto embd_tb       = g.add_tensor(m_weights->token_embedding_table);
     auto x             = g.get_embedding(embd_tb, tokens);
     TensorNode *logits = nullptr;
-    bool enable_ggml_layer_profile = false;
+    const bool enable_ggml_layer_profile = is_ggml_layer_profile_enabled();
     std::vector<std::pair<int, int>> layer_op_ranges;
     std::vector<int64_t> layer_time_ns;
     OpAfterExecHook prev_hook = nullptr;
@@ -191,9 +290,10 @@ auto Qwen2Model::forward(
                 m_platform->opencl_backends[m_config->model_id]->reset_kv_batch_size(batch_size);
             } else {
                 m_platform->ggml_backends[m_config->model_id]->reset_kv_batch_size(batch_size);
-                enable_ggml_layer_profile = true;
-                layer_op_ranges.reserve(llm_config.n_layers);
-                layer_time_ns.assign(llm_config.n_layers, 0);
+                if (enable_ggml_layer_profile) {
+                    layer_op_ranges.reserve(llm_config.n_layers);
+                    layer_time_ns.assign(llm_config.n_layers, 0);
+                }
             }
             for (size_t L = 0; L < llm_config.n_layers; L++) {
                 const int layer_op_begin = (!use_opencl) ? static_cast<int>(g.ops.size()) : -1;
@@ -208,7 +308,7 @@ auto Qwen2Model::forward(
                     auto ffn_o = m_ffn->build(g, att_o, L);
                     x          = ffn_o;
                 }
-                if (!use_opencl) {
+                if (!use_opencl && enable_ggml_layer_profile) {
                     layer_op_ranges.emplace_back(layer_op_begin, static_cast<int>(g.ops.size()));
                 }
             }
