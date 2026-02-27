@@ -161,8 +161,8 @@ void GGMLBackend::add_cache(const Tensor *k, const Tensor *v, size_t L, const st
 
     float *src_k  = static_cast<float *>(k->get<CPUBuffer>().m_data); // (kv_dim, batch_size, 1, 1)
     float *src_v  = static_cast<float *>(v->get<CPUBuffer>().m_data); // (kv_dim, batch_size, 1, 1)
-    float *dst_kb = m_kv->chunk.key_buffer[L].data() + kv_dim * cur_position;
-    float *dst_vb = m_kv->chunk.value_buffer[L].data() + kv_dim * cur_position;
+    float *dst_kb = m_kv->key_buffer_for_layer(L).data() + kv_dim * cur_position;
+    float *dst_vb = m_kv->value_buffer_for_layer(L).data() + kv_dim * cur_position;
     memcpy(dst_kb, src_k, kv_dim * batch_size * sizeof(float));
     memcpy(dst_vb, src_v, kv_dim * batch_size * sizeof(float));
 }

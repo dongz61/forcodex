@@ -141,30 +141,40 @@ auto Qwen2Model::forward(
         segment_layers > 0 &&
         static_cast<size_t>(segment_layers) < llm_config.n_layers;
 
+    if (!use_segmented_ggml && !lazy_load && !use_opencl && !has_qnn_backend) {
+        auto *ggml_backend = m_platform->ggml_backends[m_config->model_id].get();
+        if (ggml_backend->m_kv->slot_mode_enabled()) {
+            POWERSERVE_ABORT("slot mode requires segmented execution (set POWERSERVE_GGML_SEGMENT_LAYERS > 0)");
+        }
+    }
+
     if (use_segmented_ggml) {
         auto *ggml_backend = m_platform->ggml_backends[m_config->model_id].get();
+        auto *ggml_kv = ggml_backend->m_kv.get();
         ggml_backend->reset_kv_batch_size(batch_size);
-        const bool is_decode = tokens.size() == 1 && pos.size() == 1;
-        const bool use_kv_pager = is_decode && is_kv_pager_enabled();
+        const bool use_kv_pager = is_kv_pager_enabled() || ggml_kv->slot_mode_enabled();
         const bool pager_do_sync = is_kv_pager_sync_enabled();
 
         if (use_kv_pager) {
             if (!m_kv_pager) {
-                m_kv_pager = std::make_unique<ggml::GGMLKVPager>(
-                    *ggml_backend->m_kv,
-                    get_kv_pager_file_path(m_filename, m_config->model_id)
-                );
+                m_kv_pager = std::make_unique<ggml::GGMLKVPager>(*ggml_kv, get_kv_pager_file_path(m_filename, m_config->model_id));
             }
             if (!m_kv_pager->valid()) {
                 POWERSERVE_LOG_WARN("KV pager is not valid. pager is disabled for this forward.");
-            } else if (pos[0] == 0) {
+            } else if (!pos.empty() && pos[0] == 0) {
                 m_kv_pager->reset_runtime_state();
+                if (ggml_kv->slot_mode_enabled()) {
+                    ggml_kv->clear_all_mappings();
+                }
             }
         }
         const bool pager_active =
             use_kv_pager &&
             m_kv_pager &&
             m_kv_pager->valid();
+        if (ggml_kv->slot_mode_enabled() && !pager_active) {
+            POWERSERVE_ABORT("slot mode requires KV pager to be active");
+        }
 
         Tensor segment_x;
         bool has_segment_x = false;
@@ -176,12 +186,38 @@ auto Qwen2Model::forward(
                 static_cast<size_t>(llm_config.n_layers)
             );
             const bool is_last_segment = end == llm_config.n_layers;
-            const size_t cur_pos = static_cast<size_t>(pos.back());
-            const size_t tokens_before_step = cur_pos;
-            const size_t tokens_after_step = cur_pos + 1;
+            const size_t tokens_before_step = pos.empty() ? 0 : static_cast<size_t>(pos.front());
+            const size_t tokens_after_step = pos.empty() ? 0 : static_cast<size_t>(pos.back() + 1);
 
             if (pager_active) {
                 for (size_t L = begin; L < end; ++L) {
+                    if (ggml_kv->layer_to_slot(L) < 0) {
+                        int free_slot = ggml_kv->find_free_slot();
+                        if (free_slot < 0) {
+                            const size_t keep = ggml_kv->slot_window_size();
+                            size_t victim_layer = (L >= keep) ? (L - keep) : 0;
+                            if (ggml_kv->layer_to_slot(victim_layer) < 0) {
+                                bool found = false;
+                                for (size_t s = 0; s < ggml_kv->m_slot_to_layer.size(); ++s) {
+                                    if (ggml_kv->m_slot_to_layer[s] >= 0) {
+                                        victim_layer = static_cast<size_t>(ggml_kv->m_slot_to_layer[s]);
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                                POWERSERVE_ASSERT(found, "no victim layer found while all slots are occupied");
+                            }
+                            if (!m_kv_pager->evict_layer(victim_layer, tokens_before_step, false)) {
+                                POWERSERVE_LOG_ERROR("KV pager evict(victim) failed at layer {}", victim_layer);
+                                POWERSERVE_ABORT("KV pager evict victim failure");
+                            }
+                            const int victim_slot = ggml_kv->layer_to_slot(victim_layer);
+                            POWERSERVE_ASSERT(victim_slot >= 0);
+                            ggml_kv->unbind_layer(victim_layer);
+                            free_slot = victim_slot;
+                        }
+                        ggml_kv->bind_layer_to_slot(L, static_cast<size_t>(free_slot));
+                    }
                     if (!m_kv_pager->acquire_layer(L, tokens_before_step)) {
                         POWERSERVE_LOG_ERROR("KV pager acquire failed at layer {}", L);
                         POWERSERVE_ABORT("KV pager acquire failure");
@@ -221,11 +257,17 @@ auto Qwen2Model::forward(
             if (pager_active) {
                 for (size_t L = begin; L < end; ++L) {
                     m_kv_pager->mark_dirty_layer(L);
-                    if (L > 0) {
-                        if (!m_kv_pager->evict_layer(L - 1, tokens_after_step, false)) {
-                            POWERSERVE_LOG_ERROR("KV pager evict failed at layer {}", L - 1);
+                    const size_t keep = ggml_kv->slot_window_size();
+                    if (L >= keep) {
+                        const size_t victim_layer = L - keep;
+                        if (ggml_kv->layer_to_slot(victim_layer) < 0) {
+                            continue;
+                        }
+                        if (!m_kv_pager->evict_layer(victim_layer, tokens_after_step, false)) {
+                            POWERSERVE_LOG_ERROR("KV pager evict failed at layer {}", victim_layer);
                             POWERSERVE_ABORT("KV pager evict failure");
                         }
+                        ggml_kv->unbind_layer(victim_layer);
                     }
                 }
             }

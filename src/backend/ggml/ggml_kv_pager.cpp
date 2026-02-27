@@ -73,14 +73,6 @@ GGMLKVPager::GGMLKVPager(GGMLKV &kv, const std::string &file_path) :
         return;
     }
 
-    POWERSERVE_LOG_INFO(
-        "KV pager ready: path={} layers={} n_ctx={} kv_dim={} layer_bytes={}",
-        m_file_path,
-        m_n_layers,
-        m_n_ctx,
-        m_kv_dim,
-        m_layer_bytes
-    );
 }
 
 GGMLKVPager::~GGMLKVPager() {
@@ -91,7 +83,7 @@ GGMLKVPager::~GGMLKVPager() {
 }
 
 void GGMLKVPager::reset_runtime_state() {
-    std::fill(m_layer_states.begin(), m_layer_states.end(), LayerState::ResidentClean);
+    std::fill(m_layer_states.begin(), m_layer_states.end(), LayerState::Unloaded);
     std::fill(m_persisted_tokens.begin(), m_persisted_tokens.end(), 0);
 }
 
@@ -103,27 +95,21 @@ bool GGMLKVPager::acquire_layer(size_t layer_id, size_t need_tokens) {
         return true;
     }
 
-    const size_t capped_need = std::min(need_tokens, m_n_ctx);
-    const size_t load_tokens = std::min(capped_need, m_persisted_tokens[layer_id]);
-    const size_t load_bytes = load_tokens * m_kv_dim * sizeof(float);
-
-    auto &k = m_kv.chunk.key_buffer[layer_id];
-    auto &v = m_kv.chunk.value_buffer[layer_id];
-    if (load_bytes > 0) {
-        if (!pread_all(k.data(), load_bytes, offset_k(layer_id))) {
+    auto &k = m_kv.key_buffer_for_layer(layer_id);
+    auto &v = m_kv.value_buffer_for_layer(layer_id);
+    POWERSERVE_UNUSED(need_tokens);
+    if (m_persisted_tokens[layer_id] > 0) {
+        if (!pread_all(k.data(), m_layer_bytes, offset_k(layer_id))) {
             POWERSERVE_LOG_ERROR("KV pager acquire K failed: layer={} err={}", layer_id, std::strerror(errno));
             return false;
         }
-        if (!pread_all(v.data(), load_bytes, offset_v(layer_id))) {
+        if (!pread_all(v.data(), m_layer_bytes, offset_v(layer_id))) {
             POWERSERVE_LOG_ERROR("KV pager acquire V failed: layer={} err={}", layer_id, std::strerror(errno));
             return false;
         }
-    }
-
-    const size_t need_bytes = capped_need * m_kv_dim * sizeof(float);
-    if (need_bytes > load_bytes) {
-        std::memset(static_cast<char *>(static_cast<void *>(k.data())) + load_bytes, 0, need_bytes - load_bytes);
-        std::memset(static_cast<char *>(static_cast<void *>(v.data())) + load_bytes, 0, need_bytes - load_bytes);
+    } else {
+        std::fill(k.begin(), k.end(), 0.0f);
+        std::fill(v.begin(), v.end(), 0.0f);
     }
 
     m_layer_states[layer_id] = LayerState::ResidentClean;
@@ -149,25 +135,57 @@ bool GGMLKVPager::evict_layer(size_t layer_id, size_t valid_tokens, bool do_sync
 
     const size_t capped_tokens = std::min(valid_tokens, m_n_ctx);
     if (m_layer_states[layer_id] == LayerState::ResidentDirty) {
-        const size_t write_bytes = capped_tokens * m_kv_dim * sizeof(float);
-        auto &k = m_kv.chunk.key_buffer[layer_id];
-        auto &v = m_kv.chunk.value_buffer[layer_id];
+        auto &k = m_kv.key_buffer_for_layer(layer_id);
+        auto &v = m_kv.value_buffer_for_layer(layer_id);
+        if (capped_tokens > 0) {
+            const size_t start_token = std::min(m_persisted_tokens[layer_id], capped_tokens);
+            const size_t n_tokens = capped_tokens - start_token;
+            if (n_tokens > 0) {
+                const size_t token_bytes = m_kv_dim * sizeof(float);
 
-        if (write_bytes > 0) {
-            if (!pwrite_all(k.data(), write_bytes, offset_k(layer_id))) {
-                POWERSERVE_LOG_ERROR("KV pager evict K failed: layer={} err={}", layer_id, std::strerror(errno));
-                return false;
-            }
-            if (!pwrite_all(v.data(), write_bytes, offset_v(layer_id))) {
-                POWERSERVE_LOG_ERROR("KV pager evict V failed: layer={} err={}", layer_id, std::strerror(errno));
-                return false;
+                // K layout is pos-major contiguous: [pos][kv_dim]
+                const float *k_src = k.data() + start_token * m_kv_dim;
+                const int64_t k_off = offset_k(layer_id) + static_cast<int64_t>(start_token * token_bytes);
+                const size_t k_bytes = n_tokens * token_bytes;
+                if (!pwrite_all(k_src, k_bytes, k_off)) {
+                    POWERSERVE_LOG_ERROR(
+                        "KV pager evict K(range) failed: layer={} start={} n_tokens={} err={}",
+                        layer_id,
+                        start_token,
+                        n_tokens,
+                        std::strerror(errno)
+                    );
+                    return false;
+                }
+
+                // V layout is dim-major over ctx: [kv_dim][n_ctx]
+                // For each dim, [start_token, start_token + n_tokens) is contiguous.
+                const size_t v_seg_bytes = n_tokens * sizeof(float);
+                for (size_t d = 0; d < m_kv_dim; ++d) {
+                    const float *v_src = v.data() + d * m_n_ctx + start_token;
+                    const int64_t v_off =
+                        offset_v(layer_id) + static_cast<int64_t>((d * m_n_ctx + start_token) * sizeof(float));
+                    if (!pwrite_all(v_src, v_seg_bytes, v_off)) {
+                        POWERSERVE_LOG_ERROR(
+                            "KV pager evict V(range) failed: layer={} dim={} start={} n_tokens={} err={}",
+                            layer_id,
+                            d,
+                            start_token,
+                            n_tokens,
+                            std::strerror(errno)
+                        );
+                        return false;
+                    }
+                }
             }
         }
-        m_persisted_tokens[layer_id] = std::max(m_persisted_tokens[layer_id], capped_tokens);
+        m_persisted_tokens[layer_id] = capped_tokens;
     }
 
-    std::fill(m_kv.chunk.key_buffer[layer_id].begin(), m_kv.chunk.key_buffer[layer_id].end(), 0.0f);
-    std::fill(m_kv.chunk.value_buffer[layer_id].begin(), m_kv.chunk.value_buffer[layer_id].end(), 0.0f);
+    auto &k = m_kv.key_buffer_for_layer(layer_id);
+    auto &v = m_kv.value_buffer_for_layer(layer_id);
+    std::fill(k.begin(), k.end(), 0.0f);
+    std::fill(v.begin(), v.end(), 0.0f);
 
     m_layer_states[layer_id] = LayerState::Unloaded;
     if (do_sync) {
@@ -239,4 +257,3 @@ int64_t GGMLKVPager::offset_v(size_t layer_id) const {
 }
 
 } // namespace powerserve::ggml
-
