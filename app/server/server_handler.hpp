@@ -31,6 +31,7 @@
 #include "speculative/spec_model.hpp"
 
 #include <cstddef>
+#include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -317,6 +318,11 @@ public:
         // Unload model from backends
         const auto &model = m_model_map[model_name];
         m_platform_ptr->destroy_ggml_backend(model->m_config);
+#if defined(POWERSERVE_WITH_OPENCL)
+        if (std::getenv("POWERSERVE_USE_OPENCL")) {
+            m_platform_ptr->destroy_opencl_backend(model->m_config);
+        }
+#endif
 
 #if defined(POWERSERVE_WITH_QNN)
         m_platform_ptr->qnn_backend->unload_model(model->m_config);
@@ -417,6 +423,12 @@ private:
 
         model_ptr->m_platform = m_platform_ptr;
         m_platform_ptr->init_ggml_backend(model_ptr->m_config, hyper_params);
+#if defined(POWERSERVE_WITH_OPENCL)
+        if (std::getenv("POWERSERVE_USE_OPENCL")) {
+            POWERSERVE_LOG_INFO("POWERSERVE_USE_OPENCL=1 -> init OpenCL backend for {}", model_ptr->m_config->model_id);
+            m_platform_ptr->init_opencl_backend(model_ptr->m_config, hyper_params);
+        }
+#endif
 
         model_ptr->m_attn = std::make_shared<powerserve::NormAttention>(model_ptr->m_config->llm, model_ptr->m_weights);
         POWERSERVE_LOG_INFO("after attn init: {}", powerserve::perf_get_mem_result());
@@ -437,6 +449,11 @@ private:
         POWERSERVE_LOG_INFO("Destory all models in memory");
         for (const auto &[_, model] : m_model_map) {
             m_platform_ptr->destroy_ggml_backend(model->m_config);
+#if defined(POWERSERVE_WITH_OPENCL)
+            if (std::getenv("POWERSERVE_USE_OPENCL")) {
+                m_platform_ptr->destroy_opencl_backend(model->m_config);
+            }
+#endif
 #if defined(POWERSERVE_WITH_QNN)
             m_platform_ptr->qnn_backend->unload_model(model->m_config);
 #endif // POWERSERVE_WITH_QNN
