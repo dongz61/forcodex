@@ -20,6 +20,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <future>
 #include <vector>
 
 #include <fcntl.h>
@@ -51,6 +52,10 @@ GGMLKVPager::GGMLKVPager(GGMLKV &kv, const std::string &file_path) :
     m_layer_bytes = m_n_ctx * m_kv_dim * sizeof(float);
     m_layer_states.assign(m_n_layers, LayerState::ResidentClean);
     m_persisted_tokens.assign(m_n_layers, 0);
+    m_load_futures.resize(m_n_layers);
+    m_evict_futures.resize(m_n_layers);
+    m_load_inflight.assign(m_n_layers, false);
+    m_evict_inflight.assign(m_n_layers, false);
 
     m_fd = open(m_file_path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
     if (m_fd < 0) {
@@ -76,23 +81,166 @@ GGMLKVPager::GGMLKVPager(GGMLKV &kv, const std::string &file_path) :
 }
 
 GGMLKVPager::~GGMLKVPager() {
+    if (!wait_all_async()) {
+        POWERSERVE_LOG_WARN("KV pager async wait failed on destroy");
+    }
     if (m_fd >= 0) {
         close(m_fd);
         m_fd = -1;
     }
+    if (!m_file_path.empty()) {
+        if (unlink(m_file_path.c_str()) != 0 && errno != ENOENT) {
+            POWERSERVE_LOG_WARN("KV pager cleanup failed: path={} err={}", m_file_path, std::strerror(errno));
+        }
+    }
 }
 
 void GGMLKVPager::reset_runtime_state() {
+    wait_all_async();
     std::fill(m_layer_states.begin(), m_layer_states.end(), LayerState::Unloaded);
     std::fill(m_persisted_tokens.begin(), m_persisted_tokens.end(), 0);
 }
 
-bool GGMLKVPager::acquire_layer(size_t layer_id, size_t need_tokens) {
+bool GGMLKVPager::prefetch_layer_async(size_t layer_id, size_t need_tokens) {
     if (!valid() || layer_id >= m_n_layers) {
         return false;
     }
-    if (m_layer_states[layer_id] != LayerState::Unloaded) {
+
+    std::lock_guard<std::mutex> lock(m_async_mutex);
+    if (m_layer_states[layer_id] == LayerState::ResidentClean ||
+        m_layer_states[layer_id] == LayerState::ResidentDirty ||
+        m_layer_states[layer_id] == LayerState::Loading) {
         return true;
+    }
+    if (m_layer_states[layer_id] == LayerState::Writing) {
+        return true;
+    }
+    if (m_load_inflight[layer_id]) {
+        return true;
+    }
+
+    m_layer_states[layer_id] = LayerState::Loading;
+    m_load_inflight[layer_id] = true;
+    m_load_futures[layer_id] = std::async(std::launch::async, [this, layer_id, need_tokens]() {
+        const bool ok = acquire_layer_sync(layer_id, need_tokens);
+        std::lock_guard<std::mutex> lock(m_async_mutex);
+        m_load_inflight[layer_id] = false;
+        if (!ok) {
+            m_layer_states[layer_id] = LayerState::Unloaded;
+        } else if (m_layer_states[layer_id] == LayerState::Loading) {
+            m_layer_states[layer_id] = LayerState::ResidentClean;
+        }
+        return ok;
+    });
+
+    return true;
+}
+
+bool GGMLKVPager::wait_layer_ready(size_t layer_id, size_t need_tokens) {
+    if (!valid() || layer_id >= m_n_layers) {
+        return false;
+    }
+    for (;;) {
+        LayerState state = LayerState::Unloaded;
+        {
+            std::lock_guard<std::mutex> lock(m_async_mutex);
+            state = m_layer_states[layer_id];
+            if (state == LayerState::ResidentClean || state == LayerState::ResidentDirty) {
+                return true;
+            }
+        }
+
+        if (state == LayerState::Writing) {
+            if (!wait_layer_evicted(layer_id)) {
+                return false;
+            }
+            continue;
+        }
+
+        if (!prefetch_layer_async(layer_id, need_tokens)) {
+            return false;
+        }
+        if (m_load_futures[layer_id].valid()) {
+            if (!m_load_futures[layer_id].get()) {
+                return false;
+            }
+        }
+        std::lock_guard<std::mutex> lock(m_async_mutex);
+        return m_layer_states[layer_id] == LayerState::ResidentClean ||
+               m_layer_states[layer_id] == LayerState::ResidentDirty;
+    }
+}
+
+bool GGMLKVPager::evict_layer_async(size_t layer_id, size_t valid_tokens, bool do_sync) {
+    if (!valid() || layer_id >= m_n_layers) {
+        return false;
+    }
+    bool write_data = false;
+    {
+        std::lock_guard<std::mutex> lock(m_async_mutex);
+        if (m_layer_states[layer_id] == LayerState::Unloaded || m_layer_states[layer_id] == LayerState::Writing) {
+            return true;
+        }
+        if (m_evict_inflight[layer_id]) {
+            return true;
+        }
+        write_data = (m_layer_states[layer_id] == LayerState::ResidentDirty);
+        m_layer_states[layer_id] = LayerState::Writing;
+        m_evict_inflight[layer_id] = true;
+    }
+
+    m_evict_futures[layer_id] = std::async(std::launch::async, [this, layer_id, valid_tokens, do_sync, write_data]() {
+        const bool ok = evict_layer_sync(layer_id, valid_tokens, do_sync, write_data);
+        std::lock_guard<std::mutex> lock(m_async_mutex);
+        m_evict_inflight[layer_id] = false;
+        if (!ok) {
+            // Keep it resident-dirty for retry on failure.
+            m_layer_states[layer_id] = LayerState::ResidentDirty;
+        } else {
+            m_layer_states[layer_id] = LayerState::Unloaded;
+        }
+        return ok;
+    });
+
+    return true;
+}
+
+bool GGMLKVPager::wait_layer_evicted(size_t layer_id) {
+    if (!valid() || layer_id >= m_n_layers) {
+        return false;
+    }
+    if (m_evict_futures[layer_id].valid()) {
+        if (!m_evict_futures[layer_id].get()) {
+            return false;
+        }
+    }
+    std::lock_guard<std::mutex> lock(m_async_mutex);
+    return m_layer_states[layer_id] == LayerState::Unloaded;
+}
+
+bool GGMLKVPager::wait_all_async() {
+    if (!valid()) {
+        return true;
+    }
+    bool ok = true;
+    for (size_t layer_id = 0; layer_id < m_n_layers; ++layer_id) {
+        if (m_load_futures[layer_id].valid()) {
+            ok = m_load_futures[layer_id].get() && ok;
+        }
+        if (m_evict_futures[layer_id].valid()) {
+            ok = m_evict_futures[layer_id].get() && ok;
+        }
+    }
+    return ok;
+}
+
+bool GGMLKVPager::acquire_layer(size_t layer_id, size_t need_tokens) {
+    return wait_layer_ready(layer_id, need_tokens);
+}
+
+bool GGMLKVPager::acquire_layer_sync(size_t layer_id, size_t need_tokens) {
+    if (!valid() || layer_id >= m_n_layers) {
+        return false;
     }
 
     auto &k = m_kv.key_buffer_for_layer(layer_id);
@@ -112,7 +260,6 @@ bool GGMLKVPager::acquire_layer(size_t layer_id, size_t need_tokens) {
         std::fill(v.begin(), v.end(), 0.0f);
     }
 
-    m_layer_states[layer_id] = LayerState::ResidentClean;
     return true;
 }
 
@@ -120,21 +267,27 @@ void GGMLKVPager::mark_dirty_layer(size_t layer_id) {
     if (!valid() || layer_id >= m_n_layers) {
         return;
     }
-    if (m_layer_states[layer_id] != LayerState::Unloaded) {
+    std::lock_guard<std::mutex> lock(m_async_mutex);
+    if (m_layer_states[layer_id] == LayerState::ResidentClean ||
+        m_layer_states[layer_id] == LayerState::ResidentDirty) {
         m_layer_states[layer_id] = LayerState::ResidentDirty;
     }
 }
 
 bool GGMLKVPager::evict_layer(size_t layer_id, size_t valid_tokens, bool do_sync) {
+    if (!evict_layer_async(layer_id, valid_tokens, do_sync)) {
+        return false;
+    }
+    return wait_layer_evicted(layer_id);
+}
+
+bool GGMLKVPager::evict_layer_sync(size_t layer_id, size_t valid_tokens, bool do_sync, bool write_data) {
     if (!valid() || layer_id >= m_n_layers) {
         return false;
     }
-    if (m_layer_states[layer_id] == LayerState::Unloaded) {
-        return true;
-    }
 
     const size_t capped_tokens = std::min(valid_tokens, m_n_ctx);
-    if (m_layer_states[layer_id] == LayerState::ResidentDirty) {
+    if (write_data) {
         auto &k = m_kv.key_buffer_for_layer(layer_id);
         auto &v = m_kv.value_buffer_for_layer(layer_id);
         if (capped_tokens > 0) {
@@ -187,7 +340,6 @@ bool GGMLKVPager::evict_layer(size_t layer_id, size_t valid_tokens, bool do_sync
     std::fill(k.begin(), k.end(), 0.0f);
     std::fill(v.begin(), v.end(), 0.0f);
 
-    m_layer_states[layer_id] = LayerState::Unloaded;
     if (do_sync) {
         return sync();
     }
