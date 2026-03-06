@@ -1,6 +1,6 @@
 # src/backend/opencl/CMakeLists.txt
 
-# 只有显式开启 OpenCL 才处理
+# 如果未启用 OpenCL，则直接跳过该后端
 if (NOT POWERSERVE_WITH_OPENCL)
     message(STATUS "POWERSERVE_WITH_OPENCL is OFF. OpenCL backend will be disabled.")
     return()
@@ -8,7 +8,7 @@ endif()
 
 message(STATUS "Configuring OpenCL backend sources")
 
-# 1) 无条件把 OpenCL 后端实现编进主库
+# 1) 注册 OpenCL 后端源码
 target_sources(powerserve PRIVATE
     "opencl_backend.cpp"
     "opencl_kernels_ops.cpp"
@@ -20,7 +20,7 @@ target_sources(powerserve PRIVATE
     "opencl_tensor_ops.cpp"
 )
 
-# 2) include & compile definitions
+# 2) 添加头文件目录和编译宏
 target_include_directories(powerserve PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
@@ -30,7 +30,7 @@ target_compile_definitions(powerserve PRIVATE
     POWERSERVE_WITH_OPENCL
 )
 
-# 3) 嵌入式内核支持（可选）
+# 3) 可选：将 OpenCL kernel 嵌入二进制
 if (POWERSERVE_OPENCL_EMBED_KERNELS)
     message(STATUS "OpenCL kernels will be embedded into binary")
 
@@ -85,15 +85,7 @@ else()
     message(STATUS "OpenCL kernels will be loaded from files at runtime")
 endif()
 
-if (POWERSERVE_OPENCL_DEBUG)
-    target_compile_definitions(powerserve PRIVATE GGML_OPENCL_DEBUG)
-endif()
-
-if (POWERSERVE_OPENCL_PROFILING)
-    target_compile_definitions(powerserve PRIVATE GGML_OPENCL_PROFILING)
-endif()
-
-# 4) 链接 OpenCL：分平台处理
+# 4) 链接 OpenCL 运行库
 if (ANDROID)
     if (DEFINED POWERSERVE_ANDROID_OPENCL_LIB AND EXISTS "${POWERSERVE_ANDROID_OPENCL_LIB}")
         message(STATUS "Using Android OpenCL library: ${POWERSERVE_ANDROID_OPENCL_LIB}")
@@ -106,7 +98,7 @@ if (ANDROID)
         )
     endif()
 else()
-    # 非 Android：正常查找并链接
+    # 非 Android 平台通过 find_package(OpenCL) 查找系统 OpenCL
     find_package(OpenCL QUIET)
     if (OpenCL_FOUND)
         message(STATUS "OpenCL found: ${OpenCL_LIBRARIES}")

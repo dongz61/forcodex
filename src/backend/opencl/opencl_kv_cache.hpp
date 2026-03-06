@@ -9,11 +9,6 @@
 
 namespace powerserve::opencl {
 
-// KVCache v0 (minimal):
-// - batch = 1
-// - decode-only: append 1 token each step
-// - FP32 only
-// - pre-allocated device buffers
 struct OpenCLKV {
     size_t kv_dim = 0;
     size_t max_seq_len = 0;
