@@ -14,12 +14,11 @@
 
 #include "norm_attention.hpp"
 
+#include "attention_path.hpp"
 #include "graph/graph.hpp"
 #include "graph/node.hpp"
 
 #include <cstdint>
-#include <cstdio>
-#include <cstring>
 
 namespace powerserve {
 
@@ -120,52 +119,7 @@ TensorNode *NormAttention::build(
         g.copy(v_cache_view, v);
     }
 
-    TensorNode *att_scores = nullptr;
-    {
-        // size_t n_kv = ((pos.back() / 32) + 1) * 32;
-        // size_t batch_32 = ((batch_size / 32) + 1) * 32;
-        size_t n_kv     = pos.back() + 1;
-        size_t batch_32 = batch_size;
-
-        // (head_size, bs, n_heads, 1)
-        q = g.permute(rope_q, {0, 2, 1, 3});
-        // {head_size, cur_postion, n_head_kv, 1}
-        k = g.view(
-            k_cache,
-            {head_size, n_kv, n_head_kv, 1},
-            {
-                k_cache->element_size(),
-                k_cache->row_size(kv_gqa),
-                k_cache->row_size(head_size),
-                k_cache->row_size(head_size) * n_head_kv,
-            }
-        );
-
-        // {bs, cur_postion, n_head_kv, 1}
-        auto kq                = g.mat_mul(k, q);
-        auto f_attention_scale = 0.0f;
-        float kq_scale         = f_attention_scale == 0.0f ? 1.0f / sqrtf(float(head_size)) : f_attention_scale;
-        float f_max_alibi_bias = 0.000000;
-        auto kq_mask           = g.get_mask(mask, {n_kv, batch_32, 1, 1}, pos);
-        kq                     = g.softmax_ext(kq, kq_mask, kq_scale, f_max_alibi_bias);
-
-        // split cached v into n_head heads
-        // {cur_postion, head_size, n_head_kv, 1};
-        v = g.view(
-            v_cache,
-            {n_kv, head_size, n_head_kv, 1},
-            {v_cache->element_size(),
-             v_cache->element_size() * n_ctx,
-             v_cache->element_size() * n_ctx * head_size,
-             v_cache->element_size() * n_ctx * head_size * n_head_kv}
-        );
-        // {head_size, cur_postion, n_head_kv, 1};
-        auto kqv = g.mat_mul(v, kq);
-        // {head_size, n_head_kv, cur_postion, 1};
-        auto kqv_merged = g.permute(kqv, {0, 2, 1, 3});
-        //  {embed_dim, bs, 1, 1};
-        att_scores = g.cont(kqv_merged, {head_size * n_head, batch_size, 1, 1});
-    }
+    auto att_scores = build_attention_scores(g, rope_q, k_cache, v_cache, pos, mask, head_size, n_head, n_head_kv, n_ctx);
 
     auto attn_output_w = g.add_tensor(m_weights->lw[L].attn_output);
     auto attn_o        = g.mat_mul(attn_output_w, att_scores); // (embd_dim, bs, 1, 1)

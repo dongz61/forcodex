@@ -116,4 +116,13 @@ struct GetMaskParams {
     const std::vector<int> &pos;
 };
 
+struct TopKAttnParams {
+    std::vector<int> pos;
+    float scale = 1.0f;
+    int topk = 0;
+    int n_heads = 0;
+    int n_kv_heads = 0;
+    int head_size = 0;
+};
+
 } // namespace powerserve

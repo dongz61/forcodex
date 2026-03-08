@@ -226,6 +226,18 @@ public:
     void permute(const Tensor *out, const Tensor *x, Shape axes) const override;
     void cont(const Tensor *out, const Tensor *x) const override;
     void softmax_ext(const Tensor *out, const Tensor *x, const Tensor *mask, float scale, float max_bias) const override;
+    void topk_attn(
+        const Tensor *out,
+        const Tensor *q,
+        const Tensor *k,
+        const Tensor *v,
+        const std::vector<int> &pos,
+        float scale,
+        int topk,
+        int n_heads,
+        int n_kv_heads,
+        int head_size
+    ) const;
 
     void silu_hadamard(const Tensor *out, const Tensor *hb, const Tensor *hb2) const override;
     void copy(const Tensor *dst, const Tensor *src) const override;

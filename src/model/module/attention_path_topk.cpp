@@ -12,37 +12,36 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#pragma once
+#include "attention_path.hpp"
+
+#include <cmath>
 
 namespace powerserve {
 
-enum class OpType {
-    NONE = 0,
-
-    ADD,
-    MAT_MUL,
-    RMS_NORM,
-    SILU_HADAMARD,
-    ROPE,
-    SOFTMAX,
-    COPY,
-
-#if defined(POWERSERVE_WITH_QNN)
-    QNN_FORWARD,
-    QNN_FORWARD_VL,
-#endif
-
-    PRINT,
-    GET_EMBEDDING,
-    ADD_CACHE,
-    PERMUTE,
-    CONT,
-    VIEW,
-    SOFTMAX_EXT,
-    TOPK_ATTN,
-    GET_MASK,
-    TRANSPOSE,
-    INSERT_IMG_EMBEDDIGN,
-};
+TensorNode *build_attention_scores_topk(
+    Graph &g,
+    TensorNode *q,
+    TensorNode *k,
+    TensorNode *v,
+    const std::vector<int> &pos,
+    size_t head_size,
+    size_t n_head,
+    size_t n_head_kv,
+    int topk
+) {
+    const float kq_scale = 1.0f / std::sqrt(float(head_size));
+    return g.topk_attn(
+        q,
+        k,
+        v,
+        pos,
+        kq_scale,
+        topk,
+        static_cast<int>(n_head),
+        static_cast<int>(n_head_kv),
+        static_cast<int>(head_size)
+    );
+}
 
 } // namespace powerserve
+

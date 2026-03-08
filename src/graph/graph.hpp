@@ -62,6 +62,17 @@ public:
 
     auto softmax(TensorNode *x) -> TensorNode *;
     auto softmax_ext(TensorNode *x, TensorNode *mask, float scale, float max_bias) -> TensorNode *;
+    auto topk_attn(
+        TensorNode *q,
+        TensorNode *k,
+        TensorNode *v,
+        const std::vector<int> &pos,
+        float scale,
+        int topk,
+        int n_heads,
+        int n_kv_heads,
+        int head_size
+    ) -> TensorNode *;
     void print(TensorNode *x, size_t size);
 
     void add_cache(TensorNode *k, TensorNode *v, size_t L, const std::vector<int> &pos, size_t head_id);

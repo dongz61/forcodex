@@ -237,6 +237,41 @@ auto Graph::softmax_ext(TensorNode *x, TensorNode *mask, float scale, float max_
     return out;
 }
 
+auto Graph::topk_attn(
+    TensorNode *q,
+    TensorNode *k,
+    TensorNode *v,
+    const std::vector<int> &pos,
+    float scale,
+    int topk,
+    int n_heads,
+    int n_kv_heads,
+    int head_size
+) -> TensorNode * {
+    POWERSERVE_ASSERT(q->m_dtype == DataType::FP32);
+    POWERSERVE_ASSERT(k->m_dtype == DataType::FP32);
+    POWERSERVE_ASSERT(v->m_dtype == DataType::FP32);
+    POWERSERVE_ASSERT(topk > 0);
+    POWERSERVE_ASSERT(n_heads > 0);
+    POWERSERVE_ASSERT(n_kv_heads > 0);
+    POWERSERVE_ASSERT(head_size > 0);
+
+    const size_t batch = q->m_shape[1];
+    auto out = new_tensor(DataType::FP32, {static_cast<size_t>(head_size * n_heads), batch, 1, 1});
+    auto op = new_op(OpType::TOPK_ATTN);
+    op->set_inputs({q, k, v});
+    op->set_outputs({out});
+    op->set_params(TopKAttnParams{
+        .pos = pos,
+        .scale = scale,
+        .topk = topk,
+        .n_heads = n_heads,
+        .n_kv_heads = n_kv_heads,
+        .head_size = head_size,
+    });
+    return out;
+}
+
 auto Graph::get_mask(const CausalAttentionMask &mask, Shape shape, const std::vector<int> &pos) -> TensorNode * {
     auto out = new_tensor(DataType::FP32, shape);
     auto op  = new_op(OpType::GET_MASK);
