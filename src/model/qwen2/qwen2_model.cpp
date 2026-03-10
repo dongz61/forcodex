@@ -192,7 +192,16 @@ auto Qwen2Model::forward(
             );
             executor.run();
 
-            ggml_runtime::finish_kv_segment(m_kv_pager, *ggml_kv, kv_runtime, begin, end, tokens_after_step);
+            ggml_runtime::finish_kv_segment(
+                m_kv_pager,
+                *ggml_kv,
+                kv_runtime,
+                begin,
+                end,
+                llm_config.n_layers,
+                tokens_before_step,
+                tokens_after_step
+            );
 
             if (is_last_segment) {
                 if (lm_head) {

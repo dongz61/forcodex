@@ -170,59 +170,31 @@ static inline bool get_mem_size(OpenCLContext* ctx, cl_mem mem, size_t* out_size
 // for copy end
 
 bool OpenCLMemoryPool::copy_host_to_device(cl_mem dst, const void* src, size_t size, size_t offset) {
-
-    if (!dst || !src) {
-        POWERSERVE_LOG_ERROR("Invalid arguments for copy_host_to_device");
+    cl_event ev = nullptr;
+    if (!copy_host_to_device_async(dst, src, size, offset, 0, nullptr, &ev)) {
         return false;
     }
-    if (size == 0) {
-        POWERSERVE_LOG_WARN("copy_host_to_device: size == 0, skip");
-        return true;
+    if (ev) {
+        cl_int werr = clWaitForEvents(1, &ev);
+        bool ok = context_->check_error(werr, "clWaitForEvents(H2D)");
+        clReleaseEvent(ev);
+        return ok;
     }
-
-    // query dst mem size
-    size_t dst_size = 0;
-    if (!get_mem_size(context_.get(), dst, &dst_size)) {
-        POWERSERVE_LOG_ERROR("copy_host_to_device: failed to query dst mem size");
-        return false;
-    }
-
-    // OOB check
-    if (offset + size > dst_size) {
-        POWERSERVE_LOG_ERROR("H2D OOB: offset+size={} > dst_size={}",
-                             offset + size, dst_size);
-        return false;
-    }
-
-    cl_int err = clEnqueueWriteBuffer(context_->get_queue(), dst, CL_TRUE,
-                                  offset, size, src, 0, nullptr, nullptr);
-    if (!context_->check_error(err, "clEnqueueWriteBuffer")) return false;
-
     return true;
 }
 
 bool OpenCLMemoryPool::copy_device_to_host(void* dst, cl_mem src, size_t size, size_t offset) {
-    if (!dst || !src) {
-        POWERSERVE_LOG_ERROR("Invalid arguments for copy_device_to_host");
+    cl_event ev = nullptr;
+    if (!copy_device_to_host_async(dst, src, size, offset, 0, nullptr, &ev)) {
         return false;
     }
-
-    // size check
-    size_t src_size = 0;
-    if (!get_mem_size(context_.get(), src, &src_size)) {
-        POWERSERVE_LOG_ERROR("copy_device_to_host: failed to query src mem size");
-        return false;
+    if (ev) {
+        cl_int werr = clWaitForEvents(1, &ev);
+        bool ok = context_->check_error(werr, "clWaitForEvents(D2H)");
+        clReleaseEvent(ev);
+        return ok;
     }
-
-    if (offset + size > src_size) {
-        POWERSERVE_LOG_ERROR("D2H OOB: offset+size={} > src_size={}",
-                             offset + size, src_size);
-        return false;
-    }
-
-    cl_int err = clEnqueueReadBuffer(context_->get_queue(), src, CL_TRUE,
-                                     offset, size, dst, 0, nullptr, nullptr);
-    return context_->check_error(err, "clEnqueueReadBuffer");
+    return true;
 }
 
 
@@ -232,21 +204,138 @@ bool OpenCLMemoryPool::copy_device_to_device(
     size_t size,
     size_t dst_offset,
     size_t src_offset) {
+    cl_event ev = nullptr;
+    if (!copy_device_to_device_async(dst, src, size, dst_offset, src_offset, 0, nullptr, &ev)) {
+        return false;
+    }
+    if (ev) {
+        cl_int werr = clWaitForEvents(1, &ev);
+        bool ok = context_->check_error(werr, "clWaitForEvents(D2D)");
+        clReleaseEvent(ev);
+        return ok;
+    }
+    return true;
+}
+
+bool OpenCLMemoryPool::copy_host_to_device_async(
+    cl_mem dst,
+    const void* src,
+    size_t size,
+    size_t offset,
+    cl_uint num_wait_events,
+    const cl_event* wait_list,
+    cl_event* out_event) {
     if (!dst || !src) {
-        POWERSERVE_LOG_ERROR("Invalid arguments for copy_device_to_device");
+        POWERSERVE_LOG_ERROR("Invalid arguments for copy_host_to_device_async");
         return false;
     }
     if (size == 0) {
         return true;
     }
+    if ((num_wait_events == 0 && wait_list != nullptr) ||
+        (num_wait_events > 0 && wait_list == nullptr)) {
+        POWERSERVE_LOG_ERROR("copy_host_to_device_async: invalid wait list");
+        return false;
+    }
+
+    size_t dst_size = 0;
+    if (!get_mem_size(context_.get(), dst, &dst_size)) {
+        POWERSERVE_LOG_ERROR("copy_host_to_device_async: failed to query dst mem size");
+        return false;
+    }
+    if (offset + size > dst_size) {
+        POWERSERVE_LOG_ERROR("H2D OOB: offset+size={} > dst_size={}", offset + size, dst_size);
+        return false;
+    }
+
+    cl_event local_event = nullptr;
+    cl_event* ev_ptr = out_event ? out_event : &local_event;
+    cl_int err = clEnqueueWriteBuffer(
+        context_->get_queue(), dst, CL_FALSE, offset, size, src,
+        num_wait_events, wait_list, ev_ptr);
+    if (!context_->check_error(err, "clEnqueueWriteBuffer(async)")) {
+        return false;
+    }
+    if (!out_event && local_event) {
+        clReleaseEvent(local_event);
+    }
+    return true;
+}
+
+bool OpenCLMemoryPool::copy_device_to_host_async(
+    void* dst,
+    cl_mem src,
+    size_t size,
+    size_t offset,
+    cl_uint num_wait_events,
+    const cl_event* wait_list,
+    cl_event* out_event) {
+    if (!dst || !src) {
+        POWERSERVE_LOG_ERROR("Invalid arguments for copy_device_to_host_async");
+        return false;
+    }
+    if (size == 0) {
+        return true;
+    }
+    if ((num_wait_events == 0 && wait_list != nullptr) ||
+        (num_wait_events > 0 && wait_list == nullptr)) {
+        POWERSERVE_LOG_ERROR("copy_device_to_host_async: invalid wait list");
+        return false;
+    }
+
+    size_t src_size = 0;
+    if (!get_mem_size(context_.get(), src, &src_size)) {
+        POWERSERVE_LOG_ERROR("copy_device_to_host_async: failed to query src mem size");
+        return false;
+    }
+    if (offset + size > src_size) {
+        POWERSERVE_LOG_ERROR("D2H OOB: offset+size={} > src_size={}", offset + size, src_size);
+        return false;
+    }
+
+    cl_event local_event = nullptr;
+    cl_event* ev_ptr = out_event ? out_event : &local_event;
+    cl_int err = clEnqueueReadBuffer(
+        context_->get_queue(), src, CL_FALSE, offset, size, dst,
+        num_wait_events, wait_list, ev_ptr);
+    if (!context_->check_error(err, "clEnqueueReadBuffer(async)")) {
+        return false;
+    }
+    if (!out_event && local_event) {
+        clReleaseEvent(local_event);
+    }
+    return true;
+}
+
+bool OpenCLMemoryPool::copy_device_to_device_async(
+    cl_mem dst,
+    cl_mem src,
+    size_t size,
+    size_t dst_offset,
+    size_t src_offset,
+    cl_uint num_wait_events,
+    const cl_event* wait_list,
+    cl_event* out_event) {
+    if (!dst || !src) {
+        POWERSERVE_LOG_ERROR("Invalid arguments for copy_device_to_device_async");
+        return false;
+    }
+    if (size == 0) {
+        return true;
+    }
+    if ((num_wait_events == 0 && wait_list != nullptr) ||
+        (num_wait_events > 0 && wait_list == nullptr)) {
+        POWERSERVE_LOG_ERROR("copy_device_to_device_async: invalid wait list");
+        return false;
+    }
 
     size_t src_size = 0, dst_size = 0;
     if (!get_mem_size(context_.get(), src, &src_size)) {
-        POWERSERVE_LOG_ERROR("copy_device_to_device: failed to query src mem size");
+        POWERSERVE_LOG_ERROR("copy_device_to_device_async: failed to query src mem size");
         return false;
     }
     if (!get_mem_size(context_.get(), dst, &dst_size)) {
-        POWERSERVE_LOG_ERROR("copy_device_to_device: failed to query dst mem size");
+        POWERSERVE_LOG_ERROR("copy_device_to_device_async: failed to query dst mem size");
         return false;
     }
 
@@ -256,10 +345,18 @@ bool OpenCLMemoryPool::copy_device_to_device(
         return false;
     }
 
-
+    cl_event local_event = nullptr;
+    cl_event* ev_ptr = out_event ? out_event : &local_event;
     cl_int err = clEnqueueCopyBuffer(context_->get_queue(), src, dst,
-                                     src_offset, dst_offset, size, 0, nullptr, nullptr);
-    return context_->check_error(err, "clEnqueueCopyBuffer");
+                                     src_offset, dst_offset, size,
+                                     num_wait_events, wait_list, ev_ptr);
+    if (!context_->check_error(err, "clEnqueueCopyBuffer(async)")) {
+        return false;
+    }
+    if (!out_event && local_event) {
+        clReleaseEvent(local_event);
+    }
+    return true;
 }
 
 void OpenCLMemoryPool::update_peak_usage() {

@@ -40,6 +40,32 @@ public:
         size_t size,
         size_t dst_offset = 0,
         size_t src_offset = 0);
+
+    bool copy_host_to_device_async(
+        cl_mem dst,
+        const void* src,
+        size_t size,
+        size_t offset = 0,
+        cl_uint num_wait_events = 0,
+        const cl_event* wait_list = nullptr,
+        cl_event* out_event = nullptr);
+    bool copy_device_to_host_async(
+        void* dst,
+        cl_mem src,
+        size_t size,
+        size_t offset = 0,
+        cl_uint num_wait_events = 0,
+        const cl_event* wait_list = nullptr,
+        cl_event* out_event = nullptr);
+    bool copy_device_to_device_async(
+        cl_mem dst,
+        cl_mem src,
+        size_t size,
+        size_t dst_offset = 0,
+        size_t src_offset = 0,
+        cl_uint num_wait_events = 0,
+        const cl_event* wait_list = nullptr,
+        cl_event* out_event = nullptr);
     
 private:
     std::shared_ptr<OpenCLContext> context_;

@@ -32,15 +32,9 @@ kernel void kernel_cpy_f16_f16(
     int i03 = get_group_id(2);
     int i02 = get_group_id(1);
     int i01 = get_group_id(0);
+    if (i01 >= ne01 || i02 >= ne02 || i03 >= ne03) return;
 
-    int n = i03*ne02*ne01*ne00 + i02*ne01*ne00 + i01*ne00;
-
-    int i3 = n / (ne2*ne1*ne0);
-    int i2 = (n - i3*ne2*ne1*ne0) / (ne1*ne0);
-    int i1 = (n - i3*ne2*ne1*ne0 - i2*ne1*ne0) / ne0;
-    int i0 = (n - i3*ne2*ne1*ne0 - i2*ne1*ne0 - i1*ne0);
-
-    global half * dst_data = (global half *) ((global char *) dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
+    global half * dst_data = (global half *) ((global char *) dst + i03*nb3 + i02*nb2 + i01*nb1);
 
     for (int i00 = get_local_id(0); i00 < ne00; i00 += get_local_size(0)) {
         global const half * src = (global half *)((global char *) src0 + i03*nb03 + i02*nb02 + i01*nb01 + i00*nb00);
@@ -77,15 +71,9 @@ kernel void kernel_cpy_f16_f32(
     int i03 = get_group_id(2);
     int i02 = get_group_id(1);
     int i01 = get_group_id(0);
+    if (i01 >= ne01 || i02 >= ne02 || i03 >= ne03) return;
 
-    int n = i03*ne02*ne01*ne00 + i02*ne01*ne00 + i01*ne00;
-
-    int i3 = n / (ne2*ne1*ne0);
-    int i2 = (n - i3*ne2*ne1*ne0) / (ne1*ne0);
-    int i1 = (n - i3*ne2*ne1*ne0 - i2*ne1*ne0) / ne0;
-    int i0 = (n - i3*ne2*ne1*ne0 - i2*ne1*ne0 - i1*ne0);
-
-    global float * dst_data = (global float *) ((global char *) dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
+    global float * dst_data = (global float *) ((global char *) dst + i03*nb3 + i02*nb2 + i01*nb1);
 
     for (int i00 = get_local_id(0); i00 < ne00; i00 += get_local_size(0)) {
         global half * src = (global half *)((global char *) src0 + i03*nb03 + i02*nb02 + i01*nb01 + i00*nb00);
@@ -121,15 +109,9 @@ kernel void kernel_cpy_f32_f16(
     int i03 = get_group_id(2);
     int i02 = get_group_id(1);
     int i01 = get_group_id(0);
+    if (i01 >= ne01 || i02 >= ne02 || i03 >= ne03) return;
 
-    int n = i03*ne02*ne01*ne00 + i02*ne01*ne00 + i01*ne00;
-
-    int i3 = n / (ne2*ne1*ne0);
-    int i2 = (n - i3*ne2*ne1*ne0) / (ne1*ne0);
-    int i1 = (n - i3*ne2*ne1*ne0 - i2*ne1*ne0) / ne0;
-    int i0 = (n - i3*ne2*ne1*ne0 - i2*ne1*ne0 - i1*ne0);
-
-    global half * dst_data = (global half *) ((global char *) dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
+    global half * dst_data = (global half *) ((global char *) dst + i03*nb3 + i02*nb2 + i01*nb1);
 
     for (int i00 = get_local_id(0); i00 < ne00; i00 += get_local_size(0)) {
         global const float * src = (global float *)((global char *) src0 + i03*nb03 + i02*nb02 + i01*nb01 + i00*nb00);
@@ -166,15 +148,9 @@ kernel void kernel_cpy_f32_f32(
     int i03 = get_group_id(2);
     int i02 = get_group_id(1);
     int i01 = get_group_id(0);
+    if (i01 >= ne01 || i02 >= ne02 || i03 >= ne03) return;
 
-    int n = i03*ne02*ne01*ne00 + i02*ne01*ne00 + i01*ne00;
-
-    int i3 = n / (ne2*ne1*ne0);
-    int i2 = (n - i3*ne2*ne1*ne0) / (ne1*ne0);
-    int i1 = (n - i3*ne2*ne1*ne0 - i2*ne1*ne0) / ne0;
-    int i0 = (n - i3*ne2*ne1*ne0 - i2*ne1*ne0 - i1*ne0);
-
-    global float * dst_data = (global float *) ((global char *) dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
+    global float * dst_data = (global float *) ((global char *) dst + i03*nb3 + i02*nb2 + i01*nb1);
 
     for (int i00 = get_local_id(0); i00 < ne00; i00 += get_local_size(0)) {
         global const float * src = (global float *)((global char *) src0 + i03*nb03 + i02*nb02 + i01*nb01 + i00*nb00);

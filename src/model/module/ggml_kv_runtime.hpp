@@ -69,6 +69,8 @@ void finish_kv_segment(
     KVRuntimeState &state,
     size_t begin,
     size_t end,
+    size_t n_layers,
+    size_t tokens_before_step,
     size_t tokens_after_step
 );
 

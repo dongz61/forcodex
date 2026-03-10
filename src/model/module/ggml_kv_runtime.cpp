@@ -249,6 +249,8 @@ void finish_kv_segment(
     KVRuntimeState &state,
     size_t begin,
     size_t end,
+    size_t n_layers,
+    size_t tokens_before_step,
     size_t tokens_after_step
 ) {
     if (!state.pager_active) {
@@ -269,6 +271,24 @@ void finish_kv_segment(
                 POWERSERVE_ABORT("KV pager evict failure");
             }
         }
+    }
+
+    // Proactively free slots and prefetch the next segment right after current compute finishes.
+    // This avoids delaying eviction until the next segment's prepare path.
+    const size_t segment_layers = end - begin;
+    const size_t lookahead_begin = end;
+    const size_t lookahead_end = std::min(end + segment_layers, n_layers);
+    for (size_t L = lookahead_begin; L < lookahead_end; ++L) {
+        prefetch_layer_with_optional_binding(
+            kv_pager,
+            ggml_kv,
+            state,
+            L,
+            n_layers,
+            tokens_before_step,
+            tokens_after_step,
+            true
+        );
     }
 }
 

@@ -221,7 +221,7 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
                 return;
             }
             const size_t dst_off = dst_cl->get_base_offset();
-            if (!memory_pool->copy_host_to_device(dev, src_cpu->m_data, src_bytes, dst_off)) {
+            if (!memory_pool->copy_host_to_device_async(dev, src_cpu->m_data, src_bytes, dst_off)) {
                 POWERSERVE_LOG_ERROR("copy: shape-mismatch H2D copy_host_to_device failed");
             }
             return;
@@ -234,8 +234,18 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
                 return;
             }
             const size_t src_off = src_cl->get_base_offset();
-            if (!memory_pool->copy_device_to_host(dst_cpu->m_data, dev, src_bytes, src_off)) {
+            cl_event read_event = nullptr;
+            if (!memory_pool->copy_device_to_host_async(dst_cpu->m_data, dev, src_bytes, src_off, 0, nullptr, &read_event)) {
                 POWERSERVE_LOG_ERROR("copy: shape-mismatch D2H copy_device_to_host failed");
+                return;
+            }
+            if (read_event) {
+                cl_int werr = clWaitForEvents(1, &read_event);
+                if (werr != CL_SUCCESS) {
+                    POWERSERVE_LOG_ERROR("copy: shape-mismatch D2H clWaitForEvents failed: {}",
+                                         context->get_error_string(werr));
+                }
+                clReleaseEvent(read_event);
             }
             return;
         }
@@ -253,7 +263,7 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
 
             const size_t src_off = src_cl->get_base_offset();
             const size_t dst_off = dst_cl->get_base_offset();
-            if (!memory_pool->copy_device_to_device(dst_dev, src_dev, src_bytes, dst_off, src_off)) {
+            if (!memory_pool->copy_device_to_device_async(dst_dev, src_dev, src_bytes, dst_off, src_off)) {
                 POWERSERVE_LOG_ERROR("copy: shape-mismatch D2D copy_device_to_device failed");
             }
             return;
@@ -287,7 +297,7 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
 
         if (src_contig && dst_contig) {
             const size_t dst_off = dst_cl->get_base_offset();
-            if (!memory_pool->copy_host_to_device(dev, host, src_bytes, dst_off)) {
+            if (!memory_pool->copy_host_to_device_async(dev, host, src_bytes, dst_off)) {
                 POWERSERVE_LOG_ERROR("H2D: copy_host_to_device failed");
             }
             return;
@@ -306,7 +316,7 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
 
         if (dst_contig) {
             const size_t dst_off = dst_cl->get_base_offset();
-            if (!memory_pool->copy_host_to_device(dev, host_src, src_bytes, dst_off)) {
+            if (!memory_pool->copy_host_to_device_async(dev, host_src, src_bytes, dst_off)) {
                 POWERSERVE_LOG_ERROR("H2D: copy_host_to_device failed");
             }
             return;
@@ -325,13 +335,17 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
         auto &staging_buf = staging.get<OpenCLBuffer>();
         cl_mem staging_mem = staging_buf.get_device_buffer();
         const size_t st_off = staging_buf.get_base_offset();
-        if (!memory_pool->copy_host_to_device(staging_mem, host_src, src_bytes, st_off)) {
+        cl_event h2d_event = nullptr;
+        if (!memory_pool->copy_host_to_device_async(staging_mem, host_src, src_bytes, st_off, 0, nullptr, &h2d_event)) {
             POWERSERVE_LOG_ERROR("H2D: staging copy_host_to_device failed");
             dump_backtrace();
             std::abort();
         }
 
-        cpy_tensor_cl(this, &staging, dst);
+        cpy_tensor_cl(this, &staging, dst, h2d_event ? 1u : 0u, h2d_event ? &h2d_event : nullptr, nullptr);
+        if (h2d_event) {
+            clReleaseEvent(h2d_event);
+        }
         return;
     }
 
@@ -375,17 +389,35 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
 
         if (dst_contig) {
             const size_t src_off = read_cl->get_base_offset();
-            if (!memory_pool->copy_device_to_host(host, read_mem, src_bytes, src_off)) {
+            cl_event read_event = nullptr;
+            if (!memory_pool->copy_device_to_host_async(host, read_mem, src_bytes, src_off, 0, nullptr, &read_event)) {
                 POWERSERVE_LOG_ERROR("D2H: copy_device_to_host failed");
+                return;
+            }
+            if (read_event) {
+                cl_int werr = clWaitForEvents(1, &read_event);
+                if (werr != CL_SUCCESS) {
+                    POWERSERVE_LOG_ERROR("D2H: clWaitForEvents failed: {}", context->get_error_string(werr));
+                }
+                clReleaseEvent(read_event);
             }
             return;
         }
 
         std::vector<uint8_t> host_contig(src_bytes);
         const size_t src_off = read_cl->get_base_offset();
-        if (!memory_pool->copy_device_to_host(host_contig.data(), read_mem, src_bytes, src_off)) {
+        cl_event read_event = nullptr;
+        if (!memory_pool->copy_device_to_host_async(host_contig.data(), read_mem, src_bytes, src_off, 0, nullptr, &read_event)) {
             POWERSERVE_LOG_ERROR("D2H: staging copy_device_to_host failed");
             return;
+        }
+        if (read_event) {
+            cl_int werr = clWaitForEvents(1, &read_event);
+            if (werr != CL_SUCCESS) {
+                POWERSERVE_LOG_ERROR("D2H: staging clWaitForEvents failed: {}",
+                                     context->get_error_string(werr));
+            }
+            clReleaseEvent(read_event);
         }
 
         if (!unpack_contig_to_cpu_strided(host_contig.data(), dst)) {
@@ -416,7 +448,7 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
             cpy_tensor_cl(this, src, dst);
             return;
         }
-        if (!memory_pool->copy_device_to_device(dst_dev, src_dev, src_bytes)) {
+        if (!memory_pool->copy_device_to_device_async(dst_dev, src_dev, src_bytes)) {
             POWERSERVE_LOG_ERROR("D2D: copy_device_to_device failed");
             dump_backtrace();
             std::abort();

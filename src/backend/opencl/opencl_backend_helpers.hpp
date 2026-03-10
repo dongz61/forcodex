@@ -5,6 +5,7 @@
 #include "core/logger.hpp"
 
 #include <CL/cl.h>
+#include <algorithm>
 
 #define OCL_RETURN_IF_ERROR(ctx, call) \
     do { \
@@ -20,7 +21,10 @@ namespace powerserve::opencl::detail {
 
 static inline void cpy_tensor_cl(const OpenCLBackend* self,
                                  const Tensor* src,
-                                 const Tensor* dst) {
+                                 const Tensor* dst,
+                                 cl_uint num_wait_events = 0,
+                                 const cl_event* wait_list = nullptr,
+                                 cl_event* out_event = nullptr) {
     POWERSERVE_ASSERT(self && src && dst);
 
     auto* context = self->context.get();
@@ -63,6 +67,9 @@ static inline void cpy_tensor_cl(const OpenCLBackend* self,
     const int ne01 = (int)src->m_shape[1];
     const int ne02 = (int)src->m_shape[2];
     const int ne03 = (int)src->m_shape[3];
+    if (ne00 <= 0 || ne01 <= 0 || ne02 <= 0 || ne03 <= 0) {
+        return;
+    }
 
     const int ne0  = (int)dst->m_shape[0];
     const int ne1  = (int)dst->m_shape[1];
@@ -108,12 +115,39 @@ static inline void cpy_tensor_cl(const OpenCLBackend* self,
     OCL_RETURN_IF_ERROR(context, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb2));
     OCL_RETURN_IF_ERROR(context, clSetKernelArg(k, arg++, sizeof(cl_ulong), &nb3));
 
-    const size_t local[3]  = { 1, 1, 1 };
-    const size_t global[3] = { (size_t)ne01, (size_t)ne02, (size_t)ne03 };
+    size_t device_wg_max = 64;
+    cl_int wg_err = clGetDeviceInfo(
+        self->context->get_device(),
+        CL_DEVICE_MAX_WORK_GROUP_SIZE,
+        sizeof(device_wg_max),
+        &device_wg_max,
+        nullptr
+    );
+    if (wg_err != CL_SUCCESS || device_wg_max == 0) {
+        device_wg_max = 64;
+    }
+
+    const size_t hard_cap = 256;
+    size_t local_x_cap = std::min(device_wg_max, hard_cap);
+    local_x_cap = std::min(local_x_cap, (size_t)ne00);
+
+    size_t local_x = 1;
+    while ((local_x << 1) <= local_x_cap) {
+        local_x <<= 1;
+    }
+
+    const size_t local[3]  = { local_x, 1, 1 };
+    const size_t global[3] = { (size_t)ne01 * local_x, (size_t)ne02, (size_t)ne03 };
+
+    if ((num_wait_events == 0 && wait_list != nullptr) ||
+        (num_wait_events > 0 && wait_list == nullptr)) {
+        POWERSERVE_LOG_ERROR("cpy_tensor_cl: invalid wait list");
+        return;
+    }
 
     OCL_RETURN_IF_ERROR(context, clEnqueueNDRangeKernel(self->context->get_queue(),
                                                         k, 3, nullptr, global, local,
-                                                        0, nullptr, nullptr));
+                                                        num_wait_events, wait_list, out_event));
 }
 
 static inline const Tensor *ensure_contiguous_or_pack_f32(
