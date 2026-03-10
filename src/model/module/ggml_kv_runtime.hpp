@@ -54,6 +54,15 @@ void prepare_kv_segment(
     size_t tokens_after_step
 );
 
+void wait_kv_segment_ready(
+    std::unique_ptr<ggml::GGMLKVPager> &kv_pager,
+    const ggml::GGMLKV &ggml_kv,
+    const KVRuntimeState &state,
+    size_t begin,
+    size_t end,
+    size_t tokens_before_step
+);
+
 void finish_kv_segment(
     std::unique_ptr<ggml::GGMLKVPager> &kv_pager,
     ggml::GGMLKV &ggml_kv,
@@ -66,4 +75,3 @@ void finish_kv_segment(
 void sync_kv_runtime_if_needed(std::unique_ptr<ggml::GGMLKVPager> &kv_pager, const KVRuntimeState &state);
 
 } // namespace powerserve::ggml_runtime
-

@@ -182,6 +182,14 @@ auto Qwen2Model::forward(
 
             Executor executor(*m_platform, g);
             executor.allocate_buffers();
+            ggml_runtime::wait_kv_segment_ready(
+                m_kv_pager,
+                *ggml_kv,
+                kv_runtime,
+                begin,
+                end,
+                tokens_before_step
+            );
             executor.run();
 
             ggml_runtime::finish_kv_segment(m_kv_pager, *ggml_kv, kv_runtime, begin, end, tokens_after_step);

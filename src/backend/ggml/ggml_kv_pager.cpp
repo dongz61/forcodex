@@ -234,6 +234,19 @@ bool GGMLKVPager::wait_all_async() {
     return ok;
 }
 
+bool GGMLKVPager::wait_all_evictions() {
+    if (!valid()) {
+        return true;
+    }
+    bool ok = true;
+    for (size_t layer_id = 0; layer_id < m_n_layers; ++layer_id) {
+        if (m_evict_futures[layer_id].valid()) {
+            ok = m_evict_futures[layer_id].get() && ok;
+        }
+    }
+    return ok;
+}
+
 bool GGMLKVPager::acquire_layer(size_t layer_id, size_t need_tokens) {
     return wait_layer_ready(layer_id, need_tokens);
 }
