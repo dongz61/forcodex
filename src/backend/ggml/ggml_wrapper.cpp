@@ -221,8 +221,8 @@ void GGMLBackend::topk_attn(
     POWERSERVE_ASSERT(head_size > 0);
     POWERSERVE_ASSERT((n_heads % n_kv_heads) == 0);
     POWERSERVE_ASSERT(pos.size() == q->m_shape[1]);
-    POWERSERVE_ASSERT(k->m_shape[0] == v->m_shape[0]);
-    POWERSERVE_ASSERT(k->m_shape[1] == static_cast<size_t>(head_size));
+    POWERSERVE_ASSERT(k->m_shape[0] == static_cast<size_t>(head_size));
+    POWERSERVE_ASSERT(k->m_shape[1] == v->m_shape[0]);
     POWERSERVE_ASSERT(v->m_shape[1] == static_cast<size_t>(head_size));
     POWERSERVE_ASSERT(k->m_shape[2] == static_cast<size_t>(n_kv_heads));
     POWERSERVE_ASSERT(v->m_shape[2] == static_cast<size_t>(n_kv_heads));

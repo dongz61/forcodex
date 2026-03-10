@@ -45,10 +45,9 @@ TensorNode *build_attention_scores(
     const size_t n_kv = static_cast<size_t>(pos.back() + 1);
     const size_t kv_gqa = head_size * n_head_kv;
     const int topk = get_ggml_topk();
-    const bool force_topk = topk > 0;
+    const bool use_topk = (topk > 0) && (batch_size == 1);
 
-    if (force_topk) {
-        POWERSERVE_ASSERT(batch_size == 1, "POWERSERVE_GGML_TOPK currently requires decode batch_size == 1");
+    if (use_topk) {
         POWERSERVE_ASSERT(k_cache->m_data && v_cache->m_data, "POWERSERVE_GGML_TOPK requires allocated KV buffers");
         auto *k_base = k_cache->m_data.get();
         auto *v_base = v_cache->m_data.get();
@@ -83,7 +82,7 @@ TensorNode *build_attention_scores(
          v_cache->element_size() * n_ctx * head_size * n_head_kv}
     );
 
-    if (force_topk) {
+    if (use_topk) {
         return build_attention_scores_topk(g, q, k, v, pos, head_size, n_head, n_head_kv, topk);
     }
     return build_attention_scores_dense(g, q, k, v, pos, mask, head_size, n_head, n_head_kv);

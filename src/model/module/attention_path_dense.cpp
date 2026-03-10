@@ -27,9 +27,8 @@ TensorNode *build_attention_scores_dense(
     const CausalAttentionMask &mask,
     size_t head_size,
     size_t n_head,
-    size_t n_head_kv
+    size_t /*n_head_kv*/
 ) {
-    POWERSERVE_UNUSED(n_head_kv);
     const size_t n_kv = static_cast<size_t>(pos.back() + 1);
     const size_t batch_size = pos.size();
     const float kq_scale = 1.0f / std::sqrt(float(head_size));
@@ -45,4 +44,3 @@ TensorNode *build_attention_scores_dense(
 }
 
 } // namespace powerserve
-

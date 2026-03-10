@@ -69,7 +69,8 @@ public:
             const char *actual = "(null)";
             if (m_data) {
                 // 注意：这里用 m_data.get()，并且只有在非空时才做 typeid(*ptr)
-                actual = typeid(*m_data.get()).name();
+                const BaseBuffer *base = m_data.get();
+                actual = typeid(*base).name();
             }
             fprintf(stderr, "[Tensor::get] bad cast or null buffer: want=%s, actual=%s\n",
                     typeid(Buffer).name(), actual);
