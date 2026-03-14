@@ -14,27 +14,286 @@
 
 #include "ggml-quants.h"
 #include "ggml.hpp"
+#include "core/logger.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <utility>
 #include <vector>
 
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
+#if defined(__aarch64__) || defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
 namespace powerserve::ggml {
 
 namespace {
-ALWAYS_INLINE float read_f32_at(const Tensor *t, size_t i0, size_t i1, size_t i2, size_t i3) {
-    const auto &buf = t->get<CPUBuffer>();
-    const auto *p = reinterpret_cast<const float *>(
-        reinterpret_cast<const char *>(buf.m_data) +
-        i0 * buf.m_stride[0] +
-        i1 * buf.m_stride[1] +
-        i2 * buf.m_stride[2] +
-        i3 * buf.m_stride[3]
+using Clock = std::chrono::steady_clock;
+
+struct TopKProfileGlobal {
+    std::atomic<uint64_t> calls{0};
+    std::atomic<uint64_t> total_ns{0};
+    std::atomic<uint64_t> select_ns{0};
+    std::atomic<uint64_t> softmax_ns{0};
+    std::atomic<uint64_t> reduce_ns{0};
+};
+
+TopKProfileGlobal g_topk_profile;
+
+ALWAYS_INLINE void maybe_log_topk_profile_every_1000() {
+    const uint64_t calls = g_topk_profile.calls.load(std::memory_order_relaxed);
+    if (calls == 0 || (calls % 1000) != 0) {
+        return;
+    }
+
+    const uint64_t total_ns = g_topk_profile.total_ns.load(std::memory_order_relaxed);
+    const uint64_t select_ns = g_topk_profile.select_ns.load(std::memory_order_relaxed);
+    const uint64_t softmax_ns = g_topk_profile.softmax_ns.load(std::memory_order_relaxed);
+    const uint64_t reduce_ns = g_topk_profile.reduce_ns.load(std::memory_order_relaxed);
+
+    const double calls_d = static_cast<double>(calls);
+    const double avg_total_ms = static_cast<double>(total_ns) / calls_d / 1e6;
+    const double avg_select_ms = static_cast<double>(select_ns) / calls_d / 1e6;
+    const double avg_softmax_ms = static_cast<double>(softmax_ns) / calls_d / 1e6;
+    const double avg_reduce_ms = static_cast<double>(reduce_ns) / calls_d / 1e6;
+
+    const double stage_sum = static_cast<double>(select_ns + softmax_ns + reduce_ns);
+    const double pct_select = stage_sum > 0.0 ? (100.0 * static_cast<double>(select_ns) / stage_sum) : 0.0;
+    const double pct_softmax = stage_sum > 0.0 ? (100.0 * static_cast<double>(softmax_ns) / stage_sum) : 0.0;
+    const double pct_reduce = stage_sum > 0.0 ? (100.0 * static_cast<double>(reduce_ns) / stage_sum) : 0.0;
+
+    POWERSERVE_LOG_INFO(
+        "TOPK_ATTN profile calls={} avg_total={:.3f}ms avg_select={:.3f}ms avg_softmax={:.3f}ms avg_reduce={:.3f}ms "
+        "stage_share(select/softmax/reduce)={:.1f}%/{:.1f}%/{:.1f}%",
+        calls,
+        avg_total_ms,
+        avg_select_ms,
+        avg_softmax_ms,
+        avg_reduce_ms,
+        pct_select,
+        pct_softmax,
+        pct_reduce
     );
-    return *p;
 }
+
+ALWAYS_INLINE bool topk_force_scalar() {
+    static int cached = -1;
+    if (cached >= 0) {
+        return cached == 1;
+    }
+    const char *v = std::getenv("POWERSERVE_TOPK_FORCE_SCALAR");
+    cached = (v && (
+        std::strcmp(v, "1") == 0 ||
+        std::strcmp(v, "true") == 0 ||
+        std::strcmp(v, "TRUE") == 0 ||
+        std::strcmp(v, "on") == 0 ||
+        std::strcmp(v, "ON") == 0
+    )) ? 1 : 0;
+    return cached == 1;
+}
+
+ALWAYS_INLINE float dot_f32_scalar_contig(const float *a, const float *b, int n) {
+    float sum = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        sum += a[static_cast<size_t>(i)] * b[static_cast<size_t>(i)];
+    }
+    return sum;
+}
+
+#if defined(__AVX2__)
+ALWAYS_INLINE float dot_f32_avx2(const float *a, const float *b, int n) {
+    int i = 0;
+    __m256 vsum = _mm256_setzero_ps();
+    for (; i + 7 < n; i += 8) {
+        const __m256 va = _mm256_loadu_ps(a + i);
+        const __m256 vb = _mm256_loadu_ps(b + i);
+#if defined(__FMA__)
+        vsum = _mm256_fmadd_ps(va, vb, vsum);
+#else
+        vsum = _mm256_add_ps(vsum, _mm256_mul_ps(va, vb));
+#endif
+    }
+    alignas(32) float lanes[8];
+    _mm256_store_ps(lanes, vsum);
+    float sum = lanes[0] + lanes[1] + lanes[2] + lanes[3] + lanes[4] + lanes[5] + lanes[6] + lanes[7];
+    for (; i < n; ++i) {
+        sum += a[static_cast<size_t>(i)] * b[static_cast<size_t>(i)];
+    }
+    return sum;
+}
+#endif
+
+#if defined(__aarch64__) || defined(__ARM_NEON)
+ALWAYS_INLINE float dot_f32_neon(const float *a, const float *b, int n) {
+    int i = 0;
+    float32x4_t vsum = vdupq_n_f32(0.0f);
+    for (; i + 3 < n; i += 4) {
+        const float32x4_t va = vld1q_f32(a + i);
+        const float32x4_t vb = vld1q_f32(b + i);
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FMA)
+        vsum = vfmaq_f32(vsum, va, vb);
+#else
+        vsum = vmlaq_f32(vsum, va, vb);
+#endif
+    }
+#if defined(__aarch64__)
+    float sum = vaddvq_f32(vsum);
+#else
+    float32x2_t sum2 = vadd_f32(vget_low_f32(vsum), vget_high_f32(vsum));
+    sum2 = vpadd_f32(sum2, sum2);
+    float sum = vget_lane_f32(sum2, 0);
+#endif
+    for (; i < n; ++i) {
+        sum += a[static_cast<size_t>(i)] * b[static_cast<size_t>(i)];
+    }
+    return sum;
+}
+#endif
+
+ALWAYS_INLINE float dot_f32_contig(const float *a, const float *b, int n) {
+    if (topk_force_scalar()) {
+        return dot_f32_scalar_contig(a, b, n);
+    }
+#if defined(__AVX2__)
+    return dot_f32_avx2(a, b, n);
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+    return dot_f32_neon(a, b, n);
+#else
+    return dot_f32_scalar_contig(a, b, n);
+#endif
+}
+
+struct TopKAttnLayout {
+    const char *q_data = nullptr;
+    const char *k_data = nullptr;
+    const char *v_data = nullptr;
+    float *out_data = nullptr;
+
+    size_t q_s0 = 0;
+    size_t q_s1 = 0;
+    size_t q_s2 = 0;
+    size_t k_s0 = 0;
+    size_t k_s1 = 0;
+    size_t k_s2 = 0;
+    size_t v_s0 = 0;
+    size_t v_s1 = 0;
+    size_t v_s2 = 0;
+
+    int head_size = 0;
+    int n_heads = 0;
+    int q_per_kv = 0;
+    float scale = 1.0f;
+};
+
+ALWAYS_INLINE void load_query_local(
+    const TopKAttnLayout &layout,
+    size_t b,
+    int qh,
+    std::vector<float> &q_local
+) {
+    const char *q_base = layout.q_data + b * layout.q_s1 + static_cast<size_t>(qh) * layout.q_s2;
+    for (int d = 0; d < layout.head_size; ++d) {
+        q_local[static_cast<size_t>(d)] =
+            *reinterpret_cast<const float *>(q_base + static_cast<size_t>(d) * layout.q_s0);
+    }
+}
+
+ALWAYS_INLINE void select_topk(
+    const TopKAttnLayout &layout,
+    int kvh,
+    int n_kv,
+    int k_use,
+    const std::vector<float> &q_local,
+    std::vector<std::pair<float, int>> &best
+) {
+    auto heap_cmp = [](const std::pair<float, int> &a, const std::pair<float, int> &b) { return a.first > b.first; };
+    best.clear();
+
+    for (int t_idx = 0; t_idx < n_kv; ++t_idx) {
+        const char *k_base = layout.k_data + static_cast<size_t>(t_idx) * layout.k_s1 + static_cast<size_t>(kvh) * layout.k_s2;
+        float dot = 0.0f;
+        if (layout.k_s0 == sizeof(float)) {
+            const auto *k_ptr = reinterpret_cast<const float *>(k_base);
+            dot = dot_f32_contig(q_local.data(), k_ptr, layout.head_size);
+        } else {
+            for (int d = 0; d < layout.head_size; ++d) {
+                const float kv = *reinterpret_cast<const float *>(k_base + static_cast<size_t>(d) * layout.k_s0);
+                dot += q_local[static_cast<size_t>(d)] * kv;
+            }
+        }
+        const float score = dot * layout.scale;
+
+        if (static_cast<int>(best.size()) < k_use) {
+            best.emplace_back(score, t_idx);
+            std::push_heap(best.begin(), best.end(), heap_cmp);
+        } else if (score > best.front().first) {
+            std::pop_heap(best.begin(), best.end(), heap_cmp);
+            best.back() = {score, t_idx};
+            std::push_heap(best.begin(), best.end(), heap_cmp);
+        }
+    }
+}
+
+ALWAYS_INLINE float softmax_topk(
+    const std::vector<std::pair<float, int>> &best,
+    std::vector<float> &probs
+) {
+    float smax = -std::numeric_limits<float>::infinity();
+    for (const auto &p : best) {
+        smax = std::max(smax, p.first);
+    }
+
+    probs.resize(best.size());
+    float denom = 0.0f;
+    for (size_t i = 0; i < best.size(); ++i) {
+        probs[i] = std::exp(best[i].first - smax);
+        denom += probs[i];
+    }
+    if (denom <= 0.0f) {
+        return 0.0f;
+    }
+    return 1.0f / denom;
+}
+
+ALWAYS_INLINE void reduce_topk_values(
+    const TopKAttnLayout &layout,
+    size_t b,
+    int qh,
+    int kvh,
+    const std::vector<std::pair<float, int>> &best,
+    const std::vector<float> &probs,
+    float inv_denom
+) {
+    float *out_ptr =
+        layout.out_data +
+        b * static_cast<size_t>(layout.n_heads * layout.head_size) +
+        static_cast<size_t>(qh * layout.head_size);
+
+    for (int d = 0; d < layout.head_size; ++d) {
+        float acc = 0.0f;
+        for (size_t i = 0; i < best.size(); ++i) {
+            const int t_idx = best[i].second;
+            const char *v_ptr =
+                layout.v_data +
+                static_cast<size_t>(t_idx) * layout.v_s0 +
+                static_cast<size_t>(d) * layout.v_s1 +
+                static_cast<size_t>(kvh) * layout.v_s2;
+            const float vv = *reinterpret_cast<const float *>(v_ptr);
+            acc += (probs[i] * inv_denom) * vv;
+        }
+        out_ptr[static_cast<size_t>(d)] = acc;
+    }
+}
+
 } // namespace
 
 void GGMLBackend::matmul(const Tensor *dst, const Tensor *src0, const Tensor *src1) const {
@@ -210,6 +469,8 @@ void GGMLBackend::topk_attn(
     int n_kv_heads,
     int head_size
 ) const {
+    const auto topk_t0 = Clock::now();
+
     POWERSERVE_ASSERT(out && q && k && v);
     POWERSERVE_ASSERT(out->m_dtype == DataType::FP32);
     POWERSERVE_ASSERT(q->m_dtype == DataType::FP32);
@@ -232,74 +493,107 @@ void GGMLBackend::topk_attn(
 
     const size_t batch = q->m_shape[1];
     const int q_per_kv = n_heads / n_kv_heads;
+    const auto &q_buf = q->get<CPUBuffer>();
+    const auto &k_buf = k->get<CPUBuffer>();
+    const auto &v_buf = v->get<CPUBuffer>();
 
-    std::vector<std::pair<float, int>> best;
-    best.reserve(static_cast<size_t>(topk) + 1);
-    std::vector<float> probs;
-    probs.reserve(static_cast<size_t>(topk));
+    TopKAttnLayout layout{
+        .q_data = reinterpret_cast<const char *>(q_buf.m_data),
+        .k_data = reinterpret_cast<const char *>(k_buf.m_data),
+        .v_data = reinterpret_cast<const char *>(v_buf.m_data),
+        .out_data = out_data,
+        .q_s0 = q_buf.m_stride[0],
+        .q_s1 = q_buf.m_stride[1],
+        .q_s2 = q_buf.m_stride[2],
+        .k_s0 = k_buf.m_stride[0],
+        .k_s1 = k_buf.m_stride[1],
+        .k_s2 = k_buf.m_stride[2],
+        .v_s0 = v_buf.m_stride[0],
+        .v_s1 = v_buf.m_stride[1],
+        .v_s2 = v_buf.m_stride[2],
+        .head_size = head_size,
+        .n_heads = n_heads,
+        .q_per_kv = q_per_kv,
+        .scale = scale,
+    };
 
-    for (size_t b = 0; b < batch; ++b) {
-        const int n_kv = std::max(0, pos[b] + 1);
-        for (int qh = 0; qh < n_heads; ++qh) {
+    const size_t total_queries = batch * static_cast<size_t>(n_heads);
+    const size_t n_threads = m_thread_pool->size();
+    std::atomic<uint64_t> call_select_ns{0};
+    std::atomic<uint64_t> call_softmax_ns{0};
+    std::atomic<uint64_t> call_reduce_ns{0};
+
+    m_thread_pool->run([&](size_t thread_id) {
+        std::vector<float> q_local(static_cast<size_t>(head_size));
+        std::vector<std::pair<float, int>> best;
+        best.reserve(static_cast<size_t>(topk));
+        std::vector<float> probs;
+        probs.reserve(static_cast<size_t>(topk));
+        uint64_t local_select_ns = 0;
+        uint64_t local_softmax_ns = 0;
+        uint64_t local_reduce_ns = 0;
+
+        const size_t q_begin = (total_queries * thread_id) / n_threads;
+        const size_t q_end = (total_queries * (thread_id + 1)) / n_threads;
+
+        for (size_t qi = q_begin; qi < q_end; ++qi) {
+            const size_t b = qi / static_cast<size_t>(n_heads);
+            const int qh = static_cast<int>(qi % static_cast<size_t>(n_heads));
             const int kvh = qh / q_per_kv;
-            best.clear();
-
-            for (int t_idx = 0; t_idx < n_kv; ++t_idx) {
-                float dot = 0.0f;
-                for (int d = 0; d < head_size; ++d) {
-                    const float qv = read_f32_at(q, static_cast<size_t>(d), b, static_cast<size_t>(qh), 0);
-                    const float kv = read_f32_at(k, static_cast<size_t>(d), static_cast<size_t>(t_idx), static_cast<size_t>(kvh), 0);
-                    dot += qv * kv;
-                }
-                const float score = dot * scale;
-
-                if (static_cast<int>(best.size()) < topk) {
-                    best.emplace_back(score, t_idx);
-                } else {
-                    auto min_it = std::min_element(
-                        best.begin(),
-                        best.end(),
-                        [](const auto &a, const auto &b) { return a.first < b.first; }
-                    );
-                    if (score > min_it->first) {
-                        *min_it = {score, t_idx};
-                    }
-                }
-            }
-
-            if (best.empty()) {
+            const int n_kv = std::max(0, pos[b] + 1);
+            const int k_use = std::min(topk, n_kv);
+            if (k_use <= 0) {
                 continue;
             }
 
-            float smax = -std::numeric_limits<float>::infinity();
-            for (const auto &p : best) {
-                smax = std::max(smax, p.first);
-            }
+            load_query_local(layout, b, qh, q_local);
 
-            probs.resize(best.size());
-            float denom = 0.0f;
-            for (size_t i = 0; i < best.size(); ++i) {
-                probs[i] = std::exp(best[i].first - smax);
-                denom += probs[i];
-            }
-            if (denom <= 0.0f) {
+            const auto ts0 = Clock::now();
+            select_topk(layout, kvh, n_kv, k_use, q_local, best);
+            const auto ts1 = Clock::now();
+            const float inv_denom = softmax_topk(best, probs);
+            const auto ts2 = Clock::now();
+            if (inv_denom <= 0.0f) {
+                local_select_ns += static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(ts1 - ts0).count()
+                );
+                local_softmax_ns += static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(ts2 - ts1).count()
+                );
                 continue;
             }
-            const float inv_denom = 1.0f / denom;
+            reduce_topk_values(layout, b, qh, kvh, best, probs, inv_denom);
+            const auto ts3 = Clock::now();
 
-            for (int d = 0; d < head_size; ++d) {
-                float acc = 0.0f;
-                for (size_t i = 0; i < best.size(); ++i) {
-                    const int t_idx = best[i].second;
-                    const float vv = read_f32_at(
-                        v, static_cast<size_t>(t_idx), static_cast<size_t>(d), static_cast<size_t>(kvh), 0
-                    );
-                    acc += (probs[i] * inv_denom) * vv;
-                }
-                out_data[b * static_cast<size_t>(n_heads * head_size) + static_cast<size_t>(qh * head_size + d)] = acc;
-            }
+            local_select_ns += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(ts1 - ts0).count()
+            );
+            local_softmax_ns += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(ts2 - ts1).count()
+            );
+            local_reduce_ns += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(ts3 - ts2).count()
+            );
         }
-    }
+
+        call_select_ns.fetch_add(local_select_ns, std::memory_order_relaxed);
+        call_softmax_ns.fetch_add(local_softmax_ns, std::memory_order_relaxed);
+        call_reduce_ns.fetch_add(local_reduce_ns, std::memory_order_relaxed);
+    });
+
+    const uint64_t total_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - topk_t0).count()
+    );
+    const uint64_t select_ns = call_select_ns.load(std::memory_order_relaxed);
+    const uint64_t softmax_ns = call_softmax_ns.load(std::memory_order_relaxed);
+    const uint64_t reduce_ns = call_reduce_ns.load(std::memory_order_relaxed);
+
+    g_topk_profile.calls.fetch_add(1, std::memory_order_relaxed);
+    g_topk_profile.total_ns.fetch_add(total_ns, std::memory_order_relaxed);
+    g_topk_profile.select_ns.fetch_add(select_ns, std::memory_order_relaxed);
+    g_topk_profile.softmax_ns.fetch_add(softmax_ns, std::memory_order_relaxed);
+    g_topk_profile.reduce_ns.fetch_add(reduce_ns, std::memory_order_relaxed);
+    maybe_log_topk_profile_every_1000();
 }
 
 void GGMLBackend::get_embedding(const Tensor *dst, const Tensor *weight, const std::vector<int> &tokens) const {
@@ -380,7 +674,10 @@ int GGMLBackend::get_n_tasks(std::shared_ptr<OpNode> op) {
         n_tasks = std::min((int64_t)num_threads, op->prev[0]->tensor()->nrows());
     } break;
     case OpType::TOPK_ATTN: {
-        n_tasks = 1;
+        const auto &params = op->get_params<TopKAttnParams>();
+        const int64_t batch = static_cast<int64_t>(op->next[0]->tensor()->m_shape[1]);
+        const int64_t work_items = batch * std::max(1, params.n_heads);
+        n_tasks = std::max<int64_t>(1, std::min<int64_t>(num_threads, work_items));
     } break;
 
 #if defined(POWERSERVE_WITH_QNN)
