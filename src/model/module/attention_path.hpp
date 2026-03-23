@@ -21,7 +21,7 @@
 
 namespace powerserve {
 
-int get_ggml_topk();
+int get_ggml_cluster_topk();
 
 TensorNode *build_attention_scores_dense(
     Graph &g,
@@ -35,21 +35,10 @@ TensorNode *build_attention_scores_dense(
     size_t n_head_kv
 );
 
-TensorNode *build_attention_scores_topk(
-    Graph &g,
-    TensorNode *q,
-    TensorNode *k,
-    TensorNode *v,
-    const std::vector<int> &pos,
-    size_t head_size,
-    size_t n_head,
-    size_t n_head_kv,
-    int topk
-);
-
 TensorNode *build_attention_scores(
     Graph &g,
     TensorNode *rope_q,
+    int64_t layer_id,
     const TensorNode *k_cache,
     const TensorNode *v_cache,
     const std::vector<int> &pos,

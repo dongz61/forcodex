@@ -14,6 +14,7 @@
 
 #include "backend/ggml/ggml_kv_pager.hpp"
 
+#include "backend/cpu_buffer.hpp"
 #include "core/logger.hpp"
 
 #include <algorithm>
@@ -364,6 +365,50 @@ bool GGMLKVPager::sync() {
         return false;
     }
     return fdatasync(m_fd) == 0;
+}
+
+auto GGMLKVPager::materialize_compact_kv(size_t layer_id, const std::vector<int> &token_positions) const -> CompactClusterKV {
+    POWERSERVE_ASSERT(layer_id < m_n_layers);
+
+    CompactClusterKV out{
+        .key = Tensor(DataType::FP32, {token_positions.size(), m_kv_dim, 1, 1}),
+        .value = Tensor(DataType::FP32, {token_positions.size(), m_kv_dim, 1, 1}),
+        .positions = token_positions,
+    };
+    std::sort(out.positions.begin(), out.positions.end());
+    out.positions.erase(std::unique(out.positions.begin(), out.positions.end()), out.positions.end());
+
+    out.key.m_shape[0] = out.positions.size();
+    out.value.m_shape[0] = out.positions.size();
+    out.key.m_data = CPUBuffer::create_buffer<float>(out.key.m_shape);
+    out.value.m_data = CPUBuffer::create_buffer<float>(out.value.m_shape);
+
+    float *key_dst = static_cast<float *>(out.key.get<CPUBuffer>().m_data);
+    float *value_dst = static_cast<float *>(out.value.get<CPUBuffer>().m_data);
+    const auto &key_src = m_kv.key_buffer_for_layer(layer_id);
+    const auto &value_src = m_kv.value_buffer_for_layer(layer_id);
+    const size_t compact_tokens = out.positions.size();
+
+    for (size_t compact_idx = 0; compact_idx < compact_tokens; ++compact_idx) {
+        const int token_position = out.positions[compact_idx];
+        POWERSERVE_ASSERT(token_position >= 0);
+        POWERSERVE_ASSERT(static_cast<size_t>(token_position) < m_n_ctx);
+
+        const size_t src_k_offset = static_cast<size_t>(token_position) * m_kv_dim;
+        const size_t dst_k_offset = compact_idx * m_kv_dim;
+        std::copy_n(
+            key_src.begin() + static_cast<std::ptrdiff_t>(src_k_offset),
+            static_cast<std::ptrdiff_t>(m_kv_dim),
+            key_dst + static_cast<std::ptrdiff_t>(dst_k_offset)
+        );
+
+        for (size_t dim = 0; dim < m_kv_dim; ++dim) {
+            value_dst[dim * compact_tokens + compact_idx] =
+                value_src[dim * m_n_ctx + static_cast<size_t>(token_position)];
+        }
+    }
+
+    return out;
 }
 
 bool GGMLKVPager::write_header() {

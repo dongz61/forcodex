@@ -153,14 +153,6 @@ KVRuntimeState prepare_kv_runtime(
             const bool need_pager_reset = req_begin == 0 || request_rewind || request_at_reset_floor;
 
             if (need_pager_reset) {
-                POWERSERVE_LOG_INFO(
-                    "KV pager runtime reset: req_begin={} kv_cursor={} kv_reset_floor={} rewind={} at_reset_floor={}",
-                    req_begin,
-                    kv_cursor,
-                    kv_reset_floor,
-                    request_rewind,
-                    request_at_reset_floor
-                );
                 kv_pager->reset_runtime_state();
                 if (ggml_kv.slot_mode_enabled()) {
                     ggml_kv.clear_all_mappings();

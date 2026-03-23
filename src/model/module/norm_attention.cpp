@@ -119,7 +119,8 @@ TensorNode *NormAttention::build(
         g.copy(v_cache_view, v);
     }
 
-    auto att_scores = build_attention_scores(g, rope_q, k_cache, v_cache, pos, mask, head_size, n_head, n_head_kv, n_ctx);
+    auto att_scores =
+        build_attention_scores(g, rope_q, L, k_cache, v_cache, pos, mask, head_size, n_head, n_head_kv, n_ctx);
 
     auto attn_output_w = g.add_tensor(m_weights->lw[L].attn_output);
     auto attn_o        = g.mat_mul(attn_output_w, att_scores); // (embd_dim, bs, 1, 1)

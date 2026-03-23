@@ -25,6 +25,12 @@
 
 namespace powerserve::ggml {
 
+struct CompactClusterKV {
+    Tensor key;
+    Tensor value;
+    std::vector<int> positions;
+};
+
 struct GGMLKVPager {
 public:
     enum class LayerState : uint8_t {
@@ -59,6 +65,7 @@ public:
     void mark_dirty_layer(size_t layer_id);
     bool evict_layer(size_t layer_id, size_t valid_tokens, bool do_sync);
     bool sync();
+    auto materialize_compact_kv(size_t layer_id, const std::vector<int> &token_positions) const -> CompactClusterKV;
 
 private:
     bool acquire_layer_sync(size_t layer_id, size_t need_tokens);

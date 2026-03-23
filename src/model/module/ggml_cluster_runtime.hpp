@@ -12,36 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "attention_path.hpp"
+#pragma once
 
-#include <cmath>
+#include <string>
 
-namespace powerserve {
+namespace powerserve::ggml {
 
-TensorNode *build_attention_scores_topk(
-    Graph &g,
-    TensorNode *q,
-    TensorNode *k,
-    TensorNode *v,
-    const std::vector<int> &pos,
-    size_t head_size,
-    size_t n_head,
-    size_t n_head_kv,
-    int topk
-) {
-    const float kq_scale = 1.0f / std::sqrt(float(head_size));
-    return g.topk_attn(
-        q,
-        k,
-        v,
-        pos,
-        kq_scale,
-        topk,
-        static_cast<int>(n_head),
-        static_cast<int>(n_head_kv),
-        static_cast<int>(head_size)
-    );
-}
+struct GGMLClusterManager;
+struct GGMLKVPager;
 
-} // namespace powerserve
+struct GGMLClusterRuntimeView {
+    const GGMLClusterManager *manager = nullptr;
+    const GGMLKVPager *pager = nullptr;
+};
 
+void register_cluster_runtime(
+    const std::string &model_id,
+    const GGMLClusterManager *manager,
+    const GGMLKVPager *pager
+);
+auto get_cluster_runtime(const std::string &model_id) -> GGMLClusterRuntimeView;
+
+} // namespace powerserve::ggml

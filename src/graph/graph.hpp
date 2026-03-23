@@ -62,13 +62,12 @@ public:
 
     auto softmax(TensorNode *x) -> TensorNode *;
     auto softmax_ext(TensorNode *x, TensorNode *mask, float scale, float max_bias) -> TensorNode *;
-    auto topk_attn(
+    auto cluster_attn(
         TensorNode *q,
-        TensorNode *k,
-        TensorNode *v,
-        const std::vector<int> &pos,
+        const std::string &model_id,
+        int layer_id,
         float scale,
-        int topk,
+        int topk_clusters,
         int n_heads,
         int n_kv_heads,
         int head_size

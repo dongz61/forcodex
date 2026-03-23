@@ -110,6 +110,8 @@ public:
     virtual auto generate(
         const Tokenizer &tokenizer, Sampler &sampler, const std::string &prompt, int steps, size_t batch_size
     ) -> std::shared_ptr<TokenIterator> = 0;
+
+    virtual void on_prefill_finished() {}
 };
 
 using ModelPtr = std::shared_ptr<Model>;
@@ -158,6 +160,7 @@ public:
             position = m_platform->get_kv_position(model_id);
             n_prefilled += bs;
         }
+        m_model.on_prefill_finished();
         position = m_platform->get_kv_position(model_id);
         m_tokens.push_back(prompt_tokens.back());
     }

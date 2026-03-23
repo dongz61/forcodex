@@ -475,26 +475,23 @@ void Executor::run() {
             backend->softmax_ext(out, x, mask, scale, max_bias);
         } break;
 
-        case OpType::TOPK_ATTN: {
+        case OpType::CLUSTER_ATTN: {
             auto out = op->output();
             auto q = op->prev[0]->tensor();
-            auto k = op->prev[1]->tensor();
-            auto v = op->prev[2]->tensor();
-            const auto &params = op->get_params<TopKAttnParams>();
+            const auto &params = op->get_params<ClusterAttnParams>();
 
             auto *ggml_backend = dynamic_cast<powerserve::ggml::GGMLBackend *>(backend);
             POWERSERVE_ASSERT(
                 ggml_backend != nullptr,
-                "TOPK_ATTN is currently only implemented in GGML backend"
+                "CLUSTER_ATTN is currently only implemented in GGML backend"
             );
-            ggml_backend->topk_attn(
+            ggml_backend->cluster_attn(
                 out,
                 q,
-                k,
-                v,
-                params.pos,
+                params.model_id,
+                params.layer_id,
                 params.scale,
-                params.topk,
+                params.topk_clusters,
                 params.n_heads,
                 params.n_kv_heads,
                 params.head_size

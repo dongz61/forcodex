@@ -20,8 +20,8 @@
 
 namespace powerserve {
 
-int get_ggml_topk() {
-    const char *v = std::getenv("POWERSERVE_GGML_TOPK");
+int get_ggml_cluster_topk() {
+    const char *v = std::getenv("POWERSERVE_GGML_CLUSTER_TOPK");
     if (!v || v[0] == '\0') {
         return 0;
     }
@@ -32,6 +32,7 @@ int get_ggml_topk() {
 TensorNode *build_attention_scores(
     Graph &g,
     TensorNode *rope_q,
+    int64_t layer_id,
     const TensorNode *k_cache,
     const TensorNode *v_cache,
     const std::vector<int> &pos,
@@ -44,16 +45,16 @@ TensorNode *build_attention_scores(
     const size_t batch_size = pos.size();
     const size_t n_kv = static_cast<size_t>(pos.back() + 1);
     const size_t kv_gqa = head_size * n_head_kv;
-    const int topk = get_ggml_topk();
-    const bool use_topk = (topk > 0) && (batch_size == 1);
+    const int cluster_topk = get_ggml_cluster_topk();
+    const bool use_cluster = (cluster_topk > 0) && (batch_size == 1);
 
-    if (use_topk) {
-        POWERSERVE_ASSERT(k_cache->m_data && v_cache->m_data, "POWERSERVE_GGML_TOPK requires allocated KV buffers");
+    if (use_cluster) {
+        POWERSERVE_ASSERT(k_cache->m_data && v_cache->m_data, "POWERSERVE_GGML_CLUSTER_TOPK requires allocated KV buffers");
         auto *k_base = k_cache->m_data.get();
         auto *v_base = v_cache->m_data.get();
         POWERSERVE_ASSERT(
             dynamic_cast<CPUBuffer *>(k_base) != nullptr && dynamic_cast<CPUBuffer *>(v_base) != nullptr,
-            "POWERSERVE_GGML_TOPK is currently only supported on GGML/CPU KV cache tensors"
+            "POWERSERVE_GGML_CLUSTER_TOPK is currently only supported on GGML/CPU KV cache tensors"
         );
     }
 
@@ -82,8 +83,17 @@ TensorNode *build_attention_scores(
          v_cache->element_size() * n_ctx * head_size * n_head_kv}
     );
 
-    if (use_topk) {
-        return build_attention_scores_topk(g, q, k, v, pos, head_size, n_head, n_head_kv, topk);
+    if (use_cluster) {
+        return g.cluster_attn(
+            q,
+            g.m_model_id,
+            static_cast<int>(layer_id),
+            1.0f / std::sqrt(float(head_size)),
+            cluster_topk,
+            static_cast<int>(n_head),
+            static_cast<int>(n_head_kv),
+            static_cast<int>(head_size)
+        );
     }
     return build_attention_scores_dense(g, q, k, v, pos, mask, head_size, n_head, n_head_kv);
 }

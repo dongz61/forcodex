@@ -14,16 +14,15 @@
 
 #include "ggml-quants.h"
 #include "ggml.hpp"
+#include "backend/ggml/ggml_cluster_manager.hpp"
+#include "backend/ggml/ggml_kv_pager.hpp"
 #include "core/logger.hpp"
+#include "model/module/ggml_cluster_runtime.hpp"
 
 #include <algorithm>
-#include <atomic>
-#include <chrono>
 #include <cmath>
-#include <cstdlib>
 #include <cstring>
 #include <limits>
-#include <utility>
 #include <vector>
 
 #if defined(__AVX2__)
@@ -37,70 +36,6 @@
 namespace powerserve::ggml {
 
 namespace {
-using Clock = std::chrono::steady_clock;
-
-struct TopKProfileGlobal {
-    std::atomic<uint64_t> calls{0};
-    std::atomic<uint64_t> total_ns{0};
-    std::atomic<uint64_t> select_ns{0};
-    std::atomic<uint64_t> softmax_ns{0};
-    std::atomic<uint64_t> reduce_ns{0};
-};
-
-TopKProfileGlobal g_topk_profile;
-
-ALWAYS_INLINE void maybe_log_topk_profile_every_1000() {
-    const uint64_t calls = g_topk_profile.calls.load(std::memory_order_relaxed);
-    if (calls == 0 || (calls % 1000) != 0) {
-        return;
-    }
-
-    const uint64_t total_ns = g_topk_profile.total_ns.load(std::memory_order_relaxed);
-    const uint64_t select_ns = g_topk_profile.select_ns.load(std::memory_order_relaxed);
-    const uint64_t softmax_ns = g_topk_profile.softmax_ns.load(std::memory_order_relaxed);
-    const uint64_t reduce_ns = g_topk_profile.reduce_ns.load(std::memory_order_relaxed);
-
-    const double calls_d = static_cast<double>(calls);
-    const double avg_total_ms = static_cast<double>(total_ns) / calls_d / 1e6;
-    const double avg_select_ms = static_cast<double>(select_ns) / calls_d / 1e6;
-    const double avg_softmax_ms = static_cast<double>(softmax_ns) / calls_d / 1e6;
-    const double avg_reduce_ms = static_cast<double>(reduce_ns) / calls_d / 1e6;
-
-    const double stage_sum = static_cast<double>(select_ns + softmax_ns + reduce_ns);
-    const double pct_select = stage_sum > 0.0 ? (100.0 * static_cast<double>(select_ns) / stage_sum) : 0.0;
-    const double pct_softmax = stage_sum > 0.0 ? (100.0 * static_cast<double>(softmax_ns) / stage_sum) : 0.0;
-    const double pct_reduce = stage_sum > 0.0 ? (100.0 * static_cast<double>(reduce_ns) / stage_sum) : 0.0;
-
-    POWERSERVE_LOG_INFO(
-        "TOPK_ATTN profile calls={} avg_total={:.3f}ms avg_select={:.3f}ms avg_softmax={:.3f}ms avg_reduce={:.3f}ms "
-        "stage_share(select/softmax/reduce)={:.1f}%/{:.1f}%/{:.1f}%",
-        calls,
-        avg_total_ms,
-        avg_select_ms,
-        avg_softmax_ms,
-        avg_reduce_ms,
-        pct_select,
-        pct_softmax,
-        pct_reduce
-    );
-}
-
-ALWAYS_INLINE bool topk_force_scalar() {
-    static int cached = -1;
-    if (cached >= 0) {
-        return cached == 1;
-    }
-    const char *v = std::getenv("POWERSERVE_TOPK_FORCE_SCALAR");
-    cached = (v && (
-        std::strcmp(v, "1") == 0 ||
-        std::strcmp(v, "true") == 0 ||
-        std::strcmp(v, "TRUE") == 0 ||
-        std::strcmp(v, "on") == 0 ||
-        std::strcmp(v, "ON") == 0
-    )) ? 1 : 0;
-    return cached == 1;
-}
-
 ALWAYS_INLINE float dot_f32_scalar_contig(const float *a, const float *b, int n) {
     float sum = 0.0f;
     for (int i = 0; i < n; ++i) {
@@ -160,9 +95,6 @@ ALWAYS_INLINE float dot_f32_neon(const float *a, const float *b, int n) {
 #endif
 
 ALWAYS_INLINE float dot_f32_contig(const float *a, const float *b, int n) {
-    if (topk_force_scalar()) {
-        return dot_f32_scalar_contig(a, b, n);
-    }
 #if defined(__AVX2__)
     return dot_f32_avx2(a, b, n);
 #elif defined(__aarch64__) || defined(__ARM_NEON)
@@ -172,123 +104,74 @@ ALWAYS_INLINE float dot_f32_contig(const float *a, const float *b, int n) {
 #endif
 }
 
-struct TopKAttnLayout {
+struct ClusterQLayout {
     const char *q_data = nullptr;
-    const char *k_data = nullptr;
-    const char *v_data = nullptr;
     float *out_data = nullptr;
-
     size_t q_s0 = 0;
     size_t q_s1 = 0;
     size_t q_s2 = 0;
-    size_t k_s0 = 0;
-    size_t k_s1 = 0;
-    size_t k_s2 = 0;
-    size_t v_s0 = 0;
-    size_t v_s1 = 0;
-    size_t v_s2 = 0;
-
     int head_size = 0;
     int n_heads = 0;
     int q_per_kv = 0;
     float scale = 1.0f;
 };
 
-ALWAYS_INLINE void load_query_local(
-    const TopKAttnLayout &layout,
-    size_t b,
-    int qh,
-    std::vector<float> &q_local
-) {
-    const char *q_base = layout.q_data + b * layout.q_s1 + static_cast<size_t>(qh) * layout.q_s2;
+ALWAYS_INLINE void load_cluster_query_local(const ClusterQLayout &layout, int qh, std::vector<float> &q_local) {
+    const char *q_base = layout.q_data + static_cast<size_t>(qh) * layout.q_s2;
     for (int d = 0; d < layout.head_size; ++d) {
         q_local[static_cast<size_t>(d)] =
             *reinterpret_cast<const float *>(q_base + static_cast<size_t>(d) * layout.q_s0);
     }
 }
 
-ALWAYS_INLINE void select_topk(
-    const TopKAttnLayout &layout,
+ALWAYS_INLINE void select_topk_cluster_ids(
+    const std::vector<ClusterInfo> &clusters,
     int kvh,
-    int n_kv,
-    int k_use,
+    int head_size,
+    int topk_clusters,
+    float scale,
     const std::vector<float> &q_local,
-    std::vector<std::pair<float, int>> &best
+    std::vector<int> &cluster_ids
 ) {
     auto heap_cmp = [](const std::pair<float, int> &a, const std::pair<float, int> &b) { return a.first > b.first; };
-    best.clear();
+    std::vector<std::pair<float, int>> best;
+    best.reserve(static_cast<size_t>(topk_clusters));
 
-    for (int t_idx = 0; t_idx < n_kv; ++t_idx) {
-        const char *k_base = layout.k_data + static_cast<size_t>(t_idx) * layout.k_s1 + static_cast<size_t>(kvh) * layout.k_s2;
-        float dot = 0.0f;
-        if (layout.k_s0 == sizeof(float)) {
-            const auto *k_ptr = reinterpret_cast<const float *>(k_base);
-            dot = dot_f32_contig(q_local.data(), k_ptr, layout.head_size);
-        } else {
-            for (int d = 0; d < layout.head_size; ++d) {
-                const float kv = *reinterpret_cast<const float *>(k_base + static_cast<size_t>(d) * layout.k_s0);
-                dot += q_local[static_cast<size_t>(d)] * kv;
-            }
-        }
-        const float score = dot * layout.scale;
-
-        if (static_cast<int>(best.size()) < k_use) {
-            best.emplace_back(score, t_idx);
+    for (size_t cluster_id = 0; cluster_id < clusters.size(); ++cluster_id) {
+        const auto &center = clusters[cluster_id].center;
+        const float *center_slice = center.data() + static_cast<size_t>(kvh * head_size);
+        const float score = dot_f32_contig(q_local.data(), center_slice, head_size) * scale;
+        if (static_cast<int>(best.size()) < topk_clusters) {
+            best.emplace_back(score, static_cast<int>(cluster_id));
             std::push_heap(best.begin(), best.end(), heap_cmp);
         } else if (score > best.front().first) {
             std::pop_heap(best.begin(), best.end(), heap_cmp);
-            best.back() = {score, t_idx};
+            best.back() = {score, static_cast<int>(cluster_id)};
             std::push_heap(best.begin(), best.end(), heap_cmp);
         }
     }
+
+    cluster_ids.clear();
+    cluster_ids.reserve(best.size());
+    for (const auto &entry : best) {
+        cluster_ids.push_back(entry.second);
+    }
 }
 
-ALWAYS_INLINE float softmax_topk(
-    const std::vector<std::pair<float, int>> &best,
-    std::vector<float> &probs
-) {
-    float smax = -std::numeric_limits<float>::infinity();
-    for (const auto &p : best) {
-        smax = std::max(smax, p.first);
-    }
-
-    probs.resize(best.size());
-    float denom = 0.0f;
-    for (size_t i = 0; i < best.size(); ++i) {
-        probs[i] = std::exp(best[i].first - smax);
-        denom += probs[i];
-    }
-    if (denom <= 0.0f) {
-        return 0.0f;
-    }
-    return 1.0f / denom;
-}
-
-ALWAYS_INLINE void reduce_topk_values(
-    const TopKAttnLayout &layout,
-    size_t b,
-    int qh,
+ALWAYS_INLINE void reduce_dense_values_from_compact(
+    float *out_ptr,
+    const float *compact_v,
+    size_t compact_tokens,
+    int head_size,
     int kvh,
-    const std::vector<std::pair<float, int>> &best,
     const std::vector<float> &probs,
     float inv_denom
 ) {
-    float *out_ptr =
-        layout.out_data +
-        b * static_cast<size_t>(layout.n_heads * layout.head_size) +
-        static_cast<size_t>(qh * layout.head_size);
-
-    for (int d = 0; d < layout.head_size; ++d) {
+    for (int d = 0; d < head_size; ++d) {
         float acc = 0.0f;
-        for (size_t i = 0; i < best.size(); ++i) {
-            const int t_idx = best[i].second;
-            const char *v_ptr =
-                layout.v_data +
-                static_cast<size_t>(t_idx) * layout.v_s0 +
-                static_cast<size_t>(d) * layout.v_s1 +
-                static_cast<size_t>(kvh) * layout.v_s2;
-            const float vv = *reinterpret_cast<const float *>(v_ptr);
-            acc += (probs[i] * inv_denom) * vv;
+        const size_t value_row = static_cast<size_t>(kvh * head_size + d) * compact_tokens;
+        for (size_t t = 0; t < compact_tokens; ++t) {
+            acc += (probs[t] * inv_denom) * compact_v[value_row + t];
         }
         out_ptr[static_cast<size_t>(d)] = acc;
     }
@@ -457,143 +340,110 @@ void GGMLBackend::softmax_ext(const Tensor *out, const Tensor *x, const Tensor *
     });
 }
 
-void GGMLBackend::topk_attn(
+void GGMLBackend::cluster_attn(
     const Tensor *out,
     const Tensor *q,
-    const Tensor *k,
-    const Tensor *v,
-    const std::vector<int> &pos,
+    const std::string &model_id,
+    int layer_id,
     float scale,
-    int topk,
+    int topk_clusters,
     int n_heads,
     int n_kv_heads,
     int head_size
 ) const {
-    const auto topk_t0 = Clock::now();
-
-    POWERSERVE_ASSERT(out && q && k && v);
+    POWERSERVE_ASSERT(out && q);
     POWERSERVE_ASSERT(out->m_dtype == DataType::FP32);
     POWERSERVE_ASSERT(q->m_dtype == DataType::FP32);
-    POWERSERVE_ASSERT(k->m_dtype == DataType::FP32);
-    POWERSERVE_ASSERT(v->m_dtype == DataType::FP32);
-    POWERSERVE_ASSERT(topk > 0);
+    POWERSERVE_ASSERT(q->m_shape[1] == 1, "CLUSTER_ATTN currently only supports batch_size == 1");
+    POWERSERVE_ASSERT(topk_clusters > 0);
     POWERSERVE_ASSERT(n_heads > 0);
     POWERSERVE_ASSERT(n_kv_heads > 0);
     POWERSERVE_ASSERT(head_size > 0);
     POWERSERVE_ASSERT((n_heads % n_kv_heads) == 0);
-    POWERSERVE_ASSERT(pos.size() == q->m_shape[1]);
-    POWERSERVE_ASSERT(k->m_shape[0] == static_cast<size_t>(head_size));
-    POWERSERVE_ASSERT(k->m_shape[1] == v->m_shape[0]);
-    POWERSERVE_ASSERT(v->m_shape[1] == static_cast<size_t>(head_size));
-    POWERSERVE_ASSERT(k->m_shape[2] == static_cast<size_t>(n_kv_heads));
-    POWERSERVE_ASSERT(v->m_shape[2] == static_cast<size_t>(n_kv_heads));
+
+    const auto runtime = get_cluster_runtime(model_id);
+    POWERSERVE_ASSERT(runtime.manager != nullptr, "CLUSTER_ATTN missing cluster manager for model_id={}", model_id);
+    POWERSERVE_ASSERT(runtime.pager != nullptr, "CLUSTER_ATTN missing KV pager for model_id={}", model_id);
+
+    const auto &clusters = runtime.manager->get_layer_clusters(static_cast<size_t>(layer_id));
+    POWERSERVE_ASSERT(!clusters.empty(), "CLUSTER_ATTN requires non-empty clusters at layer={}", layer_id);
 
     auto *out_data = reinterpret_cast<float *>(out->get<CPUBuffer>().m_data);
     std::fill(out_data, out_data + out->n_elements(), 0.0f);
 
-    const size_t batch = q->m_shape[1];
     const int q_per_kv = n_heads / n_kv_heads;
     const auto &q_buf = q->get<CPUBuffer>();
-    const auto &k_buf = k->get<CPUBuffer>();
-    const auto &v_buf = v->get<CPUBuffer>();
-
-    TopKAttnLayout layout{
+    ClusterQLayout layout{
         .q_data = reinterpret_cast<const char *>(q_buf.m_data),
-        .k_data = reinterpret_cast<const char *>(k_buf.m_data),
-        .v_data = reinterpret_cast<const char *>(v_buf.m_data),
         .out_data = out_data,
         .q_s0 = q_buf.m_stride[0],
         .q_s1 = q_buf.m_stride[1],
         .q_s2 = q_buf.m_stride[2],
-        .k_s0 = k_buf.m_stride[0],
-        .k_s1 = k_buf.m_stride[1],
-        .k_s2 = k_buf.m_stride[2],
-        .v_s0 = v_buf.m_stride[0],
-        .v_s1 = v_buf.m_stride[1],
-        .v_s2 = v_buf.m_stride[2],
         .head_size = head_size,
         .n_heads = n_heads,
         .q_per_kv = q_per_kv,
         .scale = scale,
     };
 
-    const size_t total_queries = batch * static_cast<size_t>(n_heads);
-    const size_t n_threads = m_thread_pool->size();
-    std::atomic<uint64_t> call_select_ns{0};
-    std::atomic<uint64_t> call_softmax_ns{0};
-    std::atomic<uint64_t> call_reduce_ns{0};
+    std::vector<float> q_local(static_cast<size_t>(head_size));
+    std::vector<int> cluster_ids;
+    std::vector<char> selected(static_cast<size_t>(clusters.size()), 0);
+    for (int qh = 0; qh < n_heads; ++qh) {
+        const int kvh = qh / q_per_kv;
+        load_cluster_query_local(layout, qh, q_local);
+        select_topk_cluster_ids(
+            clusters,
+            kvh,
+            head_size,
+            std::min(topk_clusters, static_cast<int>(clusters.size())),
+            scale,
+            q_local,
+            cluster_ids
+        );
+        for (int cluster_id : cluster_ids) {
+            selected[static_cast<size_t>(cluster_id)] = 1;
+        }
+    }
 
-    m_thread_pool->run([&](size_t thread_id) {
-        std::vector<float> q_local(static_cast<size_t>(head_size));
-        std::vector<std::pair<float, int>> best;
-        best.reserve(static_cast<size_t>(topk));
-        std::vector<float> probs;
-        probs.reserve(static_cast<size_t>(topk));
-        uint64_t local_select_ns = 0;
-        uint64_t local_softmax_ns = 0;
-        uint64_t local_reduce_ns = 0;
+    std::vector<int> token_positions;
+    for (size_t cluster_id = 0; cluster_id < clusters.size(); ++cluster_id) {
+        if (!selected[cluster_id]) {
+            continue;
+        }
+        const auto &positions = clusters[cluster_id].token_positions;
+        token_positions.insert(token_positions.end(), positions.begin(), positions.end());
+    }
+    POWERSERVE_ASSERT(!token_positions.empty(), "CLUSTER_ATTN selected no tokens at layer={}", layer_id);
 
-        const size_t q_begin = (total_queries * thread_id) / n_threads;
-        const size_t q_end = (total_queries * (thread_id + 1)) / n_threads;
+    const auto compact = runtime.pager->materialize_compact_kv(static_cast<size_t>(layer_id), token_positions);
+    const size_t compact_tokens = compact.positions.size();
+    POWERSERVE_ASSERT(compact_tokens > 0, "CLUSTER_ATTN materialized empty compact KV at layer={}", layer_id);
 
-        for (size_t qi = q_begin; qi < q_end; ++qi) {
-            const size_t b = qi / static_cast<size_t>(n_heads);
-            const int qh = static_cast<int>(qi % static_cast<size_t>(n_heads));
-            const int kvh = qh / q_per_kv;
-            const int n_kv = std::max(0, pos[b] + 1);
-            const int k_use = std::min(topk, n_kv);
-            if (k_use <= 0) {
-                continue;
-            }
+    const float *compact_k = static_cast<const float *>(compact.key.get<CPUBuffer>().m_data);
+    const float *compact_v = static_cast<const float *>(compact.value.get<CPUBuffer>().m_data);
 
-            load_query_local(layout, b, qh, q_local);
+    std::vector<float> probs(compact_tokens);
+    for (int qh = 0; qh < n_heads; ++qh) {
+        const int kvh = qh / q_per_kv;
+        load_cluster_query_local(layout, qh, q_local);
 
-            const auto ts0 = Clock::now();
-            select_topk(layout, kvh, n_kv, k_use, q_local, best);
-            const auto ts1 = Clock::now();
-            const float inv_denom = softmax_topk(best, probs);
-            const auto ts2 = Clock::now();
-            if (inv_denom <= 0.0f) {
-                local_select_ns += static_cast<uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(ts1 - ts0).count()
-                );
-                local_softmax_ns += static_cast<uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(ts2 - ts1).count()
-                );
-                continue;
-            }
-            reduce_topk_values(layout, b, qh, kvh, best, probs, inv_denom);
-            const auto ts3 = Clock::now();
-
-            local_select_ns += static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(ts1 - ts0).count()
-            );
-            local_softmax_ns += static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(ts2 - ts1).count()
-            );
-            local_reduce_ns += static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(ts3 - ts2).count()
-            );
+        float smax = -std::numeric_limits<float>::infinity();
+        for (size_t t = 0; t < compact_tokens; ++t) {
+            const float *k_slice = compact_k + t * static_cast<size_t>(n_kv_heads * head_size) + static_cast<size_t>(kvh * head_size);
+            probs[t] = dot_f32_contig(q_local.data(), k_slice, head_size) * scale;
+            smax = std::max(smax, probs[t]);
         }
 
-        call_select_ns.fetch_add(local_select_ns, std::memory_order_relaxed);
-        call_softmax_ns.fetch_add(local_softmax_ns, std::memory_order_relaxed);
-        call_reduce_ns.fetch_add(local_reduce_ns, std::memory_order_relaxed);
-    });
+        float denom = 0.0f;
+        for (size_t t = 0; t < compact_tokens; ++t) {
+            probs[t] = std::exp(probs[t] - smax);
+            denom += probs[t];
+        }
+        POWERSERVE_ASSERT(denom > 0.0f, "CLUSTER_ATTN softmax denom must be positive");
 
-    const uint64_t total_ns = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - topk_t0).count()
-    );
-    const uint64_t select_ns = call_select_ns.load(std::memory_order_relaxed);
-    const uint64_t softmax_ns = call_softmax_ns.load(std::memory_order_relaxed);
-    const uint64_t reduce_ns = call_reduce_ns.load(std::memory_order_relaxed);
-
-    g_topk_profile.calls.fetch_add(1, std::memory_order_relaxed);
-    g_topk_profile.total_ns.fetch_add(total_ns, std::memory_order_relaxed);
-    g_topk_profile.select_ns.fetch_add(select_ns, std::memory_order_relaxed);
-    g_topk_profile.softmax_ns.fetch_add(softmax_ns, std::memory_order_relaxed);
-    g_topk_profile.reduce_ns.fetch_add(reduce_ns, std::memory_order_relaxed);
-    maybe_log_topk_profile_every_1000();
+        float *out_ptr = out_data + static_cast<size_t>(qh * head_size);
+        reduce_dense_values_from_compact(out_ptr, compact_v, compact_tokens, head_size, kvh, probs, 1.0f / denom);
+    }
 }
 
 void GGMLBackend::get_embedding(const Tensor *dst, const Tensor *weight, const std::vector<int> &tokens) const {
@@ -673,8 +523,8 @@ int GGMLBackend::get_n_tasks(std::shared_ptr<OpNode> op) {
     case OpType::SOFTMAX: {
         n_tasks = std::min((int64_t)num_threads, op->prev[0]->tensor()->nrows());
     } break;
-    case OpType::TOPK_ATTN: {
-        const auto &params = op->get_params<TopKAttnParams>();
+    case OpType::CLUSTER_ATTN: {
+        const auto &params = op->get_params<ClusterAttnParams>();
         const int64_t batch = static_cast<int64_t>(op->next[0]->tensor()->m_shape[1]);
         const int64_t work_items = batch * std::max(1, params.n_heads);
         n_tasks = std::max<int64_t>(1, std::min<int64_t>(num_threads, work_items));

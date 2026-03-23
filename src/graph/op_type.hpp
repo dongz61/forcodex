@@ -39,7 +39,7 @@ enum class OpType {
     CONT,
     VIEW,
     SOFTMAX_EXT,
-    TOPK_ATTN,
+    CLUSTER_ATTN,
     GET_MASK,
     TRANSPOSE,
     INSERT_IMG_EMBEDDIGN,

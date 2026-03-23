@@ -70,7 +70,7 @@ void GGMLBackend::plan(std::vector<std::shared_ptr<OpNode>> &ops) {
 
         case OpType::SOFTMAX_EXT:
         case OpType::SOFTMAX:
-        case OpType::TOPK_ATTN:
+        case OpType::CLUSTER_ATTN:
         case OpType::ROPE: {
             auto dst = op->next[0]->tensor();
             cur      = ggml_type_size(GGML_TYPE_F32) * dst->m_shape[0] * n_tasks;

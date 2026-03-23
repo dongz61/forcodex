@@ -15,6 +15,7 @@
 #include "qwen2_model.hpp"
 
 #include "backend/cpu_buffer.hpp"
+#include "backend/ggml/ggml_cluster_manager.hpp"
 #include "backend/ggml/ggml_kv_pager.hpp"
 #include "core/logger.hpp"
 #include "core/perfetto_trace.hpp"
@@ -22,6 +23,7 @@
 #include "executor/executor.hpp"
 #include "graph/graph.hpp"
 #include "graph/node.hpp"
+#include "model/module/ggml_cluster_runtime.hpp"
 #include "model/module/ggml_kv_runtime.hpp"
 #include "model/qwen2/qwen2_weight.hpp"
 #include "sampler/sampler.hpp"
@@ -68,6 +70,70 @@ Qwen2Model::Qwen2Model(const std::string &filename, const std::shared_ptr<ModelC
 
 Qwen2Model::~Qwen2Model() {
     gguf_free(gguf_ctx);
+}
+
+void Qwen2Model::ensure_cluster_manager() {
+    if (!m_platform || !m_platform->ggml_backends[m_config->model_id]) {
+        return;
+    }
+    auto *ggml_kv = m_platform->ggml_backends[m_config->model_id]->m_kv.get();
+    if (!m_cluster_manager) {
+        m_cluster_manager = std::make_unique<ggml::GGMLClusterManager>(*ggml_kv);
+    }
+    if (!m_kv_pager) {
+        m_kv_pager = std::make_unique<ggml::GGMLKVPager>(
+            *ggml_kv,
+            ggml_runtime::get_kv_pager_file_path(m_filename, m_config->model_id)
+        );
+    }
+    ggml::register_cluster_runtime(m_config->model_id, m_cluster_manager.get(), m_kv_pager.get());
+}
+
+void Qwen2Model::on_prefill_finished() {
+    if (!m_platform) {
+        return;
+    }
+    bool has_qnn_backend = false;
+#if defined(POWERSERVE_WITH_QNN)
+    has_qnn_backend = (m_platform->qnn_backend != nullptr);
+#endif
+    if (lazy_load || m_platform->using_opencl(m_config->model_id) || has_qnn_backend) {
+        return;
+    }
+    ensure_cluster_manager();
+    if (!m_cluster_manager || !m_cluster_manager->enabled()) {
+        return;
+    }
+    if (m_platform->ggml_backends[m_config->model_id]->m_kv->slot_mode_enabled()) {
+        POWERSERVE_LOG_WARN("GGML cluster manager is currently disabled when slot mode is active");
+        return;
+    }
+    m_cluster_manager->build_all_layers_after_prefill();
+}
+
+void Qwen2Model::update_decode_clusters_for_layers(size_t begin, size_t end, int token_position) {
+    if (token_position < 0 || !m_platform) {
+        return;
+    }
+    ensure_cluster_manager();
+    if (!m_cluster_manager || !m_cluster_manager->enabled()) {
+        return;
+    }
+
+    auto *ggml_kv = m_platform->ggml_backends[m_config->model_id]->m_kv.get();
+    if (ggml_kv->slot_mode_enabled()) {
+        return;
+    }
+    for (size_t layer_id = begin; layer_id < end; ++layer_id) {
+        const auto &key_buffer = ggml_kv->key_buffer_for_layer(layer_id);
+        const size_t offset = static_cast<size_t>(token_position) * ggml_kv->m_kv_dim;
+        POWERSERVE_ASSERT(offset + ggml_kv->m_kv_dim <= key_buffer.size());
+        std::vector<float> new_k(
+            key_buffer.begin() + static_cast<std::ptrdiff_t>(offset),
+            key_buffer.begin() + static_cast<std::ptrdiff_t>(offset + ggml_kv->m_kv_dim)
+        );
+        m_cluster_manager->update_layer_after_decode(layer_id, token_position, new_k);
+    }
 }
 
 auto Qwen2Model::forward(
@@ -202,6 +268,10 @@ auto Qwen2Model::forward(
                 tokens_before_step,
                 tokens_after_step
             );
+
+            if (batch_size == 1 && !pos.empty()) {
+                update_decode_clusters_for_layers(begin, end, pos.front());
+            }
 
             if (is_last_segment) {
                 if (lm_head) {
@@ -379,6 +449,10 @@ auto Qwen2Model::forward(
                 avg_span_layer_ms
             );
         }
+    }
+
+    if (!lazy_load && !use_opencl && !has_qnn_backend && batch_size == 1 && !pos.empty()) {
+        update_decode_clusters_for_layers(0, llm_config.n_layers, pos.front());
     }
 #if defined(POWERSERVE_WITH_QNN)
     if (!m_platform->qnn_backend)

@@ -20,6 +20,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace powerserve {
@@ -116,10 +117,11 @@ struct GetMaskParams {
     const std::vector<int> &pos;
 };
 
-struct TopKAttnParams {
-    std::vector<int> pos;
+struct ClusterAttnParams {
+    std::string model_id;
+    int layer_id = 0;
     float scale = 1.0f;
-    int topk = 0;
+    int topk_clusters = 0;
     int n_heads = 0;
     int n_kv_heads = 0;
     int head_size = 0;

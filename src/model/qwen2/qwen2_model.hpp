@@ -25,6 +25,7 @@
 
 namespace powerserve {
 namespace ggml {
+struct GGMLClusterManager;
 struct GGMLKVPager;
 }
 
@@ -34,6 +35,7 @@ public:
     ggml_context *ggml_ctx;
     gguf_context *gguf_ctx;
     bool lazy_load;
+    std::unique_ptr<ggml::GGMLClusterManager> m_cluster_manager;
     std::unique_ptr<ggml::GGMLKVPager> m_kv_pager;
 
 public:
@@ -45,6 +47,7 @@ public:
         -> std::vector<Token> override;
     auto generate(const Tokenizer &tokenizer, Sampler &sampler, const std::string &prompt, int steps, size_t batch_size)
         -> std::shared_ptr<TokenIterator> override;
+    void on_prefill_finished() override;
 
     auto forward(
         const std::vector<int> &tokens,
@@ -52,6 +55,10 @@ public:
         const CausalAttentionMask &mask,
         bool lm_head = true
     ) -> LogitsVector override;
+
+private:
+    void ensure_cluster_manager();
+    void update_decode_clusters_for_layers(size_t begin, size_t end, int token_position);
 };
 
 } // namespace powerserve
