@@ -123,7 +123,7 @@ public:
     // Lightweight cache tensor wrappers for graph construction.
     std::pair<Tensor, Tensor> get_cache_tensors(size_t L) const;
 
-    // 张量属性检查 / 并行任务估算（如果还需要）
+    // 张量属性检查 / 并行任务估算
     bool is_contiguous(const Tensor *tensor, int n) const;
 
     // buffer 创建
