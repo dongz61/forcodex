@@ -132,7 +132,7 @@ public:
 
     bool is_initialized() const { return initialized; }
 
-    // rope接口专用小工具（backup 保留）
+    // rope接口专用小工具
     static inline int dim4(const Tensor *t, int i) { return t ? (int)t->m_shape[i] : 1; }
     static inline int imin(int a, int b) { return a < b ? a : b; }
 
