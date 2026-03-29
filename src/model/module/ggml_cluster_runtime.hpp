@@ -24,6 +24,7 @@ struct GGMLKVPager;
 struct GGMLClusterRuntimeView {
     const GGMLClusterManager *manager = nullptr;
     const GGMLKVPager *pager = nullptr;
+    bool ready = false;
 };
 
 void register_cluster_runtime(
@@ -31,6 +32,7 @@ void register_cluster_runtime(
     const GGMLClusterManager *manager,
     const GGMLKVPager *pager
 );
+void set_cluster_runtime_ready(const std::string &model_id, bool ready);
 auto get_cluster_runtime(const std::string &model_id) -> GGMLClusterRuntimeView;
 
 } // namespace powerserve::ggml

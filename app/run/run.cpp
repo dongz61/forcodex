@@ -32,6 +32,8 @@
 #endif //POWERSERVE_DUMP_SPEEDINFO
 
 int main(int argc, char *argv[]) {
+    static constexpr const char *kPredictionMarker = "\n[PREDICTION]\n";
+
     const powerserve::CommandLineArgument args = powerserve::parse_command_line("PowerServe CLI", argc, argv);
     const powerserve::Config config            = powerserve::get_config_from_argument(args);
 
@@ -134,6 +136,8 @@ int main(int argc, char *argv[]) {
         auto next = iter->next();
         if (!start) {
             start = true;
+            fmt::print("{}", kPredictionMarker);
+            fflush(stdout);
             continue;
         }
         actual_predict += 1;

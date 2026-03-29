@@ -15,6 +15,7 @@
 #include "attention_path.hpp"
 
 #include "backend/cpu_buffer.hpp"
+#include "model/module/ggml_cluster_runtime.hpp"
 
 #include <cstdlib>
 
@@ -46,7 +47,12 @@ TensorNode *build_attention_scores(
     const size_t n_kv = static_cast<size_t>(pos.back() + 1);
     const size_t kv_gqa = head_size * n_head_kv;
     const int cluster_topk = get_ggml_cluster_topk();
-    const bool use_cluster = (cluster_topk > 0) && (batch_size == 1);
+    const auto cluster_runtime = ggml::get_cluster_runtime(g.m_model_id);
+    const bool use_cluster = (cluster_topk > 0) &&
+                             (batch_size == 1) &&
+                             (cluster_runtime.manager != nullptr) &&
+                             (cluster_runtime.pager != nullptr) &&
+                             cluster_runtime.ready;
 
     if (use_cluster) {
         POWERSERVE_ASSERT(k_cache->m_data && v_cache->m_data, "POWERSERVE_GGML_CLUSTER_TOPK requires allocated KV buffers");

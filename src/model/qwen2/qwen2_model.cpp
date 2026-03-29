@@ -87,6 +87,7 @@ void Qwen2Model::ensure_cluster_manager() {
         );
     }
     ggml::register_cluster_runtime(m_config->model_id, m_cluster_manager.get(), m_kv_pager.get());
+    ggml::set_cluster_runtime_ready(m_config->model_id, false);
 }
 
 void Qwen2Model::on_prefill_finished() {
@@ -109,6 +110,7 @@ void Qwen2Model::on_prefill_finished() {
         return;
     }
     m_cluster_manager->build_all_layers_after_prefill();
+    ggml::set_cluster_runtime_ready(m_config->model_id, true);
 }
 
 void Qwen2Model::update_decode_clusters_for_layers(size_t begin, size_t end, int token_position) {

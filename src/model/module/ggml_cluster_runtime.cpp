@@ -35,7 +35,14 @@ void register_cluster_runtime(
     g_cluster_runtimes[model_id] = GGMLClusterRuntimeView{
         .manager = manager,
         .pager = pager,
+        .ready = false,
     };
+}
+
+void set_cluster_runtime_ready(const std::string &model_id, bool ready) {
+    std::lock_guard<std::mutex> lock(g_cluster_runtime_mutex);
+    auto &runtime = g_cluster_runtimes[model_id];
+    runtime.ready = ready;
 }
 
 auto get_cluster_runtime(const std::string &model_id) -> GGMLClusterRuntimeView {

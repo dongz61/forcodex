@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "platform.hpp"
+#include "model/module/ggml_cluster_runtime.hpp"
 
 namespace powerserve {
 
@@ -62,6 +63,7 @@ size_t Platform::get_kv_position(std::string &model_id) const {
 
 void Platform::reset_kv_position(std::string &model_id) {
     ggml_backends[model_id]->m_kv->reset_kv_cache();
+    ggml::set_cluster_runtime_ready(model_id, false);
 #if defined(POWERSERVE_WITH_QNN)
     if (qnn_backend) {
         qnn_backend->m_models[model_id]->reset_kv_cache();
