@@ -16,9 +16,6 @@
 
 #include "backend/cpu_buffer.hpp"
 
-#include <algorithm>
-#include <cstdlib>
-
 namespace powerserve::ggml {
 
 GGMLKV::GGMLKV(const ModelConfig::LLMConfig &config) :
@@ -29,25 +26,6 @@ GGMLKV::GGMLKV(const ModelConfig::LLMConfig &config) :
     m_head_size(config.head_size),
     m_batch_size(1), // FIXME:
     m_config(config) {
-    const char *env = std::getenv("POWERSERVE_GGML_KV_WINDOW_LAYERS");
-    const size_t req_window = env ? static_cast<size_t>(std::max(0, std::atoi(env))) : 0;
-    if (req_window > 0 && req_window < m_n_layers) {
-        m_n_slots = req_window;
-        m_slot_mode = true;
-    } else {
-        m_n_slots = m_n_layers;
-        m_slot_mode = false;
-    }
-
-    m_layer_to_slot.assign(m_n_layers, -1);
-    m_slot_to_layer.assign(m_n_slots, -1);
-    if (!m_slot_mode) {
-        for (size_t l = 0; l < m_n_layers; ++l) {
-            m_layer_to_slot[l] = static_cast<int>(l);
-            m_slot_to_layer[l] = static_cast<int>(l);
-        }
-    }
-
     prepare_model_chunk();
 
     kv_cache = std::make_unique<KVCache<GGMLKVInterface>>(m_n_layers, m_n_kv_heads, m_n_ctx, *this, chunk);
@@ -59,12 +37,12 @@ void GGMLKV::prepare_model_chunk() {
     auto &k            = chunk.current_k;
     auto &v            = chunk.current_v;
 
-    key_buffer.resize(m_n_slots);
-    value_buffer.resize(m_n_slots);
+    key_buffer.resize(m_n_layers);
+    value_buffer.resize(m_n_layers);
     size_t layer_size = m_kv_dim * m_n_ctx;
-    for (size_t s = 0; s < m_n_slots; s++) {
-        key_buffer[s].resize(layer_size);
-        value_buffer[s].resize(layer_size);
+    for (size_t layer_id = 0; layer_id < m_n_layers; layer_id++) {
+        key_buffer[layer_id].resize(layer_size);
+        value_buffer[layer_id].resize(layer_size);
 
         chunk.key_tensors.emplace_back(Tensor(DataType::FP32, {m_n_ctx, m_kv_dim, 1, 1}));
         chunk.value_tensors.emplace_back(Tensor(DataType::FP32, {m_n_ctx, m_kv_dim, 1, 1}));
@@ -74,8 +52,8 @@ void GGMLKV::prepare_model_chunk() {
             sizeof(float) * m_kv_dim * m_n_ctx,
             sizeof(float) * m_kv_dim * m_n_ctx
         };
-        chunk.key_tensors[s].m_data   = std::make_shared<CPUBuffer>(stride, key_buffer[s].data());
-        chunk.value_tensors[s].m_data = std::make_shared<CPUBuffer>(stride, value_buffer[s].data());
+        chunk.key_tensors[layer_id].m_data   = std::make_shared<CPUBuffer>(stride, key_buffer[layer_id].data());
+        chunk.value_tensors[layer_id].m_data = std::make_shared<CPUBuffer>(stride, value_buffer[layer_id].data());
     }
 
     k.resize(m_n_layers);

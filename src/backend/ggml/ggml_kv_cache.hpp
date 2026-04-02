@@ -33,10 +33,8 @@ public:
     size_t m_n_kv_heads = 0;
     size_t m_n_ctx      = 0;
     size_t m_n_layers   = 0;
-    size_t m_n_slots    = 0;
     size_t m_head_size  = 0;
     size_t m_batch_size = 0;
-    bool m_slot_mode    = false;
     size_t kv_size      = 0; // system_prompt size
     const ModelConfig::LLMConfig &m_config;
 
@@ -52,8 +50,6 @@ public:
     };
 
     GGMLChunk chunk;
-    std::vector<int> m_layer_to_slot; // [n_layers] -> slot id or -1
-    std::vector<int> m_slot_to_layer; // [n_slots]  -> layer id or -1
 
     struct GGMLKVInterface {
         GGMLKV &parent;
@@ -164,95 +160,31 @@ public:
     }
 
     auto get_cache(size_t L) -> std::pair<Tensor &, Tensor &> {
-        const size_t slot = logical_layer_to_slot_or_die(L);
-        return {chunk.key_tensors[slot], chunk.value_tensors[slot]};
-    }
-
-    bool slot_mode_enabled() const {
-        return m_slot_mode;
-    }
-
-    size_t slot_window_size() const {
-        return m_n_slots;
-    }
-
-    int layer_to_slot(size_t layer_id) const {
-        POWERSERVE_ASSERT(layer_id < m_layer_to_slot.size());
-        return m_layer_to_slot[layer_id];
-    }
-
-    int find_free_slot() const {
-        for (size_t s = 0; s < m_slot_to_layer.size(); ++s) {
-            if (m_slot_to_layer[s] < 0) {
-                return static_cast<int>(s);
-            }
-        }
-        return -1;
-    }
-
-    void bind_layer_to_slot(size_t layer_id, size_t slot_id) {
-        POWERSERVE_ASSERT(layer_id < m_n_layers);
-        POWERSERVE_ASSERT(slot_id < m_n_slots);
-
-        const int prev_layer = m_slot_to_layer[slot_id];
-        if (prev_layer >= 0) {
-            m_layer_to_slot[static_cast<size_t>(prev_layer)] = -1;
-        }
-
-        const int prev_slot = m_layer_to_slot[layer_id];
-        if (prev_slot >= 0) {
-            m_slot_to_layer[static_cast<size_t>(prev_slot)] = -1;
-        }
-
-        m_layer_to_slot[layer_id] = static_cast<int>(slot_id);
-        m_slot_to_layer[slot_id] = static_cast<int>(layer_id);
-    }
-
-    void unbind_layer(size_t layer_id) {
-        POWERSERVE_ASSERT(layer_id < m_n_layers);
-        const int slot = m_layer_to_slot[layer_id];
-        if (slot >= 0) {
-            m_slot_to_layer[static_cast<size_t>(slot)] = -1;
-            m_layer_to_slot[layer_id] = -1;
-        }
+        POWERSERVE_ASSERT(L < m_n_layers);
+        return {chunk.key_tensors[L], chunk.value_tensors[L]};
     }
 
     auto key_buffer_for_layer(size_t layer_id) -> std::vector<float> & {
-        const size_t slot = logical_layer_to_slot_or_die(layer_id);
-        return chunk.key_buffer[slot];
+        POWERSERVE_ASSERT(layer_id < m_n_layers);
+        return chunk.key_buffer[layer_id];
     }
 
     auto value_buffer_for_layer(size_t layer_id) -> std::vector<float> & {
-        const size_t slot = logical_layer_to_slot_or_die(layer_id);
-        return chunk.value_buffer[slot];
+        POWERSERVE_ASSERT(layer_id < m_n_layers);
+        return chunk.value_buffer[layer_id];
     }
 
     auto key_buffer_for_layer(size_t layer_id) const -> const std::vector<float> & {
-        const size_t slot = logical_layer_to_slot_or_die(layer_id);
-        return chunk.key_buffer[slot];
+        POWERSERVE_ASSERT(layer_id < m_n_layers);
+        return chunk.key_buffer[layer_id];
     }
 
     auto value_buffer_for_layer(size_t layer_id) const -> const std::vector<float> & {
-        const size_t slot = logical_layer_to_slot_or_die(layer_id);
-        return chunk.value_buffer[slot];
-    }
-
-    void clear_all_mappings() {
-        std::fill(m_layer_to_slot.begin(), m_layer_to_slot.end(), -1);
-        std::fill(m_slot_to_layer.begin(), m_slot_to_layer.end(), -1);
+        POWERSERVE_ASSERT(layer_id < m_n_layers);
+        return chunk.value_buffer[layer_id];
     }
 
 private:
-    size_t logical_layer_to_slot_or_die(size_t layer_id) const {
-        POWERSERVE_ASSERT(layer_id < m_n_layers);
-        if (!m_slot_mode) {
-            return layer_id;
-        }
-        const int slot = m_layer_to_slot[layer_id];
-        POWERSERVE_ASSERT(slot >= 0, "layer {} is not mapped to any KV slot", layer_id);
-        return static_cast<size_t>(slot);
-    }
-
     void prepare_model_chunk();
 };
 
