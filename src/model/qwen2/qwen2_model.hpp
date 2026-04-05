@@ -58,7 +58,6 @@ public:
 
 private:
     void ensure_cluster_manager();
-    void update_decode_clusters_for_layers(size_t begin, size_t end, int token_position);
 };
 
 } // namespace powerserve

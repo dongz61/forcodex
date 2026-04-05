@@ -158,20 +158,23 @@ ALWAYS_INLINE void select_topk_cluster_ids(
     }
 }
 
-ALWAYS_INLINE void reduce_dense_values_from_compact(
+ALWAYS_INLINE void reduce_dense_values_from_cluster_views(
     float *out_ptr,
-    const float *compact_v,
-    size_t compact_tokens,
+    const std::vector<ClusterView> &views,
     int head_size,
     int kvh,
-    const std::vector<float> &probs,
+    const std::vector<std::vector<float>> &probs_per_view,
     float inv_denom
 ) {
     for (int d = 0; d < head_size; ++d) {
         float acc = 0.0f;
-        const size_t value_row = static_cast<size_t>(kvh * head_size + d) * compact_tokens;
-        for (size_t t = 0; t < compact_tokens; ++t) {
-            acc += (probs[t] * inv_denom) * compact_v[value_row + t];
+        for (size_t view_idx = 0; view_idx < views.size(); ++view_idx) {
+            const auto &view = views[view_idx];
+            const auto &probs = probs_per_view[view_idx];
+            const size_t value_row = static_cast<size_t>(kvh * head_size + d) * view.token_count;
+            for (size_t t = 0; t < view.token_count; ++t) {
+                acc += (probs[t] * inv_denom) * view.v_ptr[value_row + t];
+            }
         }
         out_ptr[static_cast<size_t>(d)] = acc;
     }
@@ -363,8 +366,6 @@ void GGMLBackend::cluster_attn(
 
     const auto runtime = get_cluster_runtime(model_id);
     POWERSERVE_ASSERT(runtime.manager != nullptr, "CLUSTER_ATTN missing cluster manager for model_id={}", model_id);
-    POWERSERVE_ASSERT(runtime.pager != nullptr, "CLUSTER_ATTN missing KV pager for model_id={}", model_id);
-
     const auto &clusters = runtime.manager->get_layer_clusters(static_cast<size_t>(layer_id));
     POWERSERVE_ASSERT(!clusters.empty(), "CLUSTER_ATTN requires non-empty clusters at layer={}", layer_id);
 
@@ -405,44 +406,53 @@ void GGMLBackend::cluster_attn(
         }
     }
 
-    std::vector<int> token_positions;
+    std::vector<int> selected_cluster_indices;
     for (size_t cluster_id = 0; cluster_id < clusters.size(); ++cluster_id) {
         if (!selected[cluster_id]) {
             continue;
         }
-        const auto &positions = clusters[cluster_id].token_positions;
-        token_positions.insert(token_positions.end(), positions.begin(), positions.end());
+        selected_cluster_indices.push_back(static_cast<int>(cluster_id));
     }
-    POWERSERVE_ASSERT(!token_positions.empty(), "CLUSTER_ATTN selected no tokens at layer={}", layer_id);
+    POWERSERVE_ASSERT(!selected_cluster_indices.empty(), "CLUSTER_ATTN selected no clusters at layer={}", layer_id);
 
-    const auto compact = runtime.pager->materialize_compact_kv(static_cast<size_t>(layer_id), token_positions);
-    const size_t compact_tokens = compact.positions.size();
-    POWERSERVE_ASSERT(compact_tokens > 0, "CLUSTER_ATTN materialized empty compact KV at layer={}", layer_id);
+    std::vector<ClusterView> views;
+    POWERSERVE_ASSERT(
+        runtime.manager->query_cluster_views(static_cast<size_t>(layer_id), selected_cluster_indices, views),
+        "CLUSTER_ATTN failed to query cluster views at layer={}",
+        layer_id
+    );
+    POWERSERVE_ASSERT(!views.empty(), "CLUSTER_ATTN queried no cluster views at layer={}", layer_id);
 
-    const float *compact_k = static_cast<const float *>(compact.key.get<CPUBuffer>().m_data);
-    const float *compact_v = static_cast<const float *>(compact.value.get<CPUBuffer>().m_data);
-
-    std::vector<float> probs(compact_tokens);
+    std::vector<std::vector<float>> probs_per_view;
+    probs_per_view.resize(views.size());
     for (int qh = 0; qh < n_heads; ++qh) {
         const int kvh = qh / q_per_kv;
         load_cluster_query_local(layout, qh, q_local);
 
         float smax = -std::numeric_limits<float>::infinity();
-        for (size_t t = 0; t < compact_tokens; ++t) {
-            const float *k_slice = compact_k + t * static_cast<size_t>(n_kv_heads * head_size) + static_cast<size_t>(kvh * head_size);
-            probs[t] = dot_f32_contig(q_local.data(), k_slice, head_size) * scale;
-            smax = std::max(smax, probs[t]);
+        for (size_t view_idx = 0; view_idx < views.size(); ++view_idx) {
+            const auto &view = views[view_idx];
+            auto &probs = probs_per_view[view_idx];
+            probs.resize(view.token_count);
+            for (size_t t = 0; t < view.token_count; ++t) {
+                const float *k_slice =
+                    view.k_ptr + t * static_cast<size_t>(n_kv_heads * head_size) + static_cast<size_t>(kvh * head_size);
+                probs[t] = dot_f32_contig(q_local.data(), k_slice, head_size) * scale;
+                smax = std::max(smax, probs[t]);
+            }
         }
 
         float denom = 0.0f;
-        for (size_t t = 0; t < compact_tokens; ++t) {
-            probs[t] = std::exp(probs[t] - smax);
-            denom += probs[t];
+        for (auto &probs : probs_per_view) {
+            for (float &prob : probs) {
+                prob = std::exp(prob - smax);
+                denom += prob;
+            }
         }
         POWERSERVE_ASSERT(denom > 0.0f, "CLUSTER_ATTN softmax denom must be positive");
 
         float *out_ptr = out_data + static_cast<size_t>(qh * head_size);
-        reduce_dense_values_from_compact(out_ptr, compact_v, compact_tokens, head_size, kvh, probs, 1.0f / denom);
+        reduce_dense_values_from_cluster_views(out_ptr, views, head_size, kvh, probs_per_view, 1.0f / denom);
     }
 }
 
@@ -497,6 +507,7 @@ int GGMLBackend::get_n_tasks(std::shared_ptr<OpNode> op) {
     // custom ops
     case OpType::SILU_HADAMARD:
     case OpType::ADD_CACHE:
+    case OpType::CLUSTER_UPDATE:
     case OpType::PRINT:
     case OpType::VIEW:
     case OpType::TRANSPOSE:

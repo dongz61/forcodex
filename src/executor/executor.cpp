@@ -15,7 +15,9 @@
 #include "executor/executor.hpp"
 
 #include "backend/ggml/ggml.hpp"
+#include "backend/ggml/ggml_cluster_manager.hpp"
 #include "core/logger.hpp"
+#include "model/module/ggml_cluster_runtime.hpp"
 
 #include <cstdint>
 #include <unordered_set>
@@ -28,6 +30,35 @@
 
 
 namespace powerserve {
+
+namespace {
+
+auto copy_tensor_f32_contiguous(const Tensor *tensor) -> std::vector<float> {
+    POWERSERVE_ASSERT(tensor != nullptr);
+    POWERSERVE_ASSERT(tensor->m_dtype == DataType::FP32);
+    const auto &buffer = tensor->get<CPUBuffer>();
+    const auto *base = static_cast<const char *>(buffer.m_data);
+    std::vector<float> out;
+    out.reserve(tensor->n_elements());
+    for (size_t i3 = 0; i3 < tensor->m_shape[3]; ++i3) {
+        for (size_t i2 = 0; i2 < tensor->m_shape[2]; ++i2) {
+            for (size_t i1 = 0; i1 < tensor->m_shape[1]; ++i1) {
+                for (size_t i0 = 0; i0 < tensor->m_shape[0]; ++i0) {
+                    const auto *ptr = reinterpret_cast<const float *>(
+                        base + i3 * buffer.m_stride[3] +
+                        i2 * buffer.m_stride[2] +
+                        i1 * buffer.m_stride[1] +
+                        i0 * buffer.m_stride[0]
+                    );
+                    out.push_back(*ptr);
+                }
+            }
+        }
+    }
+    return out;
+}
+
+} // namespace
 
 static inline bool force_get_mask_cpu_fallback() {
     static int cached = -1;
@@ -473,6 +504,21 @@ void Executor::run() {
             auto [scale, max_bias] = op->get_params<SoftmaxExtParams>();
 
             backend->softmax_ext(out, x, mask, scale, max_bias);
+        } break;
+
+        case OpType::CLUSTER_UPDATE: {
+            POWERSERVE_ASSERT(!use_opencl, "CLUSTER_UPDATE is currently only implemented on GGML/CPU");
+            const auto &params = op->get_params<ClusterUpdateParams>();
+            const auto runtime = powerserve::ggml::get_cluster_runtime(params.model_id);
+            POWERSERVE_ASSERT(runtime.manager != nullptr, "CLUSTER_UPDATE missing cluster manager");
+            auto *k = op->prev[0]->tensor();
+            auto *v = op->prev[1]->tensor();
+            runtime.manager->update_layer_after_decode(
+                static_cast<size_t>(params.layer_id),
+                params.token_position,
+                copy_tensor_f32_contiguous(k),
+                copy_tensor_f32_contiguous(v)
+            );
         } break;
 
         case OpType::CLUSTER_ATTN: {

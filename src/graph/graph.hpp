@@ -62,6 +62,7 @@ public:
 
     auto softmax(TensorNode *x) -> TensorNode *;
     auto softmax_ext(TensorNode *x, TensorNode *mask, float scale, float max_bias) -> TensorNode *;
+    void cluster_update(TensorNode *k, TensorNode *v, const std::string &model_id, int layer_id, int token_position);
     auto cluster_attn(
         TensorNode *q,
         const std::string &model_id,

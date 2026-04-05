@@ -127,4 +127,10 @@ struct ClusterAttnParams {
     int head_size = 0;
 };
 
+struct ClusterUpdateParams {
+    std::string model_id;
+    int layer_id = 0;
+    int token_position = -1;
+};
+
 } // namespace powerserve

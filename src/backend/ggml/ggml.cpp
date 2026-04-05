@@ -38,6 +38,7 @@ void GGMLBackend::plan(std::vector<std::shared_ptr<OpNode>> &ops) {
         // custom ops
         case OpType::SILU_HADAMARD:
         case OpType::ADD_CACHE:
+        case OpType::CLUSTER_UPDATE:
         case OpType::TRANSPOSE:
         case OpType::PRINT:
         case OpType::VIEW:

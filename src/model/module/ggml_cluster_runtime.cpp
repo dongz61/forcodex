@@ -28,8 +28,8 @@ std::unordered_map<std::string, GGMLClusterRuntimeView> g_cluster_runtimes;
 
 void register_cluster_runtime(
     const std::string &model_id,
-    const GGMLClusterManager *manager,
-    const GGMLKVPager *pager
+    GGMLClusterManager *manager,
+    GGMLKVPager *pager
 ) {
     std::lock_guard<std::mutex> lock(g_cluster_runtime_mutex);
     g_cluster_runtimes[model_id] = GGMLClusterRuntimeView{

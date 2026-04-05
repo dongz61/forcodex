@@ -31,6 +31,12 @@ struct CompactClusterKV {
     std::vector<int> positions;
 };
 
+struct ClusterDiskLayout {
+    int64_t offset = -1;
+    size_t token_count = 0;
+    size_t capacity_tokens = 0;
+};
+
 struct GGMLKVPager {
 public:
     enum class LayerState : uint8_t {
@@ -67,6 +73,30 @@ public:
     bool sync();
     auto materialize_compact_kv(size_t layer_id, const std::vector<int> &token_positions) const -> CompactClusterKV;
 
+    bool read_cluster(
+        int64_t disk_offset,
+        size_t capacity_tokens,
+        size_t token_count,
+        float *key_dst,
+        float *value_dst
+    ) const;
+    bool write_cluster_full(
+        int64_t disk_offset,
+        size_t capacity_tokens,
+        size_t token_count,
+        const float *key_src,
+        const float *value_src
+    );
+    bool append_cluster_tokens(
+        int64_t disk_offset,
+        size_t capacity_tokens,
+        size_t start_token,
+        size_t append_count,
+        const float *key_src,
+        const float *value_src
+    );
+    auto allocate_cluster_region(size_t capacity_tokens) -> int64_t;
+
 private:
     bool acquire_layer_sync(size_t layer_id, size_t need_tokens);
     bool evict_layer_sync(size_t layer_id, size_t valid_tokens, bool do_sync, bool write_data);
@@ -74,7 +104,7 @@ private:
     bool write_header();
     bool preallocate_file(size_t bytes);
     bool pwrite_all(const void *src, size_t bytes, int64_t offset);
-    bool pread_all(void *dst, size_t bytes, int64_t offset);
+    bool pread_all(void *dst, size_t bytes, int64_t offset) const;
 
     int64_t offset_k(size_t layer_id) const;
     int64_t offset_v(size_t layer_id) const;
@@ -89,6 +119,7 @@ private:
     size_t m_kv_dim = 0;
     size_t m_layer_bytes = 0;
     size_t m_header_bytes = 4096;
+    int64_t m_next_cluster_offset = 0;
 
     std::vector<LayerState> m_layer_states;
     std::vector<size_t> m_persisted_tokens;

@@ -51,6 +51,7 @@ GGMLKVPager::GGMLKVPager(GGMLKV &kv, const std::string &file_path) :
     m_n_ctx(kv.m_n_ctx),
     m_kv_dim(kv.m_kv_dim) {
     m_layer_bytes = m_n_ctx * m_kv_dim * sizeof(float);
+    m_next_cluster_offset = static_cast<int64_t>(m_header_bytes);
     m_layer_states.assign(m_n_layers, LayerState::ResidentClean);
     m_persisted_tokens.assign(m_n_layers, 0);
     m_load_futures.resize(m_n_layers);
@@ -64,8 +65,7 @@ GGMLKVPager::GGMLKVPager(GGMLKV &kv, const std::string &file_path) :
         return;
     }
 
-    const size_t data_bytes = m_n_layers * 2 * m_layer_bytes;
-    if (!preallocate_file(m_header_bytes + data_bytes)) {
+    if (!preallocate_file(m_header_bytes)) {
         POWERSERVE_LOG_ERROR("KV pager preallocate failed: path={} err={}", m_file_path, std::strerror(errno));
         close(m_fd);
         m_fd = -1;
@@ -411,6 +411,123 @@ auto GGMLKVPager::materialize_compact_kv(size_t layer_id, const std::vector<int>
     return out;
 }
 
+bool GGMLKVPager::read_cluster(
+    int64_t disk_offset,
+    size_t capacity_tokens,
+    size_t token_count,
+    float *key_dst,
+    float *value_dst
+) const {
+    if (!valid() || disk_offset < 0) {
+        return false;
+    }
+    const size_t key_bytes = token_count * m_kv_dim * sizeof(float);
+    if (key_bytes > 0 && !pread_all(key_dst, key_bytes, disk_offset)) {
+        return false;
+    }
+    const int64_t value_offset =
+        disk_offset + static_cast<int64_t>(capacity_tokens * m_kv_dim * sizeof(float));
+    const size_t value_seg_bytes = token_count * sizeof(float);
+    for (size_t d = 0; d < m_kv_dim; ++d) {
+        if (value_seg_bytes == 0) {
+            continue;
+        }
+        if (!pread_all(
+                value_dst + d * token_count,
+                value_seg_bytes,
+                value_offset + static_cast<int64_t>(d * value_seg_bytes)
+            )) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool GGMLKVPager::write_cluster_full(
+    int64_t disk_offset,
+    size_t capacity_tokens,
+    size_t token_count,
+    const float *key_src,
+    const float *value_src
+) {
+    if (!valid() || disk_offset < 0) {
+        return false;
+    }
+    const size_t key_bytes = token_count * m_kv_dim * sizeof(float);
+    if (key_bytes > 0 && !pwrite_all(key_src, key_bytes, disk_offset)) {
+        return false;
+    }
+    const int64_t value_offset =
+        disk_offset + static_cast<int64_t>(capacity_tokens * m_kv_dim * sizeof(float));
+    const size_t value_seg_bytes = token_count * sizeof(float);
+    for (size_t d = 0; d < m_kv_dim; ++d) {
+        if (value_seg_bytes == 0) {
+            continue;
+        }
+        if (!pwrite_all(
+                value_src + d * token_count,
+                value_seg_bytes,
+                value_offset + static_cast<int64_t>(d * value_seg_bytes)
+            )) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool GGMLKVPager::append_cluster_tokens(
+    int64_t disk_offset,
+    size_t capacity_tokens,
+    size_t start_token,
+    size_t append_count,
+    const float *key_src,
+    const float *value_src
+) {
+    if (!valid() || disk_offset < 0) {
+        return false;
+    }
+    const size_t key_token_bytes = m_kv_dim * sizeof(float);
+    const size_t key_bytes = append_count * key_token_bytes;
+    if (key_bytes > 0 &&
+        !pwrite_all(
+            key_src,
+            key_bytes,
+            disk_offset + static_cast<int64_t>(start_token * key_token_bytes)
+        )) {
+        return false;
+    }
+
+    const int64_t value_offset =
+        disk_offset + static_cast<int64_t>(capacity_tokens * m_kv_dim * sizeof(float));
+    const size_t value_seg_bytes = append_count * sizeof(float);
+    for (size_t d = 0; d < m_kv_dim; ++d) {
+        if (value_seg_bytes == 0) {
+            continue;
+        }
+        if (!pwrite_all(
+                value_src + d * append_count,
+                value_seg_bytes,
+                value_offset + static_cast<int64_t>((d * capacity_tokens + start_token) * sizeof(float))
+            )) {
+            return false;
+        }
+    }
+    return true;
+}
+
+auto GGMLKVPager::allocate_cluster_region(size_t capacity_tokens) -> int64_t {
+    if (!valid()) {
+        return -1;
+    }
+    const size_t cluster_bytes = 2 * capacity_tokens * m_kv_dim * sizeof(float);
+    const int64_t out = m_next_cluster_offset;
+    m_next_cluster_offset += static_cast<int64_t>(cluster_bytes);
+    if (!preallocate_file(static_cast<size_t>(m_next_cluster_offset))) {
+        return -1;
+    }
+    return out;
+}
+
 bool GGMLKVPager::write_header() {
     KVPagerFileHeader hdr{};
     std::memcpy(hdr.magic, "PSKVPGR", 7);
@@ -445,7 +562,7 @@ bool GGMLKVPager::pwrite_all(const void *src, size_t bytes, int64_t offset) {
     return true;
 }
 
-bool GGMLKVPager::pread_all(void *dst, size_t bytes, int64_t offset) {
+bool GGMLKVPager::pread_all(void *dst, size_t bytes, int64_t offset) const {
     size_t done = 0;
     auto *buf = static_cast<char *>(dst);
     while (done < bytes) {

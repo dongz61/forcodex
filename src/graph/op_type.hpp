@@ -39,6 +39,7 @@ enum class OpType {
     CONT,
     VIEW,
     SOFTMAX_EXT,
+    CLUSTER_UPDATE,
     CLUSTER_ATTN,
     GET_MASK,
     TRANSPOSE,

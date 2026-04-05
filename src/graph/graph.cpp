@@ -237,6 +237,16 @@ auto Graph::softmax_ext(TensorNode *x, TensorNode *mask, float scale, float max_
     return out;
 }
 
+void Graph::cluster_update(TensorNode *k, TensorNode *v, const std::string &model_id, int layer_id, int token_position) {
+    auto op = new_op(OpType::CLUSTER_UPDATE);
+    op->set_inputs({k, v});
+    op->set_params(ClusterUpdateParams{
+        .model_id = model_id,
+        .layer_id = layer_id,
+        .token_position = token_position,
+    });
+}
+
 auto Graph::cluster_attn(
     TensorNode *q,
     const std::string &model_id,
