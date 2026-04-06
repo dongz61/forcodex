@@ -58,6 +58,7 @@ public:
 
 private:
     void ensure_cluster_manager();
+    auto use_cluster_decode_path(const std::vector<int> &pos) const -> bool;
 };
 
 } // namespace powerserve

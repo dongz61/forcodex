@@ -15,38 +15,21 @@
 #pragma once
 
 #include "graph/graph.hpp"
-#include "model/module/attention_mask.hpp"
-
-#include <vector>
 
 namespace powerserve {
 
 int get_ggml_cluster_topk();
 
-TensorNode *build_attention_scores_dense(
+TensorNode *build_cluster_decode_attention_scores(
     Graph &g,
-    TensorNode *q,
-    TensorNode *k,
+    TensorNode *rope_q,
+    TensorNode *rope_k,
     TensorNode *v,
+    int64_t layer_id,
     const std::vector<int> &pos,
-    const CausalAttentionMask &mask,
     size_t head_size,
     size_t n_head,
     size_t n_head_kv
-);
-
-TensorNode *build_attention_scores(
-    Graph &g,
-    TensorNode *rope_q,
-    int64_t layer_id,
-    const TensorNode *k_cache,
-    const TensorNode *v_cache,
-    const std::vector<int> &pos,
-    const CausalAttentionMask &mask,
-    size_t head_size,
-    size_t n_head,
-    size_t n_head_kv,
-    size_t n_ctx
 );
 
 } // namespace powerserve

@@ -44,6 +44,15 @@ public:
         const CausalAttentionMask &mask,
         bool is_need_bias = false
     ) = 0;
+
+    virtual TensorNode *build_cluster_decode(
+        Graph &g,
+        TensorNode *x,
+        int64_t L,
+        const std::vector<int> &pos,
+        const CausalAttentionMask &mask,
+        bool is_need_bias = false
+    ) = 0;
 };
 
 } // namespace powerserve

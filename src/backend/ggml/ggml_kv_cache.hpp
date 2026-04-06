@@ -36,6 +36,7 @@ public:
     size_t m_head_size  = 0;
     size_t m_batch_size = 0;
     size_t kv_size      = 0; // system_prompt size
+    bool m_full_kv_allocated = false;
     const ModelConfig::LLMConfig &m_config;
 
     struct GGMLChunk {
@@ -159,33 +160,45 @@ public:
         kv_cache->advance_tokens(size);
     }
 
+    void ensure_full_kv_storage();
+    void release_full_kv_storage();
+    auto has_full_kv_storage() const -> bool {
+        return m_full_kv_allocated;
+    }
+
     auto get_cache(size_t L) -> std::pair<Tensor &, Tensor &> {
         POWERSERVE_ASSERT(L < m_n_layers);
+        POWERSERVE_ASSERT(m_full_kv_allocated, "full KV storage is not allocated");
         return {chunk.key_tensors[L], chunk.value_tensors[L]};
     }
 
     auto key_buffer_for_layer(size_t layer_id) -> std::vector<float> & {
         POWERSERVE_ASSERT(layer_id < m_n_layers);
+        POWERSERVE_ASSERT(m_full_kv_allocated, "full KV storage is not allocated");
         return chunk.key_buffer[layer_id];
     }
 
     auto value_buffer_for_layer(size_t layer_id) -> std::vector<float> & {
         POWERSERVE_ASSERT(layer_id < m_n_layers);
+        POWERSERVE_ASSERT(m_full_kv_allocated, "full KV storage is not allocated");
         return chunk.value_buffer[layer_id];
     }
 
     auto key_buffer_for_layer(size_t layer_id) const -> const std::vector<float> & {
         POWERSERVE_ASSERT(layer_id < m_n_layers);
+        POWERSERVE_ASSERT(m_full_kv_allocated, "full KV storage is not allocated");
         return chunk.key_buffer[layer_id];
     }
 
     auto value_buffer_for_layer(size_t layer_id) const -> const std::vector<float> & {
         POWERSERVE_ASSERT(layer_id < m_n_layers);
+        POWERSERVE_ASSERT(m_full_kv_allocated, "full KV storage is not allocated");
         return chunk.value_buffer[layer_id];
     }
 
 private:
     void prepare_model_chunk();
+    void bind_full_kv_tensors();
 };
 
 } // namespace powerserve::ggml

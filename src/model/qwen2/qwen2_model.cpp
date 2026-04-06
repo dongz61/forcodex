@@ -22,6 +22,7 @@
 #include "executor/executor.hpp"
 #include "graph/graph.hpp"
 #include "graph/node.hpp"
+#include "model/module/cluster_attention_path.hpp"
 #include "model/module/ggml_cluster_runtime.hpp"
 #include "model/qwen2/qwen2_weight.hpp"
 #include "sampler/sampler.hpp"
@@ -85,6 +86,14 @@ void Qwen2Model::ensure_cluster_manager() {
     ggml::set_cluster_runtime_ready(m_config->model_id, false);
 }
 
+auto Qwen2Model::use_cluster_decode_path(const std::vector<int> &pos) const -> bool {
+    const auto runtime = ggml::get_cluster_runtime(m_config->model_id);
+    return (get_ggml_cluster_topk() > 0) &&
+           (pos.size() == 1) &&
+           (runtime.manager != nullptr) &&
+           runtime.ready;
+}
+
 void Qwen2Model::on_prefill_finished() {
     if (!m_platform) {
         return;
@@ -102,6 +111,9 @@ void Qwen2Model::on_prefill_finished() {
     }
     m_cluster_manager->build_all_layers_after_prefill();
     ggml::set_cluster_runtime_ready(m_config->model_id, true);
+    if (get_ggml_cluster_topk() > 0) {
+        m_platform->ggml_backends[m_config->model_id]->m_kv->release_full_kv_storage();
+    }
 }
 
 auto Qwen2Model::forward(
@@ -115,6 +127,7 @@ auto Qwen2Model::forward(
     has_qnn_backend = (m_platform->qnn_backend != nullptr);
 #endif
     const bool use_opencl = m_platform->using_opencl(m_config->model_id);
+    const bool use_cluster_decode = !use_opencl && use_cluster_decode_path(pos);
 
     Graph g(m_config->model_id);
     // input embedding
@@ -146,6 +159,9 @@ auto Qwen2Model::forward(
                 m_platform->opencl_backends[m_config->model_id]->reset_kv_batch_size(batch_size);
             } else {
                 m_platform->ggml_backends[m_config->model_id]->reset_kv_batch_size(batch_size);
+                if (!use_cluster_decode) {
+                    m_platform->ggml_backends[m_config->model_id]->m_kv->ensure_full_kv_storage();
+                }
             }
             for (size_t L = 0; L < llm_config.n_layers; L++) {
                 if (use_opencl) {
@@ -154,8 +170,13 @@ auto Qwen2Model::forward(
                     auto ffn_o = m_ffn->build(g, att_o, L);
                     x          = ffn_o;
                 } else {
-                    auto [k_cache, v_cache] = m_platform->ggml_backends[m_config->model_id]->m_kv->get_cache(L);
-                    auto att_o = m_attn->build(g, x, L, g.add_tensor(k_cache), g.add_tensor(v_cache), pos, mask, true);
+                    TensorNode *att_o = nullptr;
+                    if (use_cluster_decode) {
+                        att_o = m_attn->build_cluster_decode(g, x, L, pos, mask, true);
+                    } else {
+                        auto [k_cache, v_cache] = m_platform->ggml_backends[m_config->model_id]->m_kv->get_cache(L);
+                        att_o = m_attn->build(g, x, L, g.add_tensor(k_cache), g.add_tensor(v_cache), pos, mask, true);
+                    }
                     auto ffn_o = m_ffn->build(g, att_o, L);
                     x          = ffn_o;
                 }

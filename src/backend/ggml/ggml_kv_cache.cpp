@@ -39,6 +39,10 @@ void GGMLKV::prepare_model_chunk() {
 
     key_buffer.resize(m_n_layers);
     value_buffer.resize(m_n_layers);
+    chunk.key_tensors.clear();
+    chunk.value_tensors.clear();
+    chunk.key_tensors.reserve(m_n_layers);
+    chunk.value_tensors.reserve(m_n_layers);
     size_t layer_size = m_kv_dim * m_n_ctx;
     for (size_t layer_id = 0; layer_id < m_n_layers; layer_id++) {
         key_buffer[layer_id].resize(layer_size);
@@ -46,15 +50,9 @@ void GGMLKV::prepare_model_chunk() {
 
         chunk.key_tensors.emplace_back(Tensor(DataType::FP32, {m_n_ctx, m_kv_dim, 1, 1}));
         chunk.value_tensors.emplace_back(Tensor(DataType::FP32, {m_n_ctx, m_kv_dim, 1, 1}));
-        Stride stride = {
-            sizeof(float),
-            sizeof(float) * m_n_ctx,
-            sizeof(float) * m_kv_dim * m_n_ctx,
-            sizeof(float) * m_kv_dim * m_n_ctx
-        };
-        chunk.key_tensors[layer_id].m_data   = std::make_shared<CPUBuffer>(stride, key_buffer[layer_id].data());
-        chunk.value_tensors[layer_id].m_data = std::make_shared<CPUBuffer>(stride, value_buffer[layer_id].data());
     }
+    bind_full_kv_tensors();
+    m_full_kv_allocated = true;
 
     k.resize(m_n_layers);
     v.resize(m_n_layers);
@@ -65,6 +63,47 @@ void GGMLKV::prepare_model_chunk() {
 
     auto &attn_bias = chunk.attn_bias;
     attn_bias.resize(m_batch_size * m_n_ctx);
+}
+
+void GGMLKV::bind_full_kv_tensors() {
+    Stride stride = {
+        sizeof(float),
+        sizeof(float) * m_n_ctx,
+        sizeof(float) * m_kv_dim * m_n_ctx,
+        sizeof(float) * m_kv_dim * m_n_ctx
+    };
+    for (size_t layer_id = 0; layer_id < m_n_layers; ++layer_id) {
+        chunk.key_tensors[layer_id].m_data   = std::make_shared<CPUBuffer>(stride, chunk.key_buffer[layer_id].data());
+        chunk.value_tensors[layer_id].m_data = std::make_shared<CPUBuffer>(stride, chunk.value_buffer[layer_id].data());
+    }
+}
+
+void GGMLKV::ensure_full_kv_storage() {
+    if (m_full_kv_allocated) {
+        return;
+    }
+    const size_t layer_size = m_kv_dim * m_n_ctx;
+    for (size_t layer_id = 0; layer_id < m_n_layers; ++layer_id) {
+        chunk.key_buffer[layer_id].resize(layer_size);
+        chunk.value_buffer[layer_id].resize(layer_size);
+    }
+    bind_full_kv_tensors();
+    m_full_kv_allocated = true;
+}
+
+void GGMLKV::release_full_kv_storage() {
+    if (!m_full_kv_allocated) {
+        return;
+    }
+    for (size_t layer_id = 0; layer_id < m_n_layers; ++layer_id) {
+        chunk.key_buffer[layer_id].clear();
+        chunk.key_buffer[layer_id].shrink_to_fit();
+        chunk.value_buffer[layer_id].clear();
+        chunk.value_buffer[layer_id].shrink_to_fit();
+        chunk.key_tensors[layer_id].m_data.reset();
+        chunk.value_tensors[layer_id].m_data.reset();
+    }
+    m_full_kv_allocated = false;
 }
 
 } // namespace powerserve::ggml
