@@ -435,7 +435,7 @@ bool GGMLKVPager::read_cluster(
         if (!pread_all(
                 value_dst + d * token_count,
                 value_seg_bytes,
-                value_offset + static_cast<int64_t>(d * value_seg_bytes)
+                value_offset + static_cast<int64_t>((d * capacity_tokens) * sizeof(float))
             )) {
             return false;
         }
@@ -467,7 +467,7 @@ bool GGMLKVPager::write_cluster_full(
         if (!pwrite_all(
                 value_src + d * token_count,
                 value_seg_bytes,
-                value_offset + static_cast<int64_t>(d * value_seg_bytes)
+                value_offset + static_cast<int64_t>((d * capacity_tokens) * sizeof(float))
             )) {
             return false;
         }
