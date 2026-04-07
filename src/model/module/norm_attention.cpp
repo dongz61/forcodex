@@ -26,7 +26,7 @@ namespace powerserve {
 
 namespace {
 
-TensorNode *build_attention_scores_dense(
+auto build_attention_scores_dense(
     Graph &g,
     TensorNode *q,
     TensorNode *k,
@@ -152,7 +152,7 @@ TensorNode *NormAttention::build(
     }
 
     // (head_size, bs, n_heads, 1)
-    auto q = g.permute(rope_q, {0, 2, 1, 3});
+    auto q_att = g.permute(rope_q, {0, 2, 1, 3});
 
     const size_t n_kv = static_cast<size_t>(pos.back() + 1);
     // {head_size, n_kv, n_head_kv, 1}
@@ -179,7 +179,8 @@ TensorNode *NormAttention::build(
         }
     );
 
-    TensorNode *att_scores = build_attention_scores_dense(g, q, k_cache_view, v_cache_view, pos, mask, head_size, n_head);
+    TensorNode *att_scores =
+        build_attention_scores_dense(g, q_att, k_cache_view, v_cache_view, pos, mask, head_size, n_head);
 
     auto attn_output_w = g.add_tensor(m_weights->lw[L].attn_output);
     auto attn_o        = g.mat_mul(attn_output_w, att_scores); // (embd_dim, bs, 1, 1)

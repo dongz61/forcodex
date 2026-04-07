@@ -21,13 +21,85 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <utility>
 #include <vector>
 
 namespace powerserve::ggml {
 
+struct MappedFloatBuffer {
+public:
+    MappedFloatBuffer() = default;
+    ~MappedFloatBuffer();
+
+    MappedFloatBuffer(const MappedFloatBuffer &) = delete;
+    auto operator=(const MappedFloatBuffer &) -> MappedFloatBuffer & = delete;
+
+    MappedFloatBuffer(MappedFloatBuffer &&other) noexcept;
+    auto operator=(MappedFloatBuffer &&other) noexcept -> MappedFloatBuffer &;
+
+public:
+    bool allocate(size_t n_floats);
+    void release();
+
+    void zero_fill() {
+        if (m_data != nullptr && m_size > 0) {
+            std::memset(m_data, 0, m_size * sizeof(float));
+        }
+    }
+
+    auto data() -> float * {
+        return m_data;
+    }
+
+    auto data() const -> const float * {
+        return m_data;
+    }
+
+    auto size() const -> size_t {
+        return m_size;
+    }
+
+    bool empty() const {
+        return m_size == 0;
+    }
+
+    auto begin() -> float * {
+        return m_data;
+    }
+
+    auto end() -> float * {
+        return m_data + m_size;
+    }
+
+    auto begin() const -> const float * {
+        return m_data;
+    }
+
+    auto end() const -> const float * {
+        return m_data + m_size;
+    }
+
+    auto operator[](size_t index) -> float & {
+        return m_data[index];
+    }
+
+    auto operator[](size_t index) const -> const float & {
+        return m_data[index];
+    }
+
+private:
+    void move_from(MappedFloatBuffer &&other) noexcept;
+
+private:
+    float *m_data = nullptr;
+    size_t m_size = 0;
+    size_t m_bytes = 0;
+};
+
 struct GGMLKV {
 public:
-    using KVBuffer = std::vector<std::vector<float>>;
+    using KVBuffer = std::vector<MappedFloatBuffer>;
 
     size_t m_kv_dim     = 0;
     size_t m_n_kv_heads = 0;
@@ -42,8 +114,8 @@ public:
     struct GGMLChunk {
         KVBuffer key_buffer;          // [n_layers][seq_len * kv_dim]) kv_dim == n_kv_heads * head_size
         KVBuffer value_buffer;        // [n_layers][seq_len * kv_dim])
-        KVBuffer current_k;           // [n_layers][batch_size * kv_dim])
-        KVBuffer current_v;           // [n_layers][batch_size * kv_dim])
+        std::vector<std::vector<float>> current_k; // [n_layers][batch_size * kv_dim])
+        std::vector<std::vector<float>> current_v; // [n_layers][batch_size * kv_dim])
         std::vector<float> attn_bias; // [batch_size * n_ctx]
 
         std::vector<Tensor> key_tensors;   // n_layers
@@ -136,7 +208,6 @@ public:
     void reset_batch_size(const size_t &batch_size) {
         if (m_batch_size == batch_size)
             return;
-        // fmt::println("Resize batch size: {} -> {}", m_batch_size, batch_size);
         m_batch_size = batch_size;
 
         auto &k = chunk.current_k;
@@ -172,25 +243,25 @@ public:
         return {chunk.key_tensors[L], chunk.value_tensors[L]};
     }
 
-    auto key_buffer_for_layer(size_t layer_id) -> std::vector<float> & {
+    auto key_buffer_for_layer(size_t layer_id) -> MappedFloatBuffer & {
         POWERSERVE_ASSERT(layer_id < m_n_layers);
         POWERSERVE_ASSERT(m_full_kv_allocated, "full KV storage is not allocated");
         return chunk.key_buffer[layer_id];
     }
 
-    auto value_buffer_for_layer(size_t layer_id) -> std::vector<float> & {
+    auto value_buffer_for_layer(size_t layer_id) -> MappedFloatBuffer & {
         POWERSERVE_ASSERT(layer_id < m_n_layers);
         POWERSERVE_ASSERT(m_full_kv_allocated, "full KV storage is not allocated");
         return chunk.value_buffer[layer_id];
     }
 
-    auto key_buffer_for_layer(size_t layer_id) const -> const std::vector<float> & {
+    auto key_buffer_for_layer(size_t layer_id) const -> const MappedFloatBuffer & {
         POWERSERVE_ASSERT(layer_id < m_n_layers);
         POWERSERVE_ASSERT(m_full_kv_allocated, "full KV storage is not allocated");
         return chunk.key_buffer[layer_id];
     }
 
-    auto value_buffer_for_layer(size_t layer_id) const -> const std::vector<float> & {
+    auto value_buffer_for_layer(size_t layer_id) const -> const MappedFloatBuffer & {
         POWERSERVE_ASSERT(layer_id < m_n_layers);
         POWERSERVE_ASSERT(m_full_kv_allocated, "full KV storage is not allocated");
         return chunk.value_buffer[layer_id];

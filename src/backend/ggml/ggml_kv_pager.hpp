@@ -18,8 +18,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <future>
-#include <mutex>
 #include <string>
 #include <vector>
 
@@ -39,15 +37,6 @@ struct ClusterDiskLayout {
 
 struct GGMLKVPager {
 public:
-    enum class LayerState : uint8_t {
-        Unloaded = 0,
-        Loading,
-        ResidentClean,
-        ResidentDirty,
-        Writing,
-    };
-
-public:
     GGMLKVPager(GGMLKV &kv, const std::string &file_path);
     ~GGMLKVPager();
 
@@ -60,16 +49,7 @@ public:
     }
 
     void reset_runtime_state();
-    bool prefetch_layer_async(size_t layer_id, size_t need_tokens);
-    bool wait_layer_ready(size_t layer_id, size_t need_tokens);
-    bool evict_layer_async(size_t layer_id, size_t valid_tokens, bool do_sync);
-    bool wait_layer_evicted(size_t layer_id);
     bool wait_all_async();
-    bool wait_all_evictions();
-
-    bool acquire_layer(size_t layer_id, size_t need_tokens);
-    void mark_dirty_layer(size_t layer_id);
-    bool evict_layer(size_t layer_id, size_t valid_tokens, bool do_sync);
     bool sync();
     auto materialize_compact_kv(size_t layer_id, const std::vector<int> &token_positions) const -> CompactClusterKV;
 
@@ -98,9 +78,6 @@ public:
     auto allocate_cluster_region(size_t capacity_tokens) -> int64_t;
 
 private:
-    bool acquire_layer_sync(size_t layer_id, size_t need_tokens);
-    bool evict_layer_sync(size_t layer_id, size_t valid_tokens, bool do_sync, bool write_data);
-
     bool write_header();
     bool preallocate_file(size_t bytes);
     bool pwrite_all(const void *src, size_t bytes, int64_t offset);
@@ -114,20 +91,12 @@ private:
     int m_fd = -1;
     std::string m_file_path;
 
-    size_t m_n_layers = 0;     
+    size_t m_n_layers = 0;
     size_t m_n_ctx = 0;
     size_t m_kv_dim = 0;
     size_t m_layer_bytes = 0;
     size_t m_header_bytes = 4096;
     int64_t m_next_cluster_offset = 0;
-
-    std::vector<LayerState> m_layer_states;
-    std::vector<size_t> m_persisted_tokens;
-    std::vector<std::future<bool>> m_load_futures;
-    std::vector<std::future<bool>> m_evict_futures;
-    std::vector<bool> m_load_inflight;
-    std::vector<bool> m_evict_inflight;
-    std::mutex m_async_mutex;
 };
 
 } // namespace powerserve::ggml
