@@ -126,16 +126,29 @@ void GGMLClusterManager::build_layer_after_prefill(size_t layer_id) {
         return;
     }
 
-    const size_t cluster_size = target_cluster_size();
-    clusters.reserve((n_tokens + cluster_size - 1) / cluster_size);
-    for (size_t begin = 0; begin < n_tokens; begin += cluster_size) {
-        const size_t end = std::min(begin + cluster_size, n_tokens);
-        std::vector<int> token_positions;
-        token_positions.reserve(end - begin);
-        for (size_t pos = begin; pos < end; ++pos) {
-            token_positions.push_back(static_cast<int>(pos));
-        }
+    const size_t cluster_count = prefill_cluster_count(n_tokens);
+    std::vector<float> centers;
+    initialize_prefill_kmeans_centers(layer_id, cluster_count, n_tokens, centers);
 
+    std::vector<size_t> assignments;
+    constexpr size_t kmeans_iterations = 5;
+    for (size_t iter = 0; iter < kmeans_iterations; ++iter) {
+        assignments = assign_tokens_to_centers(layer_id, centers, n_tokens);
+        recompute_centers_from_assignments(layer_id, assignments, cluster_count, n_tokens, centers);
+    }
+    assignments = assign_tokens_to_centers(layer_id, centers, n_tokens);
+
+    std::vector<std::vector<int>> cluster_positions(cluster_count);
+    for (size_t pos = 0; pos < n_tokens; ++pos) {
+        POWERSERVE_ASSERT(assignments[pos] < cluster_positions.size());
+        cluster_positions[assignments[pos]].push_back(static_cast<int>(pos));
+    }
+
+    clusters.reserve(cluster_count);
+    for (const auto &token_positions : cluster_positions) {
+        if (token_positions.empty()) {
+            continue;
+        }
         ClusterInfo cluster = make_cluster_from_positions(layer_id, next_cluster_id(layer_id), token_positions);
         std::vector<float> cluster_k;
         std::vector<float> cluster_v;
@@ -373,6 +386,110 @@ auto GGMLClusterManager::value_at(size_t layer_id, int token_position) const -> 
 auto GGMLClusterManager::next_cluster_id(size_t layer_id) -> int {
     POWERSERVE_ASSERT(layer_id < m_next_cluster_ids.size());
     return m_next_cluster_ids[layer_id]++;
+}
+
+auto GGMLClusterManager::prefill_cluster_count(size_t token_count) const -> size_t {
+    POWERSERVE_ASSERT(token_count > 0);
+    const size_t cluster_size = target_cluster_size();
+    const size_t requested = (token_count + cluster_size - 1) / cluster_size;
+    return std::min(token_count, std::max<size_t>(1, requested));
+}
+
+void GGMLClusterManager::initialize_prefill_kmeans_centers(
+    size_t layer_id,
+    size_t cluster_count,
+    size_t token_count,
+    std::vector<float> &centers
+) const {
+    POWERSERVE_ASSERT(cluster_count > 0);
+    POWERSERVE_ASSERT(token_count >= cluster_count);
+    centers.assign(cluster_count * m_kv.m_kv_dim, 0.0f);
+
+    const size_t cluster_size = target_cluster_size();
+    for (size_t cluster_index = 0; cluster_index < cluster_count; ++cluster_index) {
+        const size_t begin = cluster_index * cluster_size;
+        const size_t end = std::min(begin + cluster_size, token_count);
+        POWERSERVE_ASSERT(begin < end);
+
+        float *center = centers.data() + cluster_index * m_kv.m_kv_dim;
+        const float inv_count = 1.0f / static_cast<float>(end - begin);
+        for (size_t pos = begin; pos < end; ++pos) {
+            const float *key = key_at(layer_id, static_cast<int>(pos));
+            for (size_t d = 0; d < m_kv.m_kv_dim; ++d) {
+                center[d] += key[d];
+            }
+        }
+        for (size_t d = 0; d < m_kv.m_kv_dim; ++d) {
+            center[d] *= inv_count;
+        }
+    }
+}
+
+auto GGMLClusterManager::assign_tokens_to_centers(
+    size_t layer_id,
+    const std::vector<float> &centers,
+    size_t token_count
+) const -> std::vector<size_t> {
+    POWERSERVE_ASSERT((centers.size() % m_kv.m_kv_dim) == 0);
+    const size_t cluster_count = centers.size() / m_kv.m_kv_dim;
+    POWERSERVE_ASSERT(cluster_count > 0);
+
+    std::vector<size_t> assignments(token_count, 0);
+    for (size_t pos = 0; pos < token_count; ++pos) {
+        const float *key = key_at(layer_id, static_cast<int>(pos));
+        size_t best_cluster = 0;
+        float best_distance = std::numeric_limits<float>::infinity();
+        for (size_t cluster_index = 0; cluster_index < cluster_count; ++cluster_index) {
+            const float *center = centers.data() + cluster_index * m_kv.m_kv_dim;
+            const float distance = squared_l2(key, center, m_kv.m_kv_dim);
+            if (distance < best_distance) {
+                best_distance = distance;
+                best_cluster = cluster_index;
+            }
+        }
+        assignments[pos] = best_cluster;
+    }
+    return assignments;
+}
+
+void GGMLClusterManager::recompute_centers_from_assignments(
+    size_t layer_id,
+    const std::vector<size_t> &assignments,
+    size_t cluster_count,
+    size_t token_count,
+    std::vector<float> &centers
+) const {
+    POWERSERVE_ASSERT(assignments.size() == token_count);
+    std::vector<float> previous_centers = centers;
+    centers.assign(cluster_count * m_kv.m_kv_dim, 0.0f);
+    std::vector<size_t> counts(cluster_count, 0);
+
+    for (size_t pos = 0; pos < token_count; ++pos) {
+        const size_t cluster_index = assignments[pos];
+        POWERSERVE_ASSERT(cluster_index < cluster_count);
+        float *center = centers.data() + cluster_index * m_kv.m_kv_dim;
+        const float *key = key_at(layer_id, static_cast<int>(pos));
+        for (size_t d = 0; d < m_kv.m_kv_dim; ++d) {
+            center[d] += key[d];
+        }
+        counts[cluster_index] += 1;
+    }
+
+    for (size_t cluster_index = 0; cluster_index < cluster_count; ++cluster_index) {
+        if (counts[cluster_index] == 0) {
+            std::copy_n(
+                previous_centers.data() + static_cast<std::ptrdiff_t>(cluster_index * m_kv.m_kv_dim),
+                static_cast<std::ptrdiff_t>(m_kv.m_kv_dim),
+                centers.data() + static_cast<std::ptrdiff_t>(cluster_index * m_kv.m_kv_dim)
+            );
+            continue;
+        }
+        float *center = centers.data() + cluster_index * m_kv.m_kv_dim;
+        const float inv_count = 1.0f / static_cast<float>(counts[cluster_index]);
+        for (size_t d = 0; d < m_kv.m_kv_dim; ++d) {
+            center[d] *= inv_count;
+        }
+    }
 }
 
 auto GGMLClusterManager::make_cluster_from_positions(

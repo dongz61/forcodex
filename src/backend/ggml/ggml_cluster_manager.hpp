@@ -103,6 +103,25 @@ private:
     auto value_at(size_t layer_id, int token_position) const -> std::vector<float>;
 
     auto next_cluster_id(size_t layer_id) -> int;
+    auto prefill_cluster_count(size_t token_count) const -> size_t;
+    void initialize_prefill_kmeans_centers(
+        size_t layer_id,
+        size_t cluster_count,
+        size_t token_count,
+        std::vector<float> &centers
+    ) const;
+    auto assign_tokens_to_centers(
+        size_t layer_id,
+        const std::vector<float> &centers,
+        size_t token_count
+    ) const -> std::vector<size_t>;
+    void recompute_centers_from_assignments(
+        size_t layer_id,
+        const std::vector<size_t> &assignments,
+        size_t cluster_count,
+        size_t token_count,
+        std::vector<float> &centers
+    ) const;
     auto make_cluster_from_positions(size_t layer_id, int cluster_id, const std::vector<int> &token_positions) const -> ClusterInfo;
     void build_cluster_storage_from_positions(
         size_t layer_id,
