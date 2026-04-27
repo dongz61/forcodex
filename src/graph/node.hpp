@@ -110,6 +110,8 @@ struct OpNode : Node {
 public:
     OpType op;
     std::unique_ptr<OpParams> params;
+    int profile_layer_id = -1;
+    std::string profile_scope;
 
 private:
     OpNode(OpType op) : Node(NodeType::OPERATOR), op(op) {}

@@ -16,6 +16,8 @@
 
 #include "backend/ggml/ggml_kv_pager.hpp"
 #include "core/logger.hpp"
+#include "core/timer.hpp"
+#include "model/module/ggml_cluster_profile.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -76,6 +78,20 @@ float squared_l2(const float *a, const float *b, size_t n) {
 
 bool contains_key(const std::vector<uint64_t> &keys, uint64_t target) {
     return std::find(keys.begin(), keys.end(), target) != keys.end();
+}
+
+void record_layer_cluster_stats(size_t layer_id, const std::vector<ClusterInfo> &clusters) {
+    if (!cluster_profile_enabled()) {
+        return;
+    }
+    size_t total_tokens = 0;
+    size_t max_tokens = 0;
+    for (const auto &cluster : clusters) {
+        const size_t token_count = cluster.token_positions.size();
+        total_tokens += token_count;
+        max_tokens = std::max(max_tokens, token_count);
+    }
+    cluster_profile_record_layer_cluster_stats(layer_id, clusters.size(), total_tokens, max_tokens);
 }
 
 } // namespace
@@ -177,6 +193,7 @@ void GGMLClusterManager::build_layer_after_prefill(size_t layer_id) {
         clusters.push_back(std::move(cluster));
     }
     maybe_log_layer_variance_stats("prefill", layer_id, true);
+    record_layer_cluster_stats(layer_id, clusters);
 }
 
 void GGMLClusterManager::build_all_layers_after_prefill() {
@@ -250,6 +267,7 @@ void GGMLClusterManager::update_layer_after_decode(
     }
     m_decode_update_counts[layer_id] += 1;
     maybe_log_layer_variance_stats("decode", layer_id, false);
+    record_layer_cluster_stats(layer_id, clusters);
 }
 
 auto GGMLClusterManager::get_layer_clusters(size_t layer_id) const -> const std::vector<ClusterInfo> & {
@@ -277,8 +295,17 @@ bool GGMLClusterManager::query_cluster_views(
 
     for (int cluster_index : cluster_indices) {
         auto &cluster = m_layer_clusters[layer_id][static_cast<size_t>(cluster_index)];
+        const bool cache_hit = cluster.resident;
+        const bool profile = cluster_profile_enabled();
+        const int64_t fetch_start_ns = profile ? timestamp_ns() : 0;
         if (!ensure_cluster_resident(layer_id, static_cast<size_t>(cluster_index), protected_keys)) {
+            if (profile) {
+                cluster_profile_record_cluster_fetch(layer_id, cache_hit, timestamp_ns() - fetch_start_ns);
+            }
             return false;
+        }
+        if (profile) {
+            cluster_profile_record_cluster_fetch(layer_id, cache_hit, timestamp_ns() - fetch_start_ns);
         }
         views.push_back(ClusterView{
             .k_ptr = cluster.resident_key.data(),

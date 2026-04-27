@@ -19,10 +19,12 @@
 #include "backend/ggml/ggml_kv_pager.hpp"
 #include "core/logger.hpp"
 #include "core/perfetto_trace.hpp"
+#include "core/timer.hpp"
 #include "executor/executor.hpp"
 #include "graph/graph.hpp"
 #include "graph/node.hpp"
 #include "model/module/cluster_attention_path.hpp"
+#include "model/module/ggml_cluster_profile.hpp"
 #include "model/module/ggml_cluster_runtime.hpp"
 #include "model/qwen2/qwen2_weight.hpp"
 #include "sampler/sampler.hpp"
@@ -57,6 +59,7 @@ Qwen2Model::Qwen2Model(const std::string &filename, const std::shared_ptr<ModelC
     m_config  = config;
     lazy_load = ggml_get_tensor(ggml_ctx, "output_norm.weight") == nullptr ? true : false;
     m_weights = std::make_shared<Qwen2Weight>(ggml_ctx, m_config->llm.n_layers, lazy_load);
+    ggml::cluster_profile_reset(m_config->llm.n_layers);
     if (lazy_load) {
         POWERSERVE_LOG_WARN("only the embedding table was loaded");
     }
@@ -64,6 +67,7 @@ Qwen2Model::Qwen2Model(const std::string &filename, const std::shared_ptr<ModelC
 }
 
 Qwen2Model::~Qwen2Model() {
+    ggml::cluster_profile_maybe_report(m_config->model_id, true);
     gguf_free(gguf_ctx);
 }
 
@@ -109,7 +113,12 @@ void Qwen2Model::on_prefill_finished() {
     if (!m_cluster_manager || !m_cluster_manager->enabled()) {
         return;
     }
+    const bool profile = ggml::cluster_profile_enabled();
+    const int64_t cluster_build_start_ns = profile ? timestamp_ns() : 0;
     m_cluster_manager->build_all_layers_after_prefill();
+    if (profile) {
+        ggml::cluster_profile_record_global_cluster_build(timestamp_ns() - cluster_build_start_ns);
+    }
     ggml::set_cluster_runtime_ready(m_config->model_id, true);
     if (get_ggml_cluster_topk() > 0) {
         m_platform->ggml_backends[m_config->model_id]->m_kv->release_full_kv_storage();
@@ -119,6 +128,8 @@ void Qwen2Model::on_prefill_finished() {
 auto Qwen2Model::forward(
     const std::vector<int> &tokens, const std::vector<int> &pos, const CausalAttentionMask &mask, bool lm_head
 ) -> LogitsVector {
+    const bool profile = ggml::cluster_profile_enabled();
+    const int64_t forward_start_ns = profile ? timestamp_ns() : 0;
     const size_t batch_size = tokens.size();
     auto &llm_config = m_config->llm;
 
@@ -164,10 +175,15 @@ auto Qwen2Model::forward(
                 }
             }
             for (size_t L = 0; L < llm_config.n_layers; L++) {
+                const size_t layer_op_begin = g.ops.size();
                 if (use_opencl) {
                     auto [k_cache, v_cache] = m_platform->opencl_backends[m_config->model_id]->get_cache_tensors(L);
                     auto att_o = m_attn->build(g, x, L, g.add_tensor(k_cache), g.add_tensor(v_cache), pos, mask, true);
+                    const size_t ffn_op_begin = g.ops.size();
                     auto ffn_o = m_ffn->build(g, att_o, L);
+                    for (size_t op_i = ffn_op_begin; profile && use_cluster_decode && op_i < g.ops.size(); ++op_i) {
+                        g.ops[op_i]->profile_scope = "ffn";
+                    }
                     x          = ffn_o;
                 } else {
                     TensorNode *att_o = nullptr;
@@ -177,8 +193,15 @@ auto Qwen2Model::forward(
                         auto [k_cache, v_cache] = m_platform->ggml_backends[m_config->model_id]->m_kv->get_cache(L);
                         att_o = m_attn->build(g, x, L, g.add_tensor(k_cache), g.add_tensor(v_cache), pos, mask, true);
                     }
+                    const size_t ffn_op_begin = g.ops.size();
                     auto ffn_o = m_ffn->build(g, att_o, L);
+                    for (size_t op_i = ffn_op_begin; profile && use_cluster_decode && op_i < g.ops.size(); ++op_i) {
+                        g.ops[op_i]->profile_scope = "ffn";
+                    }
                     x          = ffn_o;
+                }
+                for (size_t op_i = layer_op_begin; profile && use_cluster_decode && op_i < g.ops.size(); ++op_i) {
+                    g.ops[op_i]->profile_layer_id = static_cast<int>(L);
                 }
             }
             // TODO: cpu and qnn reuse
@@ -194,12 +217,22 @@ auto Qwen2Model::forward(
     Executor executor(*m_platform, g);
     executor.allocate_buffers();
     executor.run();
+    const int64_t forward_ns = profile ? timestamp_ns() - forward_start_ns : 0;
 
 #if defined(POWERSERVE_WITH_QNN)
     if (!m_platform->qnn_backend)
 #endif
     {
         m_platform->ggml_backends[m_config->model_id]->m_kv->advance(batch_size);
+    }
+
+    if (profile) {
+        if (use_cluster_decode) {
+            ggml::cluster_profile_record_decode_token(forward_ns);
+            ggml::cluster_profile_maybe_report(m_config->model_id);
+        } else if (pos.size() > 1) {
+            ggml::cluster_profile_record_prefill(tokens.size(), forward_ns);
+        }
     }
 
     if (!lm_head) {

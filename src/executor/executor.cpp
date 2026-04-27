@@ -3,6 +3,8 @@
 #include "backend/ggml/ggml.hpp"
 #include "backend/ggml/ggml_cluster_manager.hpp"
 #include "core/logger.hpp"
+#include "core/timer.hpp"
+#include "model/module/ggml_cluster_profile.hpp"
 #include "model/module/ggml_cluster_runtime.hpp"
 
 #include <cstdint>
@@ -256,7 +258,9 @@ void Executor::run() {
 
     int op_idx = 0;
 
+    const bool cluster_profile = ggml::cluster_profile_enabled();
     for (auto op : m_graph.ops) {
+        const int64_t op_start_ns = cluster_profile ? timestamp_ns() : 0;
         switch (op->op) {
         case OpType::GET_EMBEDDING: {
             auto weight   = op->prev[0]->tensor();
@@ -427,14 +431,24 @@ void Executor::run() {
             POWERSERVE_ASSERT(runtime.manager != nullptr, "CLUSTER_UPDATE missing cluster manager");
             auto *k = op->prev[0]->tensor();
             auto *v = op->prev[1]->tensor();
+            const int64_t copy_start_ns = cluster_profile ? timestamp_ns() : 0;
             auto new_k = copy_tensor_f32_contiguous(k);
             auto new_v = copy_tensor_f32_contiguous(v);
+            const int64_t copy_ns = cluster_profile ? timestamp_ns() - copy_start_ns : 0;
+            const int64_t update_start_ns = cluster_profile ? timestamp_ns() : 0;
             runtime.manager->update_layer_after_decode(
                 static_cast<size_t>(params.layer_id),
                 params.token_position,
                 new_k,
                 new_v
             );
+            if (cluster_profile) {
+                ggml::cluster_profile_record_cluster_update(
+                    static_cast<size_t>(params.layer_id),
+                    copy_ns,
+                    timestamp_ns() - update_start_ns
+                );
+            }
         } break;
 
         case OpType::CLUSTER_ATTN: {
@@ -514,6 +528,21 @@ void Executor::run() {
         } break;
         default:
             POWERSERVE_ABORT("Unknown OpType: {}", static_cast<int>(op->op));
+        }
+        if (cluster_profile && op->profile_layer_id >= 0) {
+            const int64_t op_ns = timestamp_ns() - op_start_ns;
+            ggml::cluster_profile_record_layer_op(
+                static_cast<size_t>(op->profile_layer_id),
+                "layer",
+                op_ns
+            );
+            if (op->profile_scope == "ffn") {
+                ggml::cluster_profile_record_layer_op(
+                    static_cast<size_t>(op->profile_layer_id),
+                    "ffn",
+                    op_ns
+                );
+            }
         }
         if (get_op_after_exec_hook()) {
             get_op_after_exec_hook()(op_idx, op.get());

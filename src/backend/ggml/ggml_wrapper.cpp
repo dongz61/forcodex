@@ -17,10 +17,13 @@
 #include "backend/ggml/ggml_cluster_manager.hpp"
 #include "backend/ggml/ggml_kv_pager.hpp"
 #include "core/logger.hpp"
+#include "core/timer.hpp"
+#include "model/module/ggml_cluster_profile.hpp"
 #include "model/module/ggml_cluster_runtime.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -389,20 +392,27 @@ void GGMLBackend::cluster_attn(
     std::vector<float> q_local(static_cast<size_t>(head_size));
     std::vector<int> cluster_ids;
     std::vector<char> selected(static_cast<size_t>(clusters.size()), 0);
-    for (int qh = 0; qh < n_heads; ++qh) {
-        const int kvh = qh / q_per_kv;
-        load_cluster_query_local(layout, qh, q_local);
-        select_topk_cluster_ids(
-            clusters,
-            kvh,
-            head_size,
-            std::min(topk_clusters, static_cast<int>(clusters.size())),
-            scale,
-            q_local,
-            cluster_ids
-        );
-        for (int cluster_id : cluster_ids) {
-            selected[static_cast<size_t>(cluster_id)] = 1;
+    const bool cluster_profile = cluster_profile_enabled();
+    {
+        const int64_t select_start_ns = cluster_profile ? timestamp_ns() : 0;
+        for (int qh = 0; qh < n_heads; ++qh) {
+            const int kvh = qh / q_per_kv;
+            load_cluster_query_local(layout, qh, q_local);
+            select_topk_cluster_ids(
+                clusters,
+                kvh,
+                head_size,
+                std::min(topk_clusters, static_cast<int>(clusters.size())),
+                scale,
+                q_local,
+                cluster_ids
+            );
+            for (int cluster_id : cluster_ids) {
+                selected[static_cast<size_t>(cluster_id)] = 1;
+            }
+        }
+        if (cluster_profile) {
+            cluster_profile_record_cluster_select(static_cast<size_t>(layer_id), timestamp_ns() - select_start_ns);
         }
     }
 
@@ -422,7 +432,19 @@ void GGMLBackend::cluster_attn(
         layer_id
     );
     POWERSERVE_ASSERT(!views.empty(), "CLUSTER_ATTN queried no cluster views at layer={}", layer_id);
+    size_t selected_tokens = 0;
+    for (const auto &view : views) {
+        selected_tokens += view.token_count;
+    }
+    if (cluster_profile) {
+        cluster_profile_record_cluster_selection(
+            static_cast<size_t>(layer_id),
+            selected_cluster_indices.size(),
+            selected_tokens
+        );
+    }
 
+    const int64_t compute_start_ns = cluster_profile ? timestamp_ns() : 0;
     std::vector<std::vector<float>> probs_per_view;
     probs_per_view.resize(views.size());
     for (int qh = 0; qh < n_heads; ++qh) {
@@ -453,6 +475,9 @@ void GGMLBackend::cluster_attn(
 
         float *out_ptr = out_data + static_cast<size_t>(qh * head_size);
         reduce_dense_values_from_cluster_views(out_ptr, views, head_size, kvh, probs_per_view, 1.0f / denom);
+    }
+    if (cluster_profile) {
+        cluster_profile_record_cluster_attn_compute(static_cast<size_t>(layer_id), timestamp_ns() - compute_start_ns);
     }
 }
 
