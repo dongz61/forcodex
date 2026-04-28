@@ -259,8 +259,10 @@ void Executor::run() {
     int op_idx = 0;
 
     const bool cluster_profile = ggml::cluster_profile_enabled();
+    const bool dense_profile = ggml::dense_profile_enabled();
+    const bool layer_profile = cluster_profile || dense_profile;
     for (auto op : m_graph.ops) {
-        const int64_t op_start_ns = cluster_profile ? timestamp_ns() : 0;
+        const int64_t op_start_ns = layer_profile ? timestamp_ns() : 0;
         switch (op->op) {
         case OpType::GET_EMBEDDING: {
             auto weight   = op->prev[0]->tensor();
@@ -538,6 +540,27 @@ void Executor::run() {
             );
             if (op->profile_scope == "ffn") {
                 ggml::cluster_profile_record_layer_op(
+                    static_cast<size_t>(op->profile_layer_id),
+                    "ffn",
+                    op_ns
+                );
+            }
+        }
+        if (dense_profile && op->profile_layer_id >= 0) {
+            const int64_t op_ns = timestamp_ns() - op_start_ns;
+            ggml::dense_profile_record_layer_op(
+                static_cast<size_t>(op->profile_layer_id),
+                "layer",
+                op_ns
+            );
+            if (op->profile_scope == "attn") {
+                ggml::dense_profile_record_layer_op(
+                    static_cast<size_t>(op->profile_layer_id),
+                    "attn",
+                    op_ns
+                );
+            } else if (op->profile_scope == "ffn") {
+                ggml::dense_profile_record_layer_op(
                     static_cast<size_t>(op->profile_layer_id),
                     "ffn",
                     op_ns

@@ -22,6 +22,8 @@ namespace powerserve::ggml {
 
 bool cluster_profile_enabled();
 int cluster_profile_report_interval();
+bool dense_profile_enabled();
+int dense_profile_report_interval();
 
 void cluster_profile_reset(size_t n_layers);
 void cluster_profile_record_prefill(size_t tokens, int64_t ns);
@@ -37,5 +39,11 @@ void cluster_profile_record_cluster_selection(size_t layer_id, size_t selected_c
 void cluster_profile_record_layer_cluster_stats(size_t layer_id, size_t cluster_count, size_t total_tokens, size_t max_tokens);
 
 void cluster_profile_maybe_report(const std::string &model_id, bool force = false);
+
+void dense_profile_reset(size_t n_layers);
+void dense_profile_record_prefill(size_t tokens, int64_t ns);
+void dense_profile_record_decode_token(int64_t ns);
+void dense_profile_record_layer_op(size_t layer_id, const char *name, int64_t ns);
+void dense_profile_maybe_report(const std::string &model_id, bool force = false);
 
 } // namespace powerserve::ggml
